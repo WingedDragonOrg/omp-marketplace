@@ -14,6 +14,7 @@ omp plugin install omp-wt@winged-dragon-org
 | Plugin | Surface | Description |
 |---|---|---|
 | `omp-wt` | extension | `/wt` — create, list, remove, prune git worktrees under `~/.omp/wt` and move the session into one |
+| `skill-gate` | extension + skill | `when:` frontmatter gates a skill on env vars, os/arch, cwd, marker files or PATH binaries; `/skill-gate` explains each decision |
 
 ## Layout
 

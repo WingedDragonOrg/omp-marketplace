@@ -26,6 +26,23 @@
         "name": "WingedDragonOrg"
       },
       "license": "MIT"
+    },
+    {
+      "name": "skill-gate",
+      "description": "Conditional skill activation: gate SKILL.md on env vars, os, arch, cwd, marker files and PATH binaries via a `when:` frontmatter block",
+      "source": "./skill-gate",
+      "version": "1.0.0",
+      "category": "development",
+      "keywords": [
+        "skills",
+        "frontmatter",
+        "activation",
+        "extension"
+      ],
+      "author": {
+        "name": "WingedDragonOrg"
+      },
+      "license": "MIT"
     }
   ]
 }

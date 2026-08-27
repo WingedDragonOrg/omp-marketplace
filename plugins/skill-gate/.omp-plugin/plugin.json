@@ -1,0 +1,9 @@
+{
+  "name": "skill-gate",
+  "version": "1.0.0",
+  "description": "Conditional skill activation: gate SKILL.md on env vars, os, arch, cwd, marker files and PATH binaries via a `when:` frontmatter block",
+  "author": {
+    "name": "WingedDragonOrg"
+  },
+  "homepage": "https://github.com/WingedDragonOrg/omp-marketplace"
+}
