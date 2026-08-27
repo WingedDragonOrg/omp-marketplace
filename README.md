@@ -1,12 +1,12 @@
-# winged-dragon
+# winged-dragon-org
 
 Oh My Pi (`omp`) plugin marketplace for [WingedDragonOrg](https://github.com/WingedDragonOrg).
 Also readable by Claude Code (`.claude-plugin/marketplace.json` mirror).
 
 ```sh
 omp plugin marketplace add WingedDragonOrg/omp-marketplace
-omp plugin discover winged-dragon
-omp plugin install omp-wt@winged-dragon
+omp plugin discover winged-dragon-org
+omp plugin install omp-wt@winged-dragon-org
 ```
 
 ## Plugins
@@ -46,7 +46,7 @@ so catalog entries carry `"source": "./<name>"`.
    { "name": "<name>", "description": "…", "source": "./<name>", "version": "1.0.0" }
    ```
 
-3. Push. Users pull the new catalog with `omp plugin marketplace update winged-dragon`.
+3. Push. Users pull the new catalog with `omp plugin marketplace update winged-dragon-org`.
 
 Naming: lowercase letters, digits, `-` and `.`; must start and end alphanumeric; ≤64 chars.
 

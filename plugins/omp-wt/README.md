@@ -9,7 +9,7 @@ and the current session is moved into them with the same primitive as `/move`.
 
 ```sh
 omp plugin marketplace add WingedDragonOrg/omp-marketplace
-omp plugin install omp-wt@winged-dragon
+omp plugin install omp-wt@winged-dragon-org
 ```
 
 Restart `omp` (or start a new session) — extension modules load at session start.
