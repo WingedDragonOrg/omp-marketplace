@@ -11,9 +11,9 @@
   },
   "plugins": [
     {
-      "name": "omp-wt",
+      "name": "wt",
       "description": "Git worktree manager: /wt creates, lists, removes worktrees under ~/.omp/wt and moves the session into one",
-      "source": "./omp-wt",
+      "source": "./wt",
       "version": "1.0.0",
       "category": "development",
       "keywords": [
