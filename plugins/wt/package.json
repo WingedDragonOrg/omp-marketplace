@@ -1,5 +1,5 @@
 {
-  "name": "wt",
+  "name": "omp-wt",
   "version": "1.0.0",
   "description": "Git worktree manager for omp: /wt create, list, remove, prune",
   "private": true,
