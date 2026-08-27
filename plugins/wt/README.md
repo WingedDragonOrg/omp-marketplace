@@ -1,4 +1,4 @@
-# omp-wt
+# wt
 
 Oh My Pi (`omp`) extension: a git worktree manager for the `/wt` command.
 
@@ -9,7 +9,7 @@ and the current session is moved into them with the same primitive as `/move`.
 
 ```sh
 omp plugin marketplace add WingedDragonOrg/omp-marketplace
-omp plugin install omp-wt@winged-dragon-org
+omp plugin install wt@winged-dragon-org
 ```
 
 Restart `omp` (or start a new session) — extension modules load at session start.

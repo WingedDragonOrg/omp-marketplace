@@ -6,14 +6,14 @@ Also readable by Claude Code (`.claude-plugin/marketplace.json` mirror).
 ```sh
 omp plugin marketplace add WingedDragonOrg/omp-marketplace
 omp plugin discover winged-dragon-org
-omp plugin install omp-wt@winged-dragon-org
+omp plugin install wt@winged-dragon-org
 ```
 
 ## Plugins
 
 | Plugin | Surface | Description |
 |---|---|---|
-| `omp-wt` | extension | `/wt` — create, list, remove, prune git worktrees under `~/.omp/wt` and move the session into one |
+| `wt` | extension | `/wt` — create, list, remove, prune git worktrees under `~/.omp/wt` and move the session into one |
 | `skill-gate` | extension + skill | `when:` frontmatter gates a skill on env vars, os/arch, cwd, marker files or PATH binaries; `/skill-gate` explains each decision |
 
 ## Layout
