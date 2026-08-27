@@ -1,17 +1,17 @@
-# spec-design
+# spec
 
-Skill-only plugin. `spec-design` turns a feature idea, behaviour change or existing
-plan into an implementable spec through a focused design interview, then writes it to
-`docs/specs/YYYY-MM-DD-<topic>-design.md`.
+Skill-only plugin for spec work. Today it ships one skill, `spec-design`, which turns a
+feature idea, behaviour change or existing plan into an implementable spec through a
+focused design interview, then writes it to `docs/specs/YYYY-MM-DD-<topic>-design.md`.
 
 ```sh
 omp plugin marketplace add WingedDragonOrg/omp-marketplace
-omp plugin install spec-design@winged-dragon-org
+omp plugin install spec@winged-dragon-org
 ```
 
 Skills refresh with `/reload-plugins`; no new session required.
 
-## What it enforces
+## `spec-design`
 
 - **Hard gate** — no implementation code, scaffolding or plan execution until the user
   confirms the design. Codebase exploration, option comparison and writing the spec are
@@ -34,6 +34,10 @@ Skills refresh with `/reload-plugins`; no new session required.
 skills/spec-design/SKILL.md          the skill
 skills/spec-design/evals/evals.json  skill-creator eval suite (5 scenarios)
 ```
+
+Plugin name and skill name are independent: the plugin is the delivery unit (`spec`), the
+skill is what the model sees (`spec-design`). Further spec-stage skills go in
+`skills/<name>/` here without another catalog entry.
 
 The evals are authoring material for `skill-creator`; omp ignores everything in a skill
 directory except `SKILL.md`.

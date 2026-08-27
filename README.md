@@ -15,7 +15,7 @@ omp plugin install wt@winged-dragon-org
 |---|---|---|
 | `wt` | extension | `/wt` — create, list, remove, prune git worktrees under `~/.omp/wt` and move the session into one |
 | `skill-gate` | extension + skill | `when:` frontmatter gates a skill on env vars, os/arch, cwd, marker files or PATH binaries; `/skill-gate` explains each decision |
-| `spec-design` | skill | Design interview that converges an idea into an implementable spec in `docs/specs/`, one product-level decision at a time |
+| `spec` | skill | `spec-design` — design interview that converges an idea into an implementable spec in `docs/specs/`, one product-level decision at a time |
 
 ## Layout
 

@@ -1,9 +1,0 @@
-{
-  "name": "spec-design",
-  "version": "1.0.0",
-  "description": "Spec design interview: converge a feature idea into an implementable spec under docs/specs/ before any code is written",
-  "author": {
-    "name": "WingedDragonOrg"
-  },
-  "homepage": "https://github.com/WingedDragonOrg/omp-marketplace"
-}

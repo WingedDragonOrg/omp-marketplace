@@ -45,9 +45,9 @@
       "license": "MIT"
     },
     {
-      "name": "spec-design",
-      "description": "Spec design interview: converge a feature idea into an implementable spec under docs/specs/ before any code is written",
-      "source": "./spec-design",
+      "name": "spec",
+      "description": "Spec workflow skills. Ships spec-design: converge a feature idea into an implementable spec under docs/specs/ before any code is written",
+      "source": "./spec",
       "version": "1.0.0",
       "category": "development",
       "keywords": [

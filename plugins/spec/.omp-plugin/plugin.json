@@ -1,0 +1,9 @@
+{
+  "name": "spec",
+  "version": "1.0.0",
+  "description": "Spec workflow skills. Ships spec-design: converge a feature idea into an implementable spec under docs/specs/ before any code is written",
+  "author": {
+    "name": "WingedDragonOrg"
+  },
+  "homepage": "https://github.com/WingedDragonOrg/omp-marketplace"
+}
