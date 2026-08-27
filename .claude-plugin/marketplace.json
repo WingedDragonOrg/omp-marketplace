@@ -43,6 +43,23 @@
         "name": "WingedDragonOrg"
       },
       "license": "MIT"
+    },
+    {
+      "name": "spec-design",
+      "description": "Spec design interview: converge a feature idea into an implementable spec under docs/specs/ before any code is written",
+      "source": "./spec-design",
+      "version": "1.0.0",
+      "category": "development",
+      "keywords": [
+        "skill",
+        "spec",
+        "design",
+        "planning"
+      ],
+      "author": {
+        "name": "WingedDragonOrg"
+      },
+      "license": "MIT"
     }
   ]
 }
