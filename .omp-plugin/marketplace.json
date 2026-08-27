@@ -1,0 +1,31 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "winged-dragon",
+  "owner": {
+    "name": "WingedDragonOrg"
+  },
+  "metadata": {
+    "description": "Oh My Pi plugins by WingedDragonOrg",
+    "version": "0.1.0",
+    "pluginRoot": "plugins"
+  },
+  "plugins": [
+    {
+      "name": "omp-wt",
+      "description": "Git worktree manager: /wt creates, lists, removes worktrees under ~/.omp/wt and moves the session into one",
+      "source": "./omp-wt",
+      "version": "1.0.0",
+      "category": "development",
+      "keywords": [
+        "worktree",
+        "git",
+        "extension",
+        "session"
+      ],
+      "author": {
+        "name": "WingedDragonOrg"
+      },
+      "license": "MIT"
+    }
+  ]
+}

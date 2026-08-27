@@ -1,0 +1,9 @@
+{
+  "name": "omp-wt",
+  "version": "1.0.0",
+  "description": "Git worktree manager for omp: /wt create, list, remove, prune",
+  "author": {
+    "name": "WingedDragonOrg"
+  },
+  "homepage": "https://github.com/WingedDragonOrg/omp-marketplace"
+}
