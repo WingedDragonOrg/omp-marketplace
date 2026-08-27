@@ -64,17 +64,15 @@ Renaming a plugin touches four places — directory name, catalog `name`, catalo
 and the `name`/`version` inside `package.json` + `.omp-plugin/plugin.json`. Miss one and
 the break only shows up when someone else installs.
 
-`scripts/check-catalog.mjs` is the single check, enforced in three layers:
+`scripts/check-catalog.mjs` is the single check, enforced in two layers:
 
 | Layer | Mechanism | Covers |
 |---|---|---|
 | CI | `.github/workflows/catalog.yml` on push + PR | everyone, always — the authoritative gate |
 | pre-commit | `.githooks/pre-commit` | fails locally before a bad commit exists |
-| auto-arm | `.omp/extensions/arm-git-hooks.ts` | sets `core.hooksPath` on the first omp session in a fresh clone |
 
 Git cannot ship hooks through a clone — `core.hooksPath` is local config by design, so
-cloning never arms code execution. The repo-local omp extension does it on session start;
-if you do not use omp, run it once yourself:
+cloning never arms code execution. Enable the hook once per clone:
 
 ```sh
 git config core.hooksPath .githooks
