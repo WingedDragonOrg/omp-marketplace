@@ -15,6 +15,7 @@ omp plugin install wt@winged-dragon-org
 |---|---|---|
 | `wt` | extension | `/wt` — create, list, remove, prune git worktrees under `~/.omp/wt` and move the session into one |
 | `skill-gate` | extension + skill | `when:` frontmatter gates a skill on env vars, os/arch, cwd, marker files or PATH binaries; `/skill-gate` explains each decision |
+| `spec-design` | skill | Design interview that converges an idea into an implementable spec in `docs/specs/`, one product-level decision at a time |
 
 ## Layout
 
@@ -61,14 +62,26 @@ every plugin change, otherwise installed copies stay stale.
 
 Renaming a plugin touches four places — directory name, catalog `name`, catalog `source`,
 and the `name`/`version` inside `package.json` + `.omp-plugin/plugin.json`. Miss one and
-the break only shows up when someone else installs. A pre-commit hook enforces it:
+the break only shows up when someone else installs.
+
+`scripts/check-catalog.mjs` is the single check, enforced in three layers:
+
+| Layer | Mechanism | Covers |
+|---|---|---|
+| CI | `.github/workflows/catalog.yml` on push + PR | everyone, always — the authoritative gate |
+| pre-commit | `.githooks/pre-commit` | fails locally before a bad commit exists |
+| auto-arm | `.omp/extensions/arm-git-hooks.ts` | sets `core.hooksPath` on the first omp session in a fresh clone |
+
+Git cannot ship hooks through a clone — `core.hooksPath` is local config by design, so
+cloning never arms code execution. The repo-local omp extension does it on session start;
+if you do not use omp, run it once yourself:
 
 ```sh
-git config core.hooksPath .githooks   # once per clone
+git config core.hooksPath .githooks
 ```
 
-`scripts/check-catalog.mjs` validates the **staged** content (not the working tree — a
-`git mv` stages the pre-rename blobs while the working tree already looks fixed):
+The check validates **staged** content, not the working tree — a `git mv` stages the
+pre-rename blobs while the working tree already looks fixed:
 
 - both catalogs parse; the `.claude-plugin` mirror is byte-identical to `.omp-plugin`
 - marketplace/plugin ids obey the naming rules; no duplicate plugin names
@@ -81,7 +94,7 @@ git config core.hooksPath .githooks   # once per clone
 Run it by hand any time:
 
 ```sh
-node scripts/check-catalog.mjs             # staged content
+node scripts/check-catalog.mjs             # staged content (CI uses --worktree)
 node scripts/check-catalog.mjs --worktree  # working tree
 ```
 
