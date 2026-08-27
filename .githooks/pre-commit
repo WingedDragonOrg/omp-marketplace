@@ -1,0 +1,19 @@
+#!/bin/sh
+# Blocks commits whose staged catalog and plugin manifests disagree.
+# Enable once per clone:  git config core.hooksPath .githooks
+
+set -e
+
+root=$(git rev-parse --show-toplevel)
+script="$root/scripts/check-catalog.mjs"
+
+[ -f "$script" ] || exit 0
+
+if command -v bun >/dev/null 2>&1; then
+	exec bun "$script"
+elif command -v node >/dev/null 2>&1; then
+	exec node "$script"
+else
+	echo "pre-commit: neither bun nor node found; skipping catalog check" >&2
+	exit 0
+fi

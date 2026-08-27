@@ -57,6 +57,34 @@ Naming: lowercase letters, digits, `-` and `.`; must start and end alphanumeric;
 (semver must be newer; non-semver just has to differ). Bump the catalog entry on
 every plugin change, otherwise installed copies stay stale.
 
+## Repo checks
+
+Renaming a plugin touches four places — directory name, catalog `name`, catalog `source`,
+and the `name`/`version` inside `package.json` + `.omp-plugin/plugin.json`. Miss one and
+the break only shows up when someone else installs. A pre-commit hook enforces it:
+
+```sh
+git config core.hooksPath .githooks   # once per clone
+```
+
+`scripts/check-catalog.mjs` validates the **staged** content (not the working tree — a
+`git mv` stages the pre-rename blobs while the working tree already looks fixed):
+
+- both catalogs parse; the `.claude-plugin` mirror is byte-identical to `.omp-plugin`
+- marketplace/plugin ids obey the naming rules; no duplicate plugin names
+- every relative `source` resolves to a directory that has files in the commit
+- directory name, catalog `name`, `package.json` `name`, `plugin.json` `name` all agree
+- catalog `version` matches both manifests' `version`
+- every `omp.extensions` entry point exists in the commit
+- no plugin directory is missing a catalog entry
+
+Run it by hand any time:
+
+```sh
+node scripts/check-catalog.mjs             # staged content
+node scripts/check-catalog.mjs --worktree  # working tree
+```
+
 ## Verifying an install
 
 ```sh
