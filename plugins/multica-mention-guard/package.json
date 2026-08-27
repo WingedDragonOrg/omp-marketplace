@@ -1,0 +1,21 @@
+{
+  "name": "multica-mention-guard",
+  "version": "1.0.0",
+  "description": "Multica mention guard for omp: blocks a task session from stopping until its final comment is published and mentions a real participant",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "omp": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "17.4.0",
+    "@types/bun": "latest",
+    "typescript": "^5.9.3"
+  }
+}

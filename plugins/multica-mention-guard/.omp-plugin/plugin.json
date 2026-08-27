@@ -1,0 +1,9 @@
+{
+  "name": "multica-mention-guard",
+  "version": "1.0.0",
+  "description": "Multica mention guard for omp: blocks a task session from stopping until its final comment is published and mentions a real participant",
+  "author": {
+    "name": "WingedDragonOrg"
+  },
+  "homepage": "https://github.com/WingedDragonOrg/omp-marketplace"
+}

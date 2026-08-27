@@ -60,6 +60,23 @@
         "name": "WingedDragonOrg"
       },
       "license": "MIT"
+    },
+    {
+      "name": "multica-mention-guard",
+      "description": "Multica mention guard: blocks a task session from stopping until its final comment is published and mentions a real participant",
+      "source": "./multica-mention-guard",
+      "version": "1.0.0",
+      "category": "development",
+      "keywords": [
+        "multica",
+        "extension",
+        "session-stop",
+        "guard"
+      ],
+      "author": {
+        "name": "WingedDragonOrg"
+      },
+      "license": "MIT"
     }
   ]
 }
