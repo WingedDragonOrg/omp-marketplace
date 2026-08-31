@@ -1,0 +1,38 @@
+{
+  "skill_name": "model-prices",
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "What is the latest price for GPT-5.6 Sol? I have not selected a provider. Use the default source path, show the exact model ID, current input/output/cache prices, any token-price discount and derived original rates, source URLs, and retrieval time.",
+      "expected_output": "An OpenRouter-first report for `openai/gpt-5.6-sol`. It does not ask the user to select a provider, and it shows each discounted route's current and derived-original token rates.",
+      "files": [],
+      "expectations": [
+        "Uses OpenRouter rather than querying LiteLLM when OpenRouter has a matching GPT-5.6 Sol record.",
+        "Lists the exact model ID and at least one endpoint tag with current and derived-original input and output token rates.",
+        "Labels the original rates as derived from the published discount, and cites a live model summary, endpoint URL, and retrieval timestamp."
+      ]
+    },
+    {
+      "id": 1,
+      "prompt": "用中文查 GPT-5.6 Sol 当前价格。我不想选 provider；请直接给默认模型价格，同时列出 OpenRouter 的 flex、标准和 fast 折扣路线的折后价/原价，以及长上下文档位。不要把 web search 费用也当成 token 折扣反推。",
+      "expected_output": "A Chinese OpenRouter-first report with default model rates, discounted route tags, token-price current/original pairs, and tier pairs. It keeps web-search pricing as published rather than deriving a fake original fee.",
+      "files": [],
+      "expectations": [
+        "Does not require a provider choice before reporting the OpenRouter model-level price.",
+        "Shows flex, standard, and fast route tags when currently published, with their 50% discount and current/derived-original token pairs.",
+        "States the long-context threshold and leaves web-search as its published request fee rather than manufacturing an undiscounted fee."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Estimate the current bill for 2,000,000 input tokens and 400,000 output tokens through the explicitly selected OpenRouter route `openai/flex` for GPT-5.6 Sol. There are no cache, image, search, request, or batch charges. Show discounted and original totals, every assumption, source URLs, and retrieval time.",
+      "expected_output": "A route-specific OpenRouter estimate that uses the flex discounted token rates, also computes the counterfactual original-rate total, and excludes the named charge types.",
+      "files": [],
+      "expectations": [
+        "Identifies the OpenRouter `openai/flex` route and applies its current discounted input and output rates to the stated token volumes.",
+        "Shows a separate original-rate counterfactual computed from the published discount, not as a claim that OpenRouter directly published those prices.",
+        "Explicitly excludes cache, image, search, request, and batch charges, while citing live model and endpoint sources with a retrieval timestamp."
+      ]
+    }
+  ]
+}

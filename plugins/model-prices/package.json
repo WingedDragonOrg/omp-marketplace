@@ -1,0 +1,6 @@
+{
+  "name": "model-prices",
+  "version": "1.0.0",
+  "description": "Live LiteLLM and OpenRouter model-pricing lookup skill",
+  "private": true
+}

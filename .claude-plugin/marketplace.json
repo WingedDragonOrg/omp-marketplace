@@ -77,6 +77,23 @@
         "name": "WingedDragonOrg"
       },
       "license": "MIT"
+    },
+    {
+      "name": "model-prices",
+      "description": "Live LiteLLM and OpenRouter model-pricing lookup skill",
+      "source": "./model-prices",
+      "version": "1.0.0",
+      "category": "development",
+      "keywords": [
+        "llm",
+        "pricing",
+        "litellm",
+        "openrouter"
+      ],
+      "author": {
+        "name": "WingedDragonOrg"
+      },
+      "license": "MIT"
     }
   ]
 }
