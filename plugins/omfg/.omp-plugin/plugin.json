@@ -1,0 +1,9 @@
+{
+  "name": "omfg",
+  "version": "1.0.0",
+  "description": "TTSR rule authoring skill: turn a complaint about recurring assistant behavior into a stream rule that catches the class, with a scored corpus",
+  "author": {
+    "name": "WingedDragonOrg"
+  },
+  "homepage": "https://github.com/WingedDragonOrg/omp-marketplace"
+}

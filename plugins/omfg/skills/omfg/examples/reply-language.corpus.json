@@ -1,0 +1,74 @@
+{
+  "cases": [
+    {
+      "expect": "trigger",
+      "why": "German drift (the original incident)",
+      "text": "Kurze Antwort: nein, das ist nicht normal — das war ein Hänger."
+    },
+    {
+      "expect": "trigger",
+      "why": "German drift, different sentence",
+      "text": "Ich habe den Test abgebrochen, weil die Fixture nicht mehr passt."
+    },
+    {
+      "expect": "trigger",
+      "why": "French drift",
+      "text": "Réponse courte : non, ce n'est pas normal, le worker est bloqué dans la boucle."
+    },
+    {
+      "expect": "trigger",
+      "why": "Spanish drift",
+      "text": "Respuesta corta: no, esto no es normal, el proceso está bloqueado y hay una fuga."
+    },
+    {
+      "expect": "trigger",
+      "why": "Japanese drift",
+      "text": "短い答え: いいえ、これは正常ではありません。テストが止まっています。"
+    },
+    {
+      "expect": "trigger",
+      "why": "Korean drift",
+      "text": "짧은 답변: 아니요, 정상이 아닙니다. 테스트가 멈췄습니다."
+    },
+    {
+      "expect": "quiet",
+      "why": "English prose containing the word die",
+      "text": "The worker will die, so we retry the request once."
+    },
+    {
+      "expect": "quiet",
+      "why": "English prose, process die + and",
+      "text": "Root cause: the process die, and the socket leaks on every retry."
+    },
+    {
+      "expect": "quiet",
+      "why": "English technical prose with la/est-like tokens",
+      "text": "Set the flag ein, then reload. The la_test fixture est_count is stale."
+    },
+    {
+      "expect": "quiet",
+      "why": "Chinese answer (the desired output)",
+      "text": "简短回答：不正常，这是卡住了。问题：重构只做了一半，tests/conftest.py 仍在构造 object.__new__(OctoAdapter)。"
+    },
+    {
+      "expect": "quiet",
+      "why": "Chinese prose with English identifiers",
+      "text": "运行 pytest 时 conftest.py 卡住，没有 --timeout 就会无限阻塞而不是失败。"
+    },
+    {
+      "expect": "quiet",
+      "why": "English commit-message register (legitimate English task)",
+      "text": "fix(session): drop the stale identity snapshot before replaying the checkpoint"
+    },
+    {
+      "expect": "quiet",
+      "why": "Chinese prose quoting one short foreign token in code span",
+      "text": "上游日志里那行是 `das ist nicht normal`，属于德语依赖的原文，我不翻译它。"
+    },
+    {
+      "expect": "quiet",
+      "why": "the rule's own body quoted back must not self-trigger",
+      "text": "## 回复语言纪律\n\n用用户的语言回答：本会话是中文，正文就必须是中文；只有当任务语境本身以英文为主（英文仓库文档、commit message、上游 issue 原文）时才整段用英文。\n\n绝不使用用户从未用过的第三种语言 —— 德语、法语、西班牙语、日语、韩语。那是不可读的噪音，会逼用户重问一遍。\n\n- 写到一半发现语言漂移 → 停下，整条消息用中文重写，不要中途切换。\n- 技术标识符保持原样：`--timeout`、`IdentityRuntime`、`conftest.py`、报错原文。只有包裹它们的叙述文字必须是中文。\n- 必须引用外语原文（报错、上游文档）时，把它放进反引号，叙述仍然用中文；反引号里的内容不触发本规则。\n\n错误：`Kurze Antwort: nein, das ist nicht normal — das war ein Hänger.`\n\n正确：简短回答：不正常，这是卡住了。问题：重构只做了一半，`tests/conftest.py` 仍在构造 `object.__new__(OctoAdapter)`，但身份状态已经搬到 `IdentityRuntime`。\n"
+    }
+  ]
+}

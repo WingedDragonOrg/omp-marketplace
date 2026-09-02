@@ -1,0 +1,92 @@
+{
+  "cases": [
+    {
+      "expect": "trigger",
+      "why": "bare except swallowing a parse error",
+      "source": "tool",
+      "tool": "write",
+      "path": "tools/report.py",
+      "text": "def read_row(line):\n    try:\n        return parse(line)\n    except:\n        pass\n"
+    },
+    {
+      "expect": "trigger",
+      "why": "except Exception with only a comment then pass",
+      "source": "tool",
+      "tool": "edit",
+      "path": "svc/queue.py",
+      "text": "    try:\n        self.ack(msg)\n    except Exception:\n        # nothing we can do here\n        pass\n"
+    },
+    {
+      "expect": "trigger",
+      "why": "tuple of OS errors swallowed",
+      "source": "tool",
+      "tool": "edit",
+      "path": "svc/files.py",
+      "text": "    try:\n        os.unlink(tmp)\n    except (OSError, IOError):\n        pass\n"
+    },
+    {
+      "expect": "trigger",
+      "why": "named binding then pass",
+      "source": "tool",
+      "tool": "edit",
+      "path": "svc/index.py",
+      "text": "    try:\n        idx = mapping[key]\n    except KeyError as k:\n        pass\n"
+    },
+    {
+      "expect": "trigger",
+      "why": "one-line handler",
+      "source": "tool",
+      "tool": "edit",
+      "path": "svc/net.py",
+      "text": "    try:\n        sock.close()\n    except Exception: pass\n"
+    },
+    {
+      "expect": "quiet",
+      "why": "handler logs and re-raises",
+      "source": "tool",
+      "tool": "edit",
+      "path": "svc/queue.py",
+      "text": "    try:\n        self.ack(msg)\n    except Exception as exc:\n        logger.warning(\"ack failed\", exc_info=exc)\n        raise\n"
+    },
+    {
+      "expect": "quiet",
+      "why": "handler returns a fallback value",
+      "source": "tool",
+      "tool": "edit",
+      "path": "svc/index.py",
+      "text": "    try:\n        return mapping[key]\n    except KeyError:\n        return None\n"
+    },
+    {
+      "expect": "quiet",
+      "why": "contextlib.suppress, the endorsed alternative",
+      "source": "tool",
+      "tool": "edit",
+      "path": "svc/files.py",
+      "text": "    with contextlib.suppress(FileNotFoundError):\n        os.unlink(tmp)\n"
+    },
+    {
+      "expect": "quiet",
+      "why": "pass as a real empty method body",
+      "source": "tool",
+      "tool": "write",
+      "path": "svc/protocol.py",
+      "text": "class Sink:\n    def emit(self, record):\n        pass\n"
+    },
+    {
+      "expect": "quiet",
+      "why": "the pattern quoted inside a TypeScript string",
+      "source": "tool",
+      "tool": "edit",
+      "path": "web/lint.ts",
+      "text": "export const HINT = \"python: never write except: pass\";\n"
+    },
+    {
+      "expect": "quiet",
+      "why": "the pattern quoted in project docs",
+      "source": "tool",
+      "tool": "write",
+      "path": "docs/style.md",
+      "text": "# Python\n\nDo not write `except: pass` — handle or re-raise.\n"
+    }
+  ]
+}

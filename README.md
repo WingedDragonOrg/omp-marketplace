@@ -17,6 +17,7 @@ omp plugin install wt@winged-dragon-org
 | `skill-gate` | extension + skill | `when:` frontmatter gates a skill on env vars, os/arch, cwd, marker files or PATH binaries; `/skill-gate` explains each decision |
 | `spec` | skill | `spec-design` — design interview that converges an idea into an implementable spec in `docs/specs/`, one product-level decision at a time |
 | `multica-mention-guard` | extension | Publishes a Multica task's final message verbatim and gates `session_stop` on valid `mention://` targets, reminding once |
+| `omfg` | skill | `omfg` — author a TTSR stream rule that catches the class of failure behind a complaint, with a corpus that scores it; manual invocation only (`/skill:omfg`) |
 
 ## Layout
 

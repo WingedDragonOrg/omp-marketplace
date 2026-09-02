@@ -94,6 +94,23 @@
         "name": "WingedDragonOrg"
       },
       "license": "MIT"
+    },
+    {
+      "name": "omfg",
+      "description": "TTSR rule authoring skill: turn a complaint about recurring assistant behavior into a stream rule that catches the class, with a scored corpus",
+      "source": "./omfg",
+      "version": "1.0.0",
+      "category": "development",
+      "keywords": [
+        "ttsr",
+        "rules",
+        "guardrail",
+        "regex"
+      ],
+      "author": {
+        "name": "WingedDragonOrg"
+      },
+      "license": "MIT"
     }
   ]
 }
