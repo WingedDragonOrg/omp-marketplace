@@ -12,12 +12,14 @@
   "plugins": [
     {
       "name": "wt",
-      "description": "Git worktree manager: /wt creates, lists, removes worktrees under ~/.omp/wt and moves the session into one",
+      "description": "Worktree manager: /wt uses Worktrunk for lifecycle hooks and local merge automation, with native Git fallback",
       "source": "./wt",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "category": "development",
       "keywords": [
         "worktree",
+        "worktrunk",
+        "merge",
         "git",
         "extension",
         "session"
