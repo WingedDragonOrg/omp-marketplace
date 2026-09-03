@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSy
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 
-import registerWorktreeManager from "./wt.ts";
+import registerWorktreeManager from "./wtm.ts";
 
 const originalPath = process.env.PATH;
 const originalWorktreeDir = process.env.OMP_WORKTREE_DIR;
@@ -20,6 +20,7 @@ interface HandlerContext {
   ui: {
     notify(text: string, level: Notice["level"]): void;
     confirm(title: string, message: string): Promise<boolean>;
+    setEditorText(text: string): void;
   };
   sessionManager: {
     moveTo(destination: string): Promise<void>;
@@ -34,6 +35,7 @@ interface RegisteredCommand {
 interface Harness {
   handler: RegisteredCommand["handler"];
   notices: Notice[];
+  editorTexts: string[];
   moves: string[];
   confirmations: Array<{ title: string; message: string }>;
   reloads: number;
@@ -135,16 +137,17 @@ function initMergeSource(root: string, branch = "feature"): { repo: string; sour
 function makeHarness(cwd: string): Harness {
   let command: RegisteredCommand | undefined;
   const notices: Notice[] = [];
+  const editorTexts: string[] = [];
   const moves: string[] = [];
   const confirmations: Array<{ title: string; message: string }> = [];
   const state = { reloads: 0 };
   registerWorktreeManager({
     setLabel() {},
     registerCommand(name: string, spec: unknown) {
-      if (name === "wt" && isRegisteredCommand(spec)) command = spec;
+      if (name === "wtm" && isRegisteredCommand(spec)) command = spec;
     },
   });
-  if (!command) throw new Error("/wt command was not registered");
+  if (!command) throw new Error("/wtm command was not registered");
 
   const ctx = {
     cwd,
@@ -156,6 +159,9 @@ function makeHarness(cwd: string): Harness {
       async confirm(title: string, message: string) {
         confirmations.push({ title, message });
         return true;
+      },
+      setEditorText(text: string) {
+        editorTexts.push(text);
       },
     },
     sessionManager: {
@@ -172,6 +178,7 @@ function makeHarness(cwd: string): Harness {
   return {
     handler: command.handler,
     notices,
+    editorTexts,
     moves,
     confirmations,
     get reloads() { return state.reloads; },
@@ -477,7 +484,7 @@ afterEach(() => {
   for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-describe("/wt backend selection", () => {
+describe("/wtm backend selection", () => {
   test("rejects merge without Worktrunk before changing the repository", async () => {
     // Catches treating the new `merge` subcommand as a worktree name on the native backend.
     const root = tempRoot();
@@ -495,8 +502,8 @@ describe("/wt backend selection", () => {
     expect(harness.notices.some(({ text, level }) => level === "error" && text.includes("Worktrunk"))).toBe(true);
   });
 
-  test("uses supported Worktrunk create output as the session destination", async () => {
-    // Catches bypassing Worktrunk, omitting the HEAD base, or deriving cwd from human output.
+  test("prepares the built-in move from supported Worktrunk create output", async () => {
+    // Catches mutating the session directly instead of handing the verified path to OMP core.
     const root = tempRoot();
     const repo = initRepo(root);
     const target = path.join(root, "managed", "repo-topic");
@@ -514,8 +521,9 @@ describe("/wt backend selection", () => {
 
     await harness.handler("topic", harness.ctx);
 
-    expect(harness.moves).toEqual([target]);
-    expect(harness.reloads).toBe(1);
+    expect(harness.editorTexts).toEqual([`/move "${target}"`]);
+    expect(harness.moves).toEqual([]);
+    expect(harness.reloads).toBe(0);
     const calls = fakeCalls(log);
     const switchCall = calls.find((args) => args.includes("switch"));
     expect(switchCall).toBeDefined();
@@ -524,10 +532,127 @@ describe("/wt backend selection", () => {
     expect(switchCall).toContain("--no-cd");
     expect(switchCall).toContain("--format=json");
     expect(switchCall?.some((arg) => arg.startsWith("worktree-path="))).toBe(true);
+    expect(harness.notices.some(({ text }) => text.includes("move command is ready"))).toBe(true);
+    expect(harness.notices.every(({ text }) => !text.includes("Moved session"))).toBe(true);
+  });
+
+  test("preserves special characters in a move handoff", async () => {
+    // Catches shell/JSON escaping a freeform /move path that OMP only unwraps once.
+    const root = tempRoot();
+    const repo = initRepo(root);
+    const target = path.join(root, `managed space`, `repo "quoted" \\ tail `);
+    process.env.OMP_WORKTREE_DIR = path.dirname(target);
+    installFakeWorktrunk(root, {
+      switchResult: {
+        action: "created_branch",
+        branch: "quoted-topic",
+        path: target,
+        created_branch: true,
+        base_branch: "main",
+      },
+    });
+    const harness = makeHarness(repo);
+
+    await harness.handler("quoted-topic", harness.ctx);
+
+    expect(harness.editorTexts).toEqual([`/move "${target}"`]);
+    expect(harness.moves).toEqual([]);
+    expect(harness.reloads).toBe(0);
+  });
+
+  test("registers only the WTM slash command", () => {
+    // Catches reintroducing a command name reserved by OMP core.
+    const names: string[] = [];
+    registerWorktreeManager({
+      setLabel() {},
+      registerCommand(name: string) {
+        names.push(name);
+      },
+    });
+
+    expect(names).toEqual(["wtm"]);
+  });
+
+  test("prints a copyable move command when no TUI is available", async () => {
+    // Catches making the handoff depend on setEditorText.
+    const root = tempRoot();
+    const repo = initRepo(root);
+    const worktreeDir = path.join(root, "headless-worktrees");
+    const target = path.join(worktreeDir, "repo-headless-topic");
+    process.env.PATH = "/usr/bin:/bin";
+    process.env.OMP_WORKTREE_DIR = worktreeDir;
+    const harness = makeHarness(repo);
+    harness.ctx.hasUI = false;
+
+    await harness.handler("headless-topic", harness.ctx);
+
+    expect(harness.editorTexts).toEqual([]);
+    expect(harness.notices.some(({ text }) => text.includes(`/move "${target}"`))).toBe(true);
+    expect(harness.moves).toEqual([]);
+  });
+
+  test("uses a timestamped branch when create has no positional name", async () => {
+    // Catches treating the empty command as help or producing a non-unique generic branch.
+    const root = tempRoot();
+    const repo = initRepo(root);
+    process.env.PATH = "/usr/bin:/bin";
+    process.env.OMP_WORKTREE_DIR = path.join(root, "default-worktrees");
+    const harness = makeHarness(repo);
+
+    await harness.handler("", harness.ctx);
+
+    const branches = git(repo, ["branch", "--format=%(refname:short)"]).split("\n");
+    const generated = branches.find((branch) => /^wt-\d{12}$/.test(branch));
+    expect(generated).toBeDefined();
+    expect(harness.editorTexts).toHaveLength(1);
+    expect(harness.editorTexts[0]).toContain(`repo-${generated}`);
+  });
+
+  test("uses an explicit base with a timestamped default branch", async () => {
+    // Catches dropping --base when the positional branch is omitted.
+    const root = tempRoot();
+    const repo = initRepo(root);
+    git(repo, ["branch", "base-point"]);
+    writeFileSync(path.join(repo, "later.txt"), "later\n");
+    git(repo, ["add", "later.txt"]);
+    git(repo, ["commit", "-m", "later"]);
+    process.env.PATH = "/usr/bin:/bin";
+    process.env.OMP_WORKTREE_DIR = path.join(root, "base-worktrees");
+    const harness = makeHarness(repo);
+
+    await harness.handler("--base base-point", harness.ctx);
+
+    const branches = git(repo, ["branch", "--format=%(refname:short)"]).split("\n");
+    const generated = branches.find((branch) => /^wt-\d{12}$/.test(branch));
+    expect(generated).toBeDefined();
+    expect(git(repo, ["rev-parse", generated!])).toBe(git(repo, ["rev-parse", "base-point"]));
+  });
+
+  test("retains a created worktree whose path cannot fit a slash command", async () => {
+    // Catches inserting a multiline path into the editor or rolling back completed Worktrunk state.
+    const root = tempRoot();
+    const repo = initRepo(root);
+    const target = path.join(root, "managed", "line\nbreak");
+    installFakeWorktrunk(root, {
+      switchResult: {
+        action: "created_branch",
+        branch: "line-break",
+        path: target,
+      },
+    });
+    const harness = makeHarness(repo);
+
+    await harness.handler("line-break", harness.ctx);
+
+    expect(existsSync(target)).toBe(true);
+    expect(harness.editorTexts).toEqual([]);
+    expect(harness.notices.some(({ text, level }) =>
+      level === "error" && text.includes("cannot be represented")
+    )).toBe(true);
   });
 });
 
-describe("/wt fallback and list behavior", () => {
+describe("/wtm fallback and list behavior", () => {
   test("keeps native create available when Worktrunk is absent", async () => {
     // Catches making the optional dependency mandatory for existing commands.
     const root = tempRoot();
@@ -541,8 +666,9 @@ describe("/wt fallback and list behavior", () => {
 
     const created = path.join(worktreeDir, "repo-native-topic");
     expect(git(repo, ["show-ref", "--verify", "refs/heads/native-topic"])).not.toBe("");
-    expect(harness.moves).toEqual([created]);
-    expect(harness.reloads).toBe(1);
+    expect(harness.editorTexts).toEqual([`/move "${created}"`]);
+    expect(harness.moves).toEqual([]);
+    expect(harness.reloads).toBe(0);
   });
 
   test("reuses an existing branch at its registered legacy path", async () => {
@@ -565,7 +691,8 @@ describe("/wt fallback and list behavior", () => {
 
     await harness.handler("legacy-topic", harness.ctx);
 
-    expect(harness.moves).toEqual([legacyPath]);
+    expect(harness.editorTexts).toEqual([`/move "${legacyPath}"`]);
+    expect(harness.moves).toEqual([]);
     const switchCall = fakeCalls(log).find((args) => args.includes("switch"));
     expect(switchCall).toBeDefined();
     expect(switchCall).not.toContain("--create");
@@ -625,7 +752,7 @@ describe("/wt fallback and list behavior", () => {
   });
 });
 
-describe("/wt Worktrunk removal", () => {
+describe("/wtm Worktrunk removal", () => {
   test("keeps the branch after Worktrunk removes its worktree", async () => {
     // Catches omitting --no-delete-branch from the Worktrunk boundary.
     const root = tempRoot();
@@ -680,21 +807,114 @@ describe("/wt Worktrunk removal", () => {
     expect(removeCall).toContain("--force");
   });
 
-  test("keeps the session on primary when self removal fails", async () => {
-    // Catches reloading into a source that Worktrunk may have partially removed.
+  test("prepares a primary move before self removal", async () => {
+    // Catches running removal, hooks, or confirmation while the session still occupies the source.
     const root = tempRoot();
     const repo = initRepo(root);
-    const source = path.join(root, "self-topic");
+    const source = path.join(root, "self topic");
     git(repo, ["worktree", "add", "-b", "self-topic", source]);
-    installFakeWorktrunk(root, { removeExit: 9 });
+    const log = installFakeWorktrunk(root);
     const harness = makeHarness(source);
 
     await harness.handler("rm self -y", harness.ctx);
 
-    expect(harness.moves).toEqual([repo]);
+    expect(harness.editorTexts).toEqual([`/move "${repo}"`]);
+    expect(harness.moves).toEqual([]);
     expect(harness.reloads).toBe(0);
+    expect(harness.confirmations).toEqual([]);
     expect(existsSync(source)).toBe(true);
-    expect(harness.notices.at(-1)?.level).toBe("error");
+    expect(fakeCalls(log).some((args) => args.includes("remove") || args.includes("approvals"))).toBe(false);
+    expect(harness.notices.some(({ text }) =>
+      text.includes(`/wtm rm ${JSON.stringify(source)}`) && !text.includes("-y")
+    )).toBe(true);
+  });
+
+  test("shows fresh identity before removing a worktree recreated at the same path", async () => {
+    // Catches treating an old path-only continuation as authorization to delete its replacement.
+    const root = tempRoot();
+    const repo = initRepo(root);
+    const source = path.join(root, "recreated-source");
+    git(repo, ["worktree", "add", "-b", "old-source", source]);
+    git(repo, ["worktree", "remove", source]);
+    git(repo, ["branch", "-D", "old-source"]);
+    git(repo, ["worktree", "add", "-b", "replacement-source", source]);
+    process.env.PATH = "/usr/bin:/bin";
+    const harness = makeHarness(repo);
+    harness.ctx.ui.confirm = async (title, message) => {
+      harness.confirmations.push({ title, message });
+      return false;
+    };
+
+    await harness.handler(`rm ${JSON.stringify(source)}`, harness.ctx);
+
+    expect(existsSync(source)).toBe(true);
+    expect(harness.confirmations).toHaveLength(1);
+    expect(harness.confirmations[0].message).toContain("replacement-source");
+    expect(harness.confirmations[0].message).toContain(git(source, ["rev-parse", "--short=12", "HEAD"]));
+  });
+
+  test("rejects a removal path replaced by another repository", async () => {
+    // Catches deleting a foreign checkout that occupies stale worktree metadata from this repository.
+    const root = tempRoot();
+    const repo = initRepo(root);
+    const source = path.join(root, "foreign-replacement");
+    git(repo, ["worktree", "add", "-b", "old-source", source]);
+    rmSync(source, { recursive: true, force: true });
+    mkdirSync(source);
+    git(source, ["init", "-b", "main"]);
+    git(source, ["config", "user.name", "Foreign Test"]);
+    git(source, ["config", "user.email", "foreign@example.invalid"]);
+    git(source, ["commit", "--allow-empty", "-m", "foreign"]);
+    const foreignHead = git(source, ["rev-parse", "HEAD"]);
+    process.env.PATH = "/usr/bin:/bin";
+    const harness = makeHarness(repo);
+
+    await harness.handler(`rm ${JSON.stringify(source)} -f -y`, harness.ctx);
+
+    expect(existsSync(source)).toBe(true);
+    expect(git(source, ["rev-parse", "HEAD"])).toBe(foreignHead);
+    expect(harness.notices.some(({ text, level }) =>
+      level === "error" && text.includes("current repository")
+    )).toBe(true);
+  });
+
+  test("excludes foreign repositories occupying stale paths from remove all", async () => {
+    // Catches classifying any live Git root as an eligible worktree of the current repository.
+    const root = tempRoot();
+    const repo = initRepo(root);
+    const current = path.join(root, "current-topic");
+    const foreign = path.join(root, "foreign-topic");
+    git(repo, ["worktree", "add", "-b", "current-topic", current]);
+    git(repo, ["worktree", "add", "-b", "foreign-topic", foreign]);
+    rmSync(foreign, { recursive: true, force: true });
+    mkdirSync(foreign);
+    git(foreign, ["init", "-b", "main"]);
+    git(foreign, ["config", "user.name", "Foreign Test"]);
+    git(foreign, ["config", "user.email", "foreign@example.invalid"]);
+    git(foreign, ["commit", "--allow-empty", "-m", "foreign"]);
+    const foreignHead = git(foreign, ["rev-parse", "HEAD"]);
+    process.env.PATH = "/usr/bin:/bin";
+    const harness = makeHarness(current);
+
+    await harness.handler("rm --all -f -y", harness.ctx);
+
+    expect(existsSync(foreign)).toBe(true);
+    expect(git(foreign, ["rev-parse", "HEAD"])).toBe(foreignHead);
+  });
+
+  test("decodes a JSON string selector for a special-character path", async () => {
+    // Catches splitting a generated continuation command on whitespace or escape characters.
+    const root = tempRoot();
+    const repo = initRepo(root);
+    const target = path.join(root, `topic "quoted" \\ path`);
+    git(repo, ["worktree", "add", "-b", "special-topic", target]);
+    process.env.PATH = "/usr/bin:/bin";
+    const harness = makeHarness(repo);
+
+    await harness.handler(`rm ${JSON.stringify(target)} -y`, harness.ctx);
+
+    expect(existsSync(target)).toBe(false);
+    expect(runGitBranchExists(repo, "special-topic")).toBe(true);
   });
 
   test("remove all targets only eligible registered worktrees", async () => {
@@ -743,7 +963,7 @@ describe("/wt Worktrunk removal", () => {
   });
 });
 
-describe("/wt Worktrunk approvals and hooks", () => {
+describe("/wtm Worktrunk approvals and hooks", () => {
   test("stops before create when a relevant command is unapproved", async () => {
     // Catches using Worktrunk's run-scoped --yes bypass instead of its persisted approval state.
     const root = tempRoot();
@@ -833,7 +1053,8 @@ describe("/wt Worktrunk approvals and hooks", () => {
     await harness.handler("approved-topic", harness.ctx);
 
     expect(fakeCalls(log).some((args) => args.includes("approvals"))).toBe(true);
-    expect(harness.moves).toEqual([target]);
+    expect(harness.editorTexts).toEqual([`/move "${target}"`]);
+    expect(harness.moves).toEqual([]);
   });
 
   test("does not let remove yes bypass project approval", async () => {
@@ -886,7 +1107,7 @@ describe("/wt Worktrunk approvals and hooks", () => {
     expect(harness.moves).toEqual([]);
     expect(harness.notices.at(-1)?.text).toContain("pre-start project:test failed");
     expect(harness.notices.at(-1)?.text).toContain(target);
-    expect(harness.notices.at(-1)?.text).toContain("Retry /wt hook-topic");
+    expect(harness.notices.at(-1)?.text).toContain("Retry /wtm hook-topic");
   });
 
   test("points to Worktrunk logs after a background hook warning", async () => {
@@ -906,21 +1127,51 @@ describe("/wt Worktrunk approvals and hooks", () => {
 
     await harness.handler("background-topic", harness.ctx);
 
-    expect(harness.moves).toEqual([target]);
+    expect(harness.editorTexts).toEqual([`/move "${target}"`]);
+    expect(harness.moves).toEqual([]);
     expect(harness.notices.some(({ text }) => text.includes("wt config state logs"))).toBe(true);
   });
 });
 
-describe("/wt Worktrunk merge", () => {
-  test("runs the default merge after moving to a safe primary", async () => {
-    // Catches launching cleanup while the OMP session still points at the removable source.
+describe("/wtm Worktrunk merge", () => {
+  test("prepares a safe landing and stateless merge continuation", async () => {
+    // Catches running approvals, confirmation, or Worktrunk before OMP moves off the removable source.
+    const root = tempRoot();
+    const { repo, source } = initMergeSource(root);
+    const refsBefore = git(repo, ["show-ref"]);
+    const log = installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: repo, main: true, current: false },
+        { branch: "feature", path: source, main: false, current: true },
+      ]),
+    });
+    const harness = makeHarness(source);
+
+    await harness.handler("merge main --no-ff --stage tracked -y", harness.ctx);
+
+    expect(git(repo, ["show-ref"])).toBe(refsBefore);
+    expect(harness.editorTexts).toEqual([`/move "${repo}"`]);
+    expect(harness.moves).toEqual([]);
+    expect(harness.reloads).toBe(0);
+    expect(harness.confirmations).toEqual([]);
+    expect(fakeCalls(log).some((args) => args.includes("approvals") || args.includes("merge"))).toBe(false);
+    const continuation = harness.notices.find(({ text }) => text.includes("/wtm merge"))?.text ?? "";
+    expect(continuation).toContain(`/wtm merge "main"`);
+    expect(continuation).toContain("--no-ff");
+    expect(continuation).toContain("--stage tracked");
+    expect(continuation).toContain(`--source ${JSON.stringify(source)}`);
+    expect(continuation).not.toContain(" -y");
+  });
+
+  test("executes an explicit source from the safe worktree with fresh confirmation", async () => {
+    // Catches ignoring --source or carrying the preparation-stage confirmation skip into execution.
     const root = tempRoot();
     const { repo, source } = initMergeSource(root);
     const sourceHead = git(source, ["rev-parse", "HEAD"]);
     const log = installFakeWorktrunk(root, {
       list: worktrunkListFixture("main", [
-        { branch: "main", path: repo, main: true, current: false },
-        { branch: "feature", path: source, main: false, current: true },
+        { branch: "main", path: repo, main: true, current: true },
+        { branch: "feature", path: source, main: false, current: false },
       ]),
       mergeResult: {
         branch: "feature",
@@ -935,22 +1186,208 @@ describe("/wt Worktrunk merge", () => {
       mergeDeleteSourceBranch: true,
       mergePrimary: repo,
       mergeTarget: "main",
-      requiredMove: repo,
     });
-    const harness = makeHarness(source);
+    const harness = makeHarness(repo);
 
-    await harness.handler("merge -y", harness.ctx);
+    await harness.handler(`merge "main" --source ${JSON.stringify(source)}`, harness.ctx);
 
-    expect(harness.moves).toEqual([repo]);
-    expect(harness.reloads).toBe(1);
+    expect(harness.confirmations).toHaveLength(1);
+    expect(harness.editorTexts).toEqual([]);
+    expect(harness.moves).toEqual([]);
+    expect(harness.reloads).toBe(0);
     expect(git(repo, ["rev-parse", "main"])).toBe(sourceHead);
     expect(existsSync(source)).toBe(false);
     expect(runGitBranchExists(repo, "feature")).toBe(false);
     const mergeCall = fakeCalls(log).find((args) => args.includes("merge"));
     expect(mergeCall).toContain("--format=json");
-    expect(mergeCall).not.toContain("--yes");
+    expect(mergeCall).toContain(source);
     expect(harness.notices.some(({ text }) => text.includes("target main updated"))).toBe(true);
     expect(harness.notices.some(({ text }) => text.includes("cleanup scheduled"))).toBe(true);
+  });
+
+  test("refuses a new merge while the source has an in-progress rebase", async () => {
+    // Catches replaying the Worktrunk pipeline over conflict recovery state.
+    const root = tempRoot();
+    const { repo, source } = initMergeSource(root);
+    const rebaseState = git(source, ["rev-parse", "--git-path", "rebase-merge"]);
+    mkdirSync(rebaseState, { recursive: true });
+    const log = installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: repo, main: true, current: true },
+        { branch: "feature", path: source, main: false, current: false },
+      ]),
+    });
+    const harness = makeHarness(repo);
+
+    await harness.handler(`merge --source ${JSON.stringify(source)}`, harness.ctx);
+
+    expect(fakeCalls(log).some((args) => args.includes("approvals") || args.includes("merge"))).toBe(false);
+    expect(harness.notices.some(({ text, level }) =>
+      level === "error" && text.includes("in-progress") && text.includes("rebase")
+    )).toBe(true);
+  });
+
+  test("detects an in-progress merge in the primary worktree", async () => {
+    // Catches resolving a primary Git state path relative to the plugin process instead of the repository.
+    const root = tempRoot();
+    const repo = initRepo(root);
+    const mergeHead = git(repo, ["rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"]);
+    writeFileSync(mergeHead, `${git(repo, ["rev-parse", "HEAD"])}\n`);
+    const log = installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: repo, main: true, current: true },
+      ]),
+    });
+    const harness = makeHarness(repo);
+
+    await harness.handler("merge --no-remove", harness.ctx);
+
+    expect(fakeCalls(log).some((args) => args.includes("approvals") || args.includes("merge"))).toBe(false);
+    expect(harness.notices.some(({ text, level }) =>
+      level === "error" && text.includes("in-progress") && text.includes("merge")
+    )).toBe(true);
+  });
+
+  test("does not replay integration when target already contains source", async () => {
+    // Catches rerunning commit, rebase, or fast-forward after cleanup alone was left incomplete.
+    const root = tempRoot();
+    const { repo, source } = initMergeSource(root);
+    git(repo, ["merge", "--ff-only", "feature"]);
+    const log = installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: repo, main: true, current: true },
+        { branch: "feature", path: source, main: false, current: false },
+      ]),
+    });
+    const harness = makeHarness(repo);
+
+    await harness.handler(`merge --source ${JSON.stringify(source)}`, harness.ctx);
+
+    expect(fakeCalls(log).some((args) => args.includes("approvals") || args.includes("merge"))).toBe(false);
+    expect(harness.notices.some(({ text, level }) =>
+      level === "warning" && text.includes("integration is already complete") && text.includes("wt config state logs")
+    )).toBe(true);
+    expect(existsSync(source)).toBe(true);
+  });
+
+  test("starts a new merge when an integrated source has uncommitted changes", async () => {
+    // Catches mistaking source HEAD ancestry for completion when Worktrunk still has dirty content to integrate.
+    const root = tempRoot();
+    const { repo, source } = initMergeSource(root);
+    git(repo, ["merge", "--ff-only", "feature"]);
+    writeFileSync(path.join(source, "dirty.txt"), "new work\n");
+    const log = installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: repo, main: true, current: true },
+        { branch: "feature", path: source, main: false, current: false },
+      ]),
+      mergeResult: {
+        branch: "feature",
+        committed: true,
+        rebased: false,
+        removed: false,
+        squashed: false,
+        target: "main",
+      },
+      mergePrimary: repo,
+      mergeTarget: "main",
+    });
+    const harness = makeHarness(repo);
+
+    await harness.handler(`merge -y --source ${JSON.stringify(source)}`, harness.ctx);
+
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(true);
+  });
+
+  test("rejects an ordinary directory as an explicit merge source", async () => {
+    // Catches accepting path existence without live Git worktree registration and repository identity.
+    const root = tempRoot();
+    const repo = initRepo(root);
+    const ordinary = path.join(repo, "ordinary");
+    mkdirSync(ordinary);
+    const log = installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: repo, main: true, current: true },
+      ]),
+    });
+    const harness = makeHarness(repo);
+
+    await harness.handler(`merge --source ${JSON.stringify(ordinary)}`, harness.ctx);
+
+    expect(fakeCalls(log).some((args) => args.includes("approvals") || args.includes("merge"))).toBe(false);
+    expect(harness.notices.some(({ text, level }) =>
+      level === "error" && text.includes("live registered branch worktree")
+    )).toBe(true);
+  });
+
+  test("rejects an explicit source from another repository", async () => {
+    // Catches authorizing a source solely because it is a valid worktree on disk.
+    const root = tempRoot();
+    const currentRoot = path.join(root, "current-root");
+    mkdirSync(currentRoot);
+    const currentRepo = initRepo(currentRoot);
+    const otherRoot = path.join(root, "other-root");
+    mkdirSync(otherRoot);
+    const { source: otherSource } = initMergeSource(otherRoot);
+    const log = installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: currentRepo, main: true, current: true },
+      ]),
+    });
+    const harness = makeHarness(currentRepo);
+
+    await harness.handler(`merge --source ${JSON.stringify(otherSource)}`, harness.ctx);
+
+    expect(fakeCalls(log).some((args) => args.includes("approvals") || args.includes("merge"))).toBe(false);
+    expect(harness.notices.some(({ text, level }) =>
+      level === "error" && text.includes("current repository")
+    )).toBe(true);
+  });
+
+  test("reissues a safe handoff when explicit source is still current", async () => {
+    // Catches treating --source as permission to delete the worktree occupied by the session.
+    const root = tempRoot();
+    const { repo, source } = initMergeSource(root);
+    const log = installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: repo, main: true, current: false },
+        { branch: "feature", path: source, main: false, current: true },
+      ]),
+    });
+    const harness = makeHarness(source);
+
+    await harness.handler(`merge -y --source ${JSON.stringify(source)}`, harness.ctx);
+
+    expect(harness.editorTexts).toEqual([`/move "${repo}"`]);
+    expect(fakeCalls(log).some((args) => args.includes("approvals") || args.includes("merge"))).toBe(false);
+    const continuation = harness.notices.find(({ text }) => text.includes("/wtm merge"))?.text ?? "";
+    expect(continuation).toContain(`--source ${JSON.stringify(source)}`);
+    expect(continuation).not.toContain(" -y");
+  });
+
+  test("runs directly when the primary source is also the target branch", async () => {
+    // Catches requiring a handoff when Worktrunk cannot remove the current primary branch.
+    const root = tempRoot();
+    const repo = initRepo(root);
+    const log = installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: repo, main: true, current: true },
+      ]),
+      mergeResult: {
+        branch: "main",
+        committed: false,
+        rebased: false,
+        removed: false,
+        squashed: false,
+        target: "main",
+      },
+    });
+    const harness = makeHarness(repo);
+
+    await harness.handler("merge -y", harness.ctx);
+
+    expect(harness.editorTexts).toEqual([]);
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(true);
   });
 
   test("keeps the source session for no-remove merge flags", async () => {
@@ -1053,8 +1490,8 @@ describe("/wt Worktrunk merge", () => {
     expect(harness.confirmations[0].message).toContain("Commit: disabled");
     expect(harness.confirmations[0].message).toContain("Squash: disabled");
   });
-  test("prefers a registered target worktree as safe landing", async () => {
-    // Catches ignoring an exact target checkout in favor of an unrelated primary.
+  test("prefers a registered target worktree for the move handoff", async () => {
+    // Catches preparing an unrelated primary when the target branch already has a live checkout.
     const root = tempRoot();
     const { repo, source } = initMergeSource(root);
     const targetPath = path.join(root, "develop");
@@ -1065,28 +1502,19 @@ describe("/wt Worktrunk merge", () => {
         { branch: "feature", path: source, main: false, current: true },
         { branch: "develop", path: targetPath, main: false, current: false },
       ]),
-      mergeResult: {
-        branch: "feature",
-        committed: false,
-        rebased: true,
-        removed: true,
-        squashed: true,
-        target: "develop",
-      },
-      mergeUpdateTarget: true,
-      mergeRemoveSource: true,
-      mergeDeleteSourceBranch: true,
-      mergePrimary: repo,
       mergeTarget: "develop",
-      requiredMove: targetPath,
     });
     const harness = makeHarness(source);
 
     await harness.handler("merge develop -y", harness.ctx);
 
-    expect(harness.moves).toEqual([targetPath]);
-    expect(harness.reloads).toBe(1);
-    expect(existsSync(source)).toBe(false);
+    expect(harness.editorTexts).toEqual([`/move "${targetPath}"`]);
+    expect(harness.moves).toEqual([]);
+    expect(harness.reloads).toBe(0);
+    expect(existsSync(source)).toBe(true);
+    expect(harness.notices.some(({ text }) =>
+      text.includes(`/wtm merge "develop"`) && text.includes(`--source ${JSON.stringify(source)}`)
+    )).toBe(true);
   });
 
   test("reconciles target update after pre-remove failure", async () => {
@@ -1096,8 +1524,8 @@ describe("/wt Worktrunk merge", () => {
     const sourceHead = git(source, ["rev-parse", "HEAD"]);
     installFakeWorktrunk(root, {
       list: worktrunkListFixture("main", [
-        { branch: "main", path: repo, main: true, current: false },
-        { branch: "feature", path: source, main: false, current: true },
+        { branch: "main", path: repo, main: true, current: true },
+        { branch: "feature", path: source, main: false, current: false },
       ]),
       mergeRaw: "",
       mergeExit: 7,
@@ -1105,17 +1533,16 @@ describe("/wt Worktrunk merge", () => {
       mergeUpdateTarget: true,
       mergePrimary: repo,
       mergeTarget: "main",
-      requiredMove: repo,
     });
-    const harness = makeHarness(source);
+    const harness = makeHarness(repo);
 
-    await harness.handler("merge -y", harness.ctx);
+    await harness.handler(`merge -y --source ${JSON.stringify(source)}`, harness.ctx);
 
     expect(git(repo, ["rev-parse", "main"])).toBe(sourceHead);
     expect(existsSync(source)).toBe(true);
     expect(runGitBranchExists(repo, "feature")).toBe(true);
-    expect(harness.moves).toEqual([repo]);
-    expect(harness.reloads).toBe(1);
+    expect(harness.moves).toEqual([]);
+    expect(harness.reloads).toBe(0);
     expect(harness.notices.some(({ text }) => text.includes("target main updated"))).toBe(true);
     expect(harness.notices.some(({ text }) => text.includes("source worktree registered"))).toBe(true);
     expect(harness.notices.some(({ text }) => text.includes("Native Git was not retried"))).toBe(true);
@@ -1128,24 +1555,23 @@ describe("/wt Worktrunk merge", () => {
     const targetBefore = git(repo, ["rev-parse", "main"]);
     installFakeWorktrunk(root, {
       list: worktrunkListFixture("main", [
-        { branch: "main", path: repo, main: true, current: false },
-        { branch: "feature", path: source, main: false, current: true },
+        { branch: "main", path: repo, main: true, current: true },
+        { branch: "feature", path: source, main: false, current: false },
       ]),
       mergeRaw: "",
       mergeExit: 8,
       mergeStderr: "rebase conflict remains in source",
       mergePrimary: repo,
       mergeTarget: "main",
-      requiredMove: repo,
     });
-    const harness = makeHarness(source);
+    const harness = makeHarness(repo);
 
-    await harness.handler("merge -y", harness.ctx);
+    await harness.handler(`merge -y --source ${JSON.stringify(source)}`, harness.ctx);
 
     expect(git(repo, ["rev-parse", "main"])).toBe(targetBefore);
     expect(existsSync(source)).toBe(true);
     expect(runGitBranchExists(repo, "feature")).toBe(true);
-    expect(harness.reloads).toBe(1);
+    expect(harness.reloads).toBe(0);
     expect(harness.notices.some(({ text }) => text.includes("target main unchanged"))).toBe(true);
   });
 
@@ -1156,18 +1582,17 @@ describe("/wt Worktrunk merge", () => {
     const sourceHead = git(source, ["rev-parse", "HEAD"]);
     const log = installFakeWorktrunk(root, {
       list: worktrunkListFixture("main", [
-        { branch: "main", path: repo, main: true, current: false },
-        { branch: "feature", path: source, main: false, current: true },
+        { branch: "main", path: repo, main: true, current: true },
+        { branch: "feature", path: source, main: false, current: false },
       ]),
       mergeRaw: "not-json",
       mergeUpdateTarget: true,
       mergePrimary: repo,
       mergeTarget: "main",
-      requiredMove: repo,
     });
-    const harness = makeHarness(source);
+    const harness = makeHarness(repo);
 
-    await harness.handler("merge -y", harness.ctx);
+    await harness.handler(`merge -y --source ${JSON.stringify(source)}`, harness.ctx);
 
     expect(git(repo, ["rev-parse", "main"])).toBe(sourceHead);
     expect(fakeCalls(log).filter((args) => args.includes("merge"))).toHaveLength(1);
@@ -1175,8 +1600,8 @@ describe("/wt Worktrunk merge", () => {
     expect(harness.notices.some(({ text }) => text.includes("Native Git was not retried"))).toBe(true);
   });
 
-  test("labels a non-target primary as the safe landing", async () => {
-    // Catches telling the user that a valid primary checkout is the requested target checkout.
+  test("uses the primary handoff when the target has no worktree", async () => {
+    // Catches inventing a target checkout instead of selecting the live primary.
     const root = tempRoot();
     const { repo, source } = initMergeSource(root);
     git(repo, ["branch", "develop", "main"]);
@@ -1185,26 +1610,17 @@ describe("/wt Worktrunk merge", () => {
         { branch: "main", path: repo, main: true, current: false },
         { branch: "feature", path: source, main: false, current: true },
       ]),
-      mergeResult: {
-        branch: "feature",
-        committed: false,
-        rebased: true,
-        removed: false,
-        squashed: true,
-        target: "develop",
-      },
-      mergeUpdateTarget: true,
-      mergePrimary: repo,
       mergeTarget: "develop",
-      requiredMove: repo,
     });
     const harness = makeHarness(source);
 
     await harness.handler("merge develop -y", harness.ctx);
 
-    expect(harness.moves).toEqual([repo]);
-    expect(harness.notices.some(({ text }) => text.includes("primary safe landing"))).toBe(true);
-    expect(harness.notices.some(({ text }) => text.includes("checked out target develop"))).toBe(false);
+    expect(harness.editorTexts).toEqual([`/move "${repo}"`]);
+    expect(harness.moves).toEqual([]);
+    expect(harness.notices.some(({ text }) =>
+      text.includes(`/wtm merge "develop"`) && text.includes(`--source ${JSON.stringify(source)}`)
+    )).toBe(true);
   });
 
 
@@ -1214,8 +1630,8 @@ describe("/wt Worktrunk merge", () => {
     const { repo, source } = initMergeSource(root);
     const log = installFakeWorktrunk(root, {
       list: worktrunkListFixture("main", [
-        { branch: "main", path: repo, main: true, current: false },
-        { branch: "feature", path: source, main: false, current: true },
+        { branch: "main", path: repo, main: true, current: true },
+        { branch: "feature", path: source, main: false, current: false },
       ]),
       approvals: {
         state: "approval_required",
@@ -1230,40 +1646,40 @@ describe("/wt Worktrunk merge", () => {
       mergePrimary: repo,
       mergeTarget: "main",
     });
-    const harness = makeHarness(source);
+    const harness = makeHarness(repo);
 
-    await harness.handler("merge -y", harness.ctx);
+    await harness.handler(`merge -y --source ${JSON.stringify(source)}`, harness.ctx);
 
     expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(false);
     expect(harness.moves).toEqual([]);
     expect(harness.notices.at(-1)?.text).toContain("post-switch/announce: echo merged");
   });
-  test("reloads the safe landing when the pinned binary disappears", async () => {
-    // Catches an ENOENT escaping after session pre-migration and skipping the required reload.
+  test("reports a pinned binary disappearing before merge execution", async () => {
+    // Catches an executable ENOENT escaping without reconciliation diagnostics.
     const root = tempRoot();
     const { repo, source } = initMergeSource(root);
     const targetBefore = git(repo, ["rev-parse", "main"]);
     installFakeWorktrunk(root, {
       list: worktrunkListFixture("main", [
-        { branch: "main", path: repo, main: true, current: false },
-        { branch: "feature", path: source, main: false, current: true },
+        { branch: "main", path: repo, main: true, current: true },
+        { branch: "feature", path: source, main: false, current: false },
       ]),
       mergePrimary: repo,
       mergeTarget: "main",
       deleteAfterApprovals: true,
     });
-    const harness = makeHarness(source);
+    const harness = makeHarness(repo);
 
-    await harness.handler("merge -y", harness.ctx);
+    await harness.handler(`merge -y --source ${JSON.stringify(source)}`, harness.ctx);
 
     expect(git(repo, ["rev-parse", "main"])).toBe(targetBefore);
-    expect(harness.moves).toEqual([repo]);
-    expect(harness.reloads).toBe(1);
+    expect(harness.moves).toEqual([]);
+    expect(harness.reloads).toBe(0);
     expect(harness.notices.some(({ text }) => text.includes("Native Git was not retried"))).toBe(true);
   });
 });
 
-describe("/wt Worktrunk compatibility boundary", () => {
+describe("/wtm Worktrunk compatibility boundary", () => {
   test("falls back before mutation for an unsupported Worktrunk version", async () => {
     // Catches sending mutating argv to a future CLI whose JSON contract was never validated.
     const root = tempRoot();
@@ -1384,7 +1800,8 @@ process.exit(91);
     const identities = readFileSync(identityLog, "utf8").trim().split("\n");
     expect(identities.length).toBeGreaterThanOrEqual(3);
     expect(identities.every((identity) => identity === "original")).toBe(true);
-    expect(harness.moves).toEqual([target]);
+    expect(harness.editorTexts).toEqual([`/move "${target}"`]);
+    expect(harness.moves).toEqual([]);
   });
 
   test("rejects unvalidated prerelease builds inside the supported minor", async () => {
@@ -1403,7 +1820,7 @@ process.exit(91);
   });
 });
 
-describe("/wt reviewed reconciliation boundaries", () => {
+describe("/wtm reviewed reconciliation boundaries", () => {
   test("rejects a switch result that is not a registered worktree", async () => {
     // Catches moving the session to an unrelated directory from structurally valid JSON.
     const root = tempRoot();
@@ -1429,7 +1846,7 @@ describe("/wt reviewed reconciliation boundaries", () => {
   });
 
   test("skips a recreated stale target path as merge landing", async () => {
-    // Catches reloading OMP into an ordinary directory occupying stale worktree metadata.
+    // Catches handing /move an ordinary directory occupying stale worktree metadata.
     const root = tempRoot();
     const { repo, source } = initMergeSource(root);
     const staleTarget = path.join(root, "stale-develop");
@@ -1442,24 +1859,15 @@ describe("/wt reviewed reconciliation boundaries", () => {
         { branch: "feature", path: source, main: false, current: true },
         { branch: "develop", path: staleTarget, main: false, current: false },
       ]),
-      mergeResult: {
-        branch: "feature",
-        committed: false,
-        rebased: false,
-        removed: false,
-        squashed: false,
-        target: "develop",
-      },
-      mergePrimary: repo,
-      mergeTarget: "develop",
-      requiredMove: repo,
     });
     const harness = makeHarness(source);
 
     await harness.handler("merge develop -y", harness.ctx);
 
-    expect(harness.moves).toEqual([repo]);
-    expect(harness.reloads).toBe(1);
+    expect(harness.editorTexts).toEqual([`/move "${repo}"`]);
+    expect(harness.moves).toEqual([]);
+    expect(harness.reloads).toBe(0);
+    expect(existsSync(source)).toBe(true);
   });
 
   test("uses Worktrunk primary metadata with a separate git directory", async () => {
@@ -1484,24 +1892,14 @@ describe("/wt reviewed reconciliation boundaries", () => {
         { branch: "main", path: repo, main: true, current: false },
         { branch: "feature", path: source, main: false, current: true },
       ]),
-      mergeResult: {
-        branch: "feature",
-        committed: false,
-        rebased: false,
-        removed: false,
-        squashed: false,
-        target: "main",
-      },
-      mergePrimary: repo,
-      mergeTarget: "main",
-      requiredMove: repo,
     });
     const harness = makeHarness(source);
 
     await harness.handler("merge -y", harness.ctx);
 
-    expect(harness.moves).toEqual([repo]);
-    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(true);
+    expect(harness.editorTexts).toEqual([`/move "${repo}"`]);
+    expect(harness.moves).toEqual([]);
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(false);
   });
 
   test("omits cleanup approvals for no-remove merge", async () => {
@@ -1584,8 +1982,8 @@ describe("/wt reviewed reconciliation boundaries", () => {
     const { repo, source } = initMergeSource(root);
     installFakeWorktrunk(root, {
       list: worktrunkListFixture("main", [
-        { branch: "main", path: repo, main: true, current: false },
-        { branch: "feature", path: source, main: false, current: true },
+        { branch: "main", path: repo, main: true, current: true },
+        { branch: "feature", path: source, main: false, current: false },
       ]),
       mergeRaw: "",
       mergeExit: 7,
@@ -1593,11 +1991,10 @@ describe("/wt reviewed reconciliation boundaries", () => {
       mergeDeleteTarget: true,
       mergePrimary: repo,
       mergeTarget: "main",
-      requiredMove: repo,
     });
-    const harness = makeHarness(source);
+    const harness = makeHarness(repo);
 
-    await harness.handler("merge -y", harness.ctx);
+    await harness.handler(`merge -y --source ${JSON.stringify(source)}`, harness.ctx);
 
     expect(runGitBranchExists(repo, "main")).toBe(false);
     expect(harness.notices.some(({ text }) => text.includes("target main absent or unreadable"))).toBe(true);
@@ -1648,8 +2045,8 @@ describe("/wt reviewed reconciliation boundaries", () => {
     expect(harness.notices.at(-1)?.text).toContain(collateral);
   });
 
-  test("moves self removal to Worktrunk primary metadata", async () => {
-    // Catches treating a separate Git metadata directory as the primary worktree.
+  test("uses Worktrunk primary metadata for a self-removal handoff", async () => {
+    // Catches deriving the safe landing from a separate Git metadata directory.
     const root = tempRoot();
     const repo = path.join(root, "remove-separate-repo");
     const gitDir = path.join(root, "remove-separate-metadata");
@@ -1673,10 +2070,11 @@ describe("/wt reviewed reconciliation boundaries", () => {
 
     await harness.handler("rm self -y", harness.ctx);
 
-    expect(harness.moves).toEqual([repo]);
-    expect(existsSync(source)).toBe(false);
+    expect(harness.editorTexts).toEqual([`/move "${repo}"`]);
+    expect(harness.moves).toEqual([]);
+    expect(existsSync(source)).toBe(true);
     expect(runGitBranchExists(repo, "feature")).toBe(true);
-    expect(harness.reloads).toBe(1);
+    expect(harness.reloads).toBe(0);
   });
 
   test("rejects primary metadata from a different repository", async () => {

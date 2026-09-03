@@ -1,39 +1,104 @@
-// /wt — Git worktree lifecycle and Worktrunk merge integration for Oh My Pi.
+// /wtm — Git worktree lifecycle and Worktrunk merge integration for Oh My Pi.
 //
 // Stable Worktrunk v0.76.x releases are used for create/reuse, list, remove, hooks,
 // approvals, configured worktree paths, and merge. Existing lifecycle commands
 // retain a native Git fallback; merge requires Worktrunk.
 //
-// OMP owns session migration through `sessionManager.moveTo()` and
-// `ctx.reload()`. Worktrunk owns Git lifecycle operations. A cleanup-enabled
-// merge moves the session to a registered safe landing before source removal.
+// OMP owns session migration through its built-in `/move`. Worktrunk owns Git
+// lifecycle operations. Cleanup-enabled operations prepare a verified safe
+// landing and an explicit continuation command.
 //
 // `OMP_WORKTREE_DIR` overrides Worktrunk's configured path for new worktrees
 // while preserving the historical <repo>-<name> layout.
 
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import * as path from "node:path";
 import { homedir } from "node:os";
 import { accessSync, constants, existsSync, realpathSync } from "node:fs";
 
 const HELP = `Usage:
-  /wt [name] [--base <ref>]       create/reuse worktree + move session
-  /wt list                        list this repo's worktrees
-  /wt rm <name|path> [-f] [-y]    remove one worktree; keep its branch
-  /wt rm self [-f] [-y]           move to primary, then remove current worktree
-  /wt rm --all [-f] [-y]          remove eligible worktrees except primary/current
-  /wt prune                       prune stale Git worktree metadata
-  /wt merge [target] [flags]      run Worktrunk's local merge pipeline
+  /wtm [branch] [--base <ref>]     create/reuse worktree + prepare /move
+  /wtm list                        list this repo's worktrees
+  /wtm rm <name|path> [-f] [-y]    remove one worktree; keep its branch
+  /wtm rm self [-f] [-y]           prepare /move, then remove current worktree
+  /wtm rm --all [-f] [-y]          remove eligible worktrees except primary/current
+  /wtm prune                       prune stale Git worktree metadata
+  /wtm merge [target] [flags]      run Worktrunk's local merge pipeline
 
 Merge flags:
   --no-squash --no-commit --no-rebase --no-remove --no-ff
-  --stage all|tracked|none  -y
+  --stage all|tracked|none  --source <path>  -y
+
+Handoff:
+  Create/reuse and operations that can remove the current worktree prepare /move.
+  Submit /move, then run the printed /wtm continuation. Preparation-stage -y is
+  not carried into remove or merge execution.
 
 Backend:
   Stable Worktrunk v0.76.x releases provide paths, lifecycle hooks, approvals, and merge.
-  Existing commands fall back to native Git before mutation when Worktrunk is unavailable.
-  Merge never falls back. Unapproved project commands must first be approved with
-  'wt config approvals add'. -y skips only the OMP confirmation.
-  OMP_WORKTREE_DIR preserves the <repo>-<name> layout for newly created worktrees.`;
+  Lifecycle commands fall back to native Git only before mutation. Merge never falls back.
+  Unapproved project commands must first be approved with 'wt config approvals add'.
+  -y skips only the current OMP confirmation. OMP_WORKTREE_DIR preserves the
+  <repo>-<name> layout for newly created worktrees.`;
+
+type CommandArgumentParse =
+  | { kind: "ok"; args: string[] }
+  | { kind: "error"; detail: string };
+
+function parseCommandArguments(raw: string): CommandArgumentParse {
+  const args: string[] = [];
+  let index = 0;
+  while (index < raw.length) {
+    while (index < raw.length && /\s/.test(raw[index])) index++;
+    if (index >= raw.length) break;
+
+    if (raw[index] !== '"') {
+      const start = index;
+      while (index < raw.length && !/\s/.test(raw[index])) index++;
+      args.push(raw.slice(start, index));
+      continue;
+    }
+
+    const start = index;
+    index++;
+    let escaped = false;
+    while (index < raw.length) {
+      const char = raw[index];
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        index++;
+        break;
+      }
+      index++;
+    }
+    if (index > raw.length || raw[index - 1] !== '"') {
+      return { kind: "error", detail: "unterminated JSON string argument" };
+    }
+    if (index < raw.length && !/\s/.test(raw[index])) {
+      return { kind: "error", detail: "a JSON string argument must end at a token boundary" };
+    }
+
+    const literal = raw.slice(start, index);
+    try {
+      const value: unknown = JSON.parse(literal);
+      if (typeof value !== "string") {
+        return { kind: "error", detail: "quoted arguments must decode to strings" };
+      }
+      args.push(value);
+    } catch {
+      return { kind: "error", detail: `invalid JSON string argument: ${literal}` };
+    }
+  }
+  return { kind: "ok", args };
+}
+
+function buildMoveCommand(destination: string): string | null {
+  if (/[\0\r\n]/.test(destination)) return null;
+  return `/move "${destination}"`;
+}
 
 function worktreeBaseDir(): string {
   const env = process.env.OMP_WORKTREE_DIR;
@@ -438,7 +503,7 @@ function reportApprovalBlock(notify: Notify, check: Extract<WorktrunkApprovalChe
   ];
   notify(
     `Worktrunk project commands require native approval:\n${lines.map((line) => `  ${line}`).join("\n")}\n` +
-    "Review the complete scope in this repository with `wt config approvals add`, then retry /wt.",
+    "Review the complete scope in this repository with `wt config approvals add`, then retry /wtm.",
     "warning",
   );
 }
@@ -471,6 +536,7 @@ type MergeStage = "all" | "tracked" | "none";
 
 interface MergeOptions {
   target: string | null;
+  source: string | null;
   noSquash: boolean;
   noCommit: boolean;
   noRebase: boolean;
@@ -487,6 +553,7 @@ type MergeArgumentParse =
 function parseMergeArguments(args: string[]): MergeArgumentParse {
   const options: MergeOptions = {
     target: null,
+    source: null,
     noSquash: false,
     noCommit: false,
     noRebase: false,
@@ -504,7 +571,12 @@ function parseMergeArguments(args: string[]): MergeArgumentParse {
     else if (arg === "--no-remove") options.noRemove = true;
     else if (arg === "--no-ff") options.noFf = true;
     else if (arg === "-y" || arg === "--yes") options.yes = true;
-    else if (arg === "--stage" || arg.startsWith("--stage=")) {
+    else if (arg === "--source" || arg.startsWith("--source=")) {
+      const value = arg === "--source" ? args[++index] : arg.slice("--source=".length);
+      if (!value) return { kind: "error", detail: "--source requires an absolute worktree path" };
+      if (options.source !== null) return { kind: "error", detail: "--source may be specified only once" };
+      options.source = value;
+    } else if (arg === "--stage" || arg.startsWith("--stage=")) {
       const value = arg === "--stage" ? args[++index] : arg.slice("--stage=".length);
       if (value !== "all" && value !== "tracked" && value !== "none") {
         return { kind: "error", detail: "--stage requires all, tracked, or none" };
@@ -519,6 +591,36 @@ function parseMergeArguments(args: string[]): MergeArgumentParse {
     }
   }
   return { kind: "ok", options };
+}
+
+function buildMergeContinuation(target: string, options: MergeOptions, sourcePath: string): string {
+  const args = [`/wtm merge`, JSON.stringify(target)];
+  if (options.noSquash) args.push("--no-squash");
+  if (options.noCommit) args.push("--no-commit");
+  if (options.noRebase) args.push("--no-rebase");
+  if (options.noRemove) args.push("--no-remove");
+  if (options.noFf) args.push("--no-ff");
+  args.push("--stage", options.stage, "--source", JSON.stringify(sourcePath));
+  return args.join(" ");
+}
+
+function activeGitOperation(cwd: string): string | null {
+  const statePaths: Array<[string, string]> = [
+    ["rebase-merge", "rebase"],
+    ["rebase-apply", "rebase"],
+    ["MERGE_HEAD", "merge"],
+    ["CHERRY_PICK_HEAD", "cherry-pick"],
+    ["REVERT_HEAD", "revert"],
+  ];
+  for (const [gitPath, operation] of statePaths) {
+    const result = runGit(cwd, ["rev-parse", "--path-format=absolute", "--git-path", gitPath]);
+    if (result.code === 0 && existsSync(stripLineEnding(result.out))) return operation;
+  }
+  const status = runGit(cwd, ["status", "--porcelain"]);
+  if (status.code === 0 && status.out.split("\n").some((line) => /^(?:DD|AU|UD|UA|DU|AA|UU) /.test(line))) {
+    return "merge conflict";
+  }
+  return null;
 }
 
 interface WorktrunkMergeResult {
@@ -575,6 +677,10 @@ function canonicalPath(value: string): string {
   return realPath(value) ?? path.resolve(value);
 }
 
+function stripLineEnding(output: string): string {
+  return output.replace(/\r?\n$/, "");
+}
+
 
 function worktrunkFallbackWarning(backend: Exclude<WorktrunkBackend, { kind: "available" } | { kind: "missing" }>): string {
   if (backend.kind === "unsupported") {
@@ -603,17 +709,17 @@ interface PorcelainWorktree {
 }
 
 function listPorcelain(cwd: string): PorcelainWorktree[] {
-  const out = runGit(cwd, ["worktree", "list", "--porcelain"]).out;
+  const out = runGit(cwd, ["worktree", "list", "--porcelain", "-z"]).out;
   const entries: PorcelainWorktree[] = [];
   let current: PorcelainWorktree | null = null;
-  for (const line of out.split("\n")) {
-    if (!line) {
+  for (const field of out.split("\0")) {
+    if (!field) {
       current = null;
       continue;
     }
-    if (line.startsWith("worktree ")) {
+    if (field.startsWith("worktree ")) {
       current = {
-        path: line.slice(9).trim(),
+        path: field.slice(9),
         branch: null,
         head: "",
         bare: false,
@@ -622,11 +728,11 @@ function listPorcelain(cwd: string): PorcelainWorktree[] {
       };
       entries.push(current);
     } else if (current) {
-      if (line.startsWith("HEAD ")) current.head = line.slice(5).trim();
-      else if (line.startsWith("branch ")) current.branch = line.slice(7).trim().replace(/^refs\/heads\//, "");
-      else if (line === "bare") current.bare = true;
-      else if (line === "detached") current.detached = true;
-      else if (line.startsWith("prunable")) current.prunable = true;
+      if (field.startsWith("HEAD ")) current.head = field.slice(5);
+      else if (field.startsWith("branch ")) current.branch = field.slice(7).replace(/^refs\/heads\//, "");
+      else if (field === "bare") current.bare = true;
+      else if (field === "detached") current.detached = true;
+      else if (field.startsWith("prunable")) current.prunable = true;
     }
   }
   return entries;
@@ -635,9 +741,9 @@ function listPorcelain(cwd: string): PorcelainWorktree[] {
 function worktreeRepositoryIdentity(worktreePath: string): string | null {
   if (!existsSync(worktreePath)) return null;
   const root = runGit(worktreePath, ["rev-parse", "--show-toplevel"]);
-  if (root.code !== 0 || canonicalPath(root.out.trim()) !== canonicalPath(worktreePath)) return null;
+  if (root.code !== 0 || canonicalPath(stripLineEnding(root.out)) !== canonicalPath(worktreePath)) return null;
   const commonDir = runGit(worktreePath, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
-  return commonDir.code === 0 ? canonicalPath(commonDir.out.trim()) : null;
+  return commonDir.code === 0 ? canonicalPath(stripLineEnding(commonDir.out)) : null;
 }
 
 function isLiveWorktreePath(worktreePath: string, repositoryIdentity?: string): boolean {
@@ -651,12 +757,14 @@ function isLiveWorktree(entry: PorcelainWorktree, repositoryIdentity?: string): 
 
 /** Resolve a user-supplied selector (name or path) to a porcelain worktree entry. */
 function resolveWorktree(cwd: string, selector: string): PorcelainWorktree | null {
-  const entries = listPorcelain(cwd).filter((entry) => isLiveWorktree(entry));
+  const repositoryIdentity = worktreeRepositoryIdentity(cwd);
+  if (!repositoryIdentity) return null;
+  const entries = listPorcelain(cwd).filter((entry) => isLiveWorktree(entry, repositoryIdentity));
   const abs = path.resolve(cwd, selector);
   const base = worktreeBaseDir();
   // Realpath both candidates and entries: the user may pass a symlinked path
   // (e.g. /tmp on macOS) while git porcelain reports resolved /private/tmp paths.
-  const candidates = [abs, path.resolve(base, selector), path.resolve(base, `${path.basename(runGit(cwd, ["rev-parse", "--show-toplevel"]).out.trim())}-${selector}`)]
+  const candidates = [abs, path.resolve(base, selector), path.resolve(base, `${path.basename(stripLineEnding(runGit(cwd, ["rev-parse", "--show-toplevel"]).out))}-${selector}`)]
     .map((c) => realPath(c) ?? c);
   return (
     entries.find((e) => candidates.some((c) => c === (realPath(e.path) ?? path.resolve(e.path)))) ??
@@ -670,11 +778,11 @@ function shortPath(p: string): string {
   return p.startsWith(home + path.sep) ? "~" + p.slice(home.length) : p;
 }
 
-export default function (pi) {
-  pi.setLabel("Worktree Manager");
+export default function (pi: ExtensionAPI) {
+  pi.setLabel("WTM Worktree Manager");
 
-  pi.registerCommand("wt", {
-    description: "Manage Git worktrees with optional Worktrunk lifecycle and merge automation",
+  pi.registerCommand("wtm", {
+    description: "Manage Git worktrees with Worktrunk lifecycle and merge automation",
     getArgumentCompletions(arg: string) {
       if (arg.includes(" ")) return null;
       const c = arg.trim().toLowerCase();
@@ -695,7 +803,40 @@ export default function (pi) {
         try { ui.notify(text, level); } catch { console.error(text); }
       };
 
-      const argv = (rawArgs ?? "").trim().split(/\s+/).filter(Boolean);
+      const prepareMoveHandoff = (destination: string, continuation?: string): boolean => {
+        const resolvedDestination = canonicalPath(destination);
+        const command = buildMoveCommand(resolvedDestination);
+        if (!command) {
+          notify(
+            `Worktree remains at ${shortPath(resolvedDestination)}, but its path contains a line break or NUL and cannot be represented as one /move command.`,
+            "error",
+          );
+          return false;
+        }
+        if (ctx.hasUI && typeof ui.setEditorText === "function") {
+          try {
+            ui.setEditorText(command);
+          } catch {
+            // The notification below remains a copyable handoff.
+          }
+        }
+        const lines = [
+          `Worktree ready at ${shortPath(resolvedDestination)}; the move command is ready:`,
+          `  ${command}`,
+        ];
+        if (continuation) {
+          lines.push("After /move succeeds, run:", `  ${continuation}`);
+        }
+        notify(lines.join("\n"), "info");
+        return true;
+      };
+
+      const parsedCommand = parseCommandArguments(rawArgs ?? "");
+      if (parsedCommand.kind === "error") {
+        notify(`Cannot parse /wtm arguments: ${parsedCommand.detail}.`, "error");
+        return;
+      }
+      const argv = parsedCommand.args;
       const sub = (argv[0] ?? "").toLowerCase();
 
       if (argv.includes("-h") || argv.includes("--help") || sub === "help") {
@@ -705,7 +846,7 @@ export default function (pi) {
 
       // ---- shared precondition: git repo ----
       if (runGit(ctx.cwd, ["rev-parse", "--git-dir"]).code !== 0) {
-        notify("Not a git repository — /wt needs a git checkout.", "error");
+        notify("Not a git repository — /wtm needs a git checkout.", "error");
         return;
       }
 
@@ -719,14 +860,14 @@ export default function (pi) {
         const options = parsedArguments.options;
         const backend = resolveWorktrunk(ctx.cwd);
         if (backend.kind === "missing") {
-          notify("Worktrunk is required for /wt merge. Install a supported v0.76.x release and retry.", "error");
+          notify("Worktrunk is required for /wtm merge. Install a supported v0.76.x release and retry.", "error");
           return;
         }
         if (backend.kind !== "available") {
           const detail = backend.kind === "unsupported"
             ? `installed version ${backend.version}`
             : backend.detail;
-          notify(`Worktrunk v0.76.x is required for /wt merge (${detail}).`, "error");
+          notify(`Worktrunk v0.76.x is required for /wtm merge (${detail}).`, "error");
           return;
         }
 
@@ -736,34 +877,96 @@ export default function (pi) {
           return;
         }
 
-        const sourceRootResult = runGit(ctx.cwd, ["rev-parse", "--show-toplevel"]);
-        if (sourceRootResult.code !== 0) {
-          notify(`Cannot resolve the source worktree: ${sourceRootResult.err.trim()}`, "error");
+        const currentRootResult = runGit(ctx.cwd, ["rev-parse", "--show-toplevel"]);
+        if (currentRootResult.code !== 0) {
+          notify(`Cannot resolve the current worktree: ${currentRootResult.err.trim()}`, "error");
           return;
         }
-        const sourcePath = sourceRootResult.out.trim();
+        const currentPath = stripLineEnding(currentRootResult.out);
+        const currentCanonical = canonicalPath(currentPath);
+        const currentRepositoryIdentity = worktreeRepositoryIdentity(currentPath);
+        const registered = listPorcelain(ctx.cwd);
+        const current = registered.find((entry) => canonicalPath(entry.path) === currentCanonical);
+        if (!currentRepositoryIdentity || !current || !isLiveWorktree(current, currentRepositoryIdentity)) {
+          notify("The current session is not in a live registered worktree.", "error");
+          return;
+        }
+
+        if (options.source !== null && !path.isAbsolute(options.source)) {
+          notify("--source requires an absolute worktree path.", "error");
+          return;
+        }
+        const sourcePath = options.source === null ? currentPath : canonicalPath(options.source);
         const sourceCanonical = canonicalPath(sourcePath);
         const sourceRepositoryIdentity = worktreeRepositoryIdentity(sourcePath);
-        if (!sourceRepositoryIdentity) {
-          notify("Cannot verify the source repository identity.", "error");
-          return;
-        }
-        const registered = listPorcelain(ctx.cwd);
         const source = registered.find((entry) => canonicalPath(entry.path) === sourceCanonical);
-        if (!source || !source.branch || !isLiveWorktree(source)) {
-          notify("/wt merge requires a registered, branch-backed worktree.", "error");
+        if (
+          !sourceRepositoryIdentity ||
+          sourceRepositoryIdentity !== currentRepositoryIdentity ||
+          !source ||
+          !source.branch ||
+          !isLiveWorktree(source, currentRepositoryIdentity)
+        ) {
+          notify("/wtm merge requires --source to name a live registered branch worktree in the current repository.", "error");
           return;
         }
 
         const target = options.target ?? probe.list.defaultBranch;
-        const targetBefore = branchOid(sourcePath, target);
+        const targetBefore = branchOid(currentPath, target);
         const sourceBefore = branchOid(sourcePath, source.branch);
         if (!targetBefore) {
-          notify(`Target branch ${target} does not exist locally; /wt merge never fetches.`, "error");
+          notify(`Target branch ${target} does not exist locally; /wtm merge never fetches.`, "error");
           return;
         }
         if (!sourceBefore) {
           notify(`Cannot resolve source branch ${source.branch}.`, "error");
+          return;
+        }
+
+        const inProgress = activeGitOperation(sourcePath);
+        if (inProgress) {
+          notify(
+            `Source ${source.branch} has an in-progress ${inProgress}; resolve or abort it in ${shortPath(sourcePath)} before starting a new merge.`,
+            "error",
+          );
+          return;
+        }
+
+        const primaryMetadata = probe.list.items.find((item) => item.main);
+        const primaryPath = primaryMetadata && isLiveWorktreePath(primaryMetadata.path, currentRepositoryIdentity)
+          ? primaryMetadata.path
+          : null;
+        const targetWorktree = registered.find((entry) =>
+          entry.branch === target &&
+          canonicalPath(entry.path) !== sourceCanonical &&
+          isLiveWorktree(entry, currentRepositoryIdentity)
+        );
+        const sourceIsPrimary = primaryPath ? canonicalPath(primaryPath) === sourceCanonical : false;
+        const cleanupCanRemoveSource = !options.noRemove && !sourceIsPrimary && source.branch !== target;
+        const statusLines = runGit(sourcePath, ["status", "--porcelain"]).out.split("\n").filter(Boolean);
+
+        if (
+          cleanupCanRemoveSource &&
+          statusLines.length === 0 &&
+          runGit(currentPath, ["merge-base", "--is-ancestor", sourceBefore, targetBefore]).code === 0
+        ) {
+          notify(
+            `Worktrunk integration is already complete for ${source.branch} -> ${target}, but source cleanup remains. ` +
+            "The merge pipeline was not replayed. Inspect `wt config state logs`, then finish cleanup with native Worktrunk.",
+            "warning",
+          );
+          return;
+        }
+
+        if (cleanupCanRemoveSource && currentCanonical === sourceCanonical) {
+          const safePath = targetWorktree?.path ??
+            (primaryPath && canonicalPath(primaryPath) !== sourceCanonical ? primaryPath : null);
+          if (!safePath) {
+            notify("Cannot find a registered safe landing outside the source worktree; repository unchanged.", "error");
+            return;
+          }
+          const continuation = buildMergeContinuation(target, options, sourceCanonical);
+          prepareMoveHandoff(safePath, continuation);
           return;
         }
 
@@ -784,41 +987,14 @@ export default function (pi) {
           return;
         }
 
-        const primaryMetadata = probe.list.items.find((item) => item.main);
-        const primaryPath = primaryMetadata && isLiveWorktreePath(primaryMetadata.path, sourceRepositoryIdentity)
-          ? primaryMetadata.path
-          : null;
-        const targetWorktree = registered.find((entry) =>
-          entry.branch === target &&
-          canonicalPath(entry.path) !== sourceCanonical &&
-          isLiveWorktree(entry, sourceRepositoryIdentity)
-        );
-        const sourceIsPrimary = primaryPath ? canonicalPath(primaryPath) === sourceCanonical : false;
-        const cleanupCanRemoveSource = !options.noRemove && !sourceIsPrimary && source.branch !== target;
-        let safePath = sourcePath;
-        let safeKind: "source" | "target" | "primary" = "source";
-        if (cleanupCanRemoveSource) {
-          if (targetWorktree) {
-            safePath = targetWorktree.path;
-            safeKind = "target";
-          } else if (primaryPath && canonicalPath(primaryPath) !== sourceCanonical) {
-            safePath = primaryPath;
-            safeKind = "primary";
-          } else {
-            notify("Cannot find a registered safe landing outside the source worktree; repository unchanged.", "error");
-            return;
-          }
-        }
-
-        const statusLines = runGit(sourcePath, ["status", "--porcelain"]).out.split("\n").filter(Boolean);
         const staged = statusLines.filter((line) => line[0] !== " " && line[0] !== "?").length;
         const unstaged = statusLines.filter((line) => line[1] !== " " && line[0] !== "?").length;
         const untracked = statusLines.filter((line) => line.startsWith("??")).length;
         const commits = runGit(sourcePath, ["rev-list", "--count", `${target}..${source.branch}`]).out.trim();
         if (!options.yes) {
           const summary = [
-            `Source: ${source.branch}`,
-            `Target: ${target}`,
+            `Source: ${source.branch} (${sourceBefore.slice(0, 12)})`,
+            `Target: ${target} (${targetBefore.slice(0, 12)})`,
             `Changes: ${staged} staged, ${unstaged} unstaged, ${untracked} untracked`,
             `Commits ahead: ${commits || "unknown"}`,
             `Stage: ${options.stage}`,
@@ -836,16 +1012,6 @@ export default function (pi) {
           }
         }
 
-        const sessionMoved = canonicalPath(safePath) !== sourceCanonical;
-        if (sessionMoved) {
-          try {
-            await ctx.sessionManager.moveTo(path.resolve(safePath));
-          } catch (e) {
-            notify(`Moving session to safe landing ${shortPath(safePath)} failed; repository unchanged: ${e instanceof Error ? e.message : String(e)}`, "error");
-            return;
-          }
-        }
-
         const mergeArgs = ["merge", target, "--stage", options.stage];
         if (options.noSquash) mergeArgs.push("--no-squash");
         if (options.noCommit) mergeArgs.push("--no-commit");
@@ -854,18 +1020,18 @@ export default function (pi) {
         if (options.noFf) mergeArgs.push("--no-ff");
         mergeArgs.push("--format=json", "-C", sourcePath);
 
-        const result = runWorktrunk(backend, safePath, mergeArgs);
+        const result = runWorktrunk(backend, currentPath, mergeArgs);
         const parsed = result.code === 0 ? parseWorktrunkMerge(result.out) : null;
         const compatibleResult = parsed && parsed.branch === source.branch && parsed.target === target
           ? parsed
           : null;
-        const targetAfter = branchOid(safePath, target);
+        const targetAfter = branchOid(currentPath, target);
         const targetState = targetAfter === null
           ? "absent or unreadable"
           : targetAfter !== targetBefore ? "updated" : "unchanged";
-        const afterEntries = listPorcelain(safePath);
+        const afterEntries = listPorcelain(currentPath);
         const sourceRegistered = afterEntries.some((entry) => canonicalPath(entry.path) === sourceCanonical);
-        const sourceBranchPresent = branchOid(safePath, source.branch) !== null;
+        const sourceBranchPresent = branchOid(currentPath, source.branch) !== null;
         const sourcePathPresent = existsSync(sourcePath);
         const cleanup = result.code === 0 && compatibleResult?.removed
           ? "cleanup scheduled"
@@ -877,11 +1043,11 @@ export default function (pi) {
           `source path ${sourcePathPresent ? "present" : "absent"}`,
           cleanup,
         ].join("; ");
-        const session = safeKind === "primary"
-          ? `Session remains at primary safe landing ${shortPath(safePath)}; primary branch may differ from merge target ${target}.`
-          : safeKind === "target"
-            ? `Session remains at target worktree ${shortPath(safePath)}.`
-            : `Session remains at source ${shortPath(sourcePath)}.`;
+        const session = primaryPath && canonicalPath(primaryPath) === currentCanonical
+          ? `Session remains at primary safe landing ${shortPath(currentPath)}; primary branch may differ from merge target ${target}.`
+          : current.branch === target
+            ? `Session remains at target worktree ${shortPath(currentPath)}.`
+            : `Session remains at safe worktree ${shortPath(currentPath)}.`;
 
         if (result.code !== 0) {
           notify(
@@ -897,8 +1063,6 @@ export default function (pi) {
           notify(`Worktrunk merge completed: ${state}. ${session}`, "info");
           reportWorktrunkStderr(notify, result.err);
         }
-
-        if (sessionMoved) return ctx.reload();
         return;
       }
 
@@ -927,7 +1091,7 @@ export default function (pi) {
           const here = (realPath(entry.path) ?? entry.path) === (realPath(ctx.cwd) ?? ctx.cwd) ? "  <- current" : "";
           return `  ${shortPath(entry.path).padEnd(46)} ${ref}${here}`;
         });
-        notify(`Worktrees of ${shortPath(runGit(ctx.cwd, ["rev-parse", "--show-toplevel"]).out.trim())}:\n${lines.join("\n")}`, "info");
+        notify(`Worktrees of ${shortPath(stripLineEnding(runGit(ctx.cwd, ["rev-parse", "--show-toplevel"]).out))}:\n${lines.join("\n")}`, "info");
         return;
       }
 
@@ -948,12 +1112,13 @@ export default function (pi) {
         const selector = rest.find((a) => !a.startsWith("-"));
 
         // main working tree (where the session falls back to when removing its own worktree)
-        const commonDir = runGit(ctx.cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).out.trim();
+        const commonDir = stripLineEnding(runGit(ctx.cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).out);
         const configuredWorktree = runGit(ctx.cwd, ["config", "--path", "--get", "core.worktree"]);
         const repositoryIdentity = worktreeRepositoryIdentity(ctx.cwd);
+        const configuredWorktreePath = stripLineEnding(configuredWorktree.out);
         let mainPath = repositoryIdentity && configuredWorktree.code === 0 &&
-          isLiveWorktreePath(configuredWorktree.out.trim(), repositoryIdentity)
-          ? configuredWorktree.out.trim()
+          isLiveWorktreePath(configuredWorktreePath, repositoryIdentity)
+          ? configuredWorktreePath
           : repositoryIdentity && commonDir &&
               isLiveWorktreePath(path.dirname(commonDir), repositoryIdentity)
             ? path.dirname(commonDir)
@@ -977,7 +1142,7 @@ export default function (pi) {
         // ---- rm --all: remove every worktree except the current one and the main tree ----
         if (all) {
           if (selector) {
-            notify("--all takes no selector — use /wt rm --all or /wt rm <name|path|self>", "error");
+            notify("--all takes no selector — use /wtm rm --all or /wtm rm <name|path|self>", "error");
             return;
           }
           // Realpath both sides: ctx.cwd may be a symlinked path (e.g. /tmp on macOS)
@@ -989,7 +1154,8 @@ export default function (pi) {
           // registrations whose directory is gone (those are cleaned by the final prune)
           const victims = listPorcelain(ctx.cwd).filter((entry) => {
             const candidate = canonicalPath(entry.path);
-            return candidate !== cwdAbs && candidate !== mainAbs && isLiveWorktree(entry);
+            return candidate !== cwdAbs && candidate !== mainAbs &&
+              repositoryIdentity !== null && isLiveWorktree(entry, repositoryIdentity);
           });
           if (victims.length === 0) {
             notify("No other worktrees to remove.", "info");
@@ -1026,12 +1192,16 @@ export default function (pi) {
           const removedPaths: string[] = [];
           const issues: string[] = [];
           for (const victim of victims) {
+            if (!repositoryIdentity || !isLiveWorktreePath(victim.path, repositoryIdentity)) {
+              issues.push(`${shortPath(victim.path)} (no longer a live worktree in the current repository)`);
+              continue;
+            }
             if (worktrunkBackend) {
-              const beforeWorktrees = listPorcelain(gitCwd).filter((entry) => isLiveWorktree(entry));
+              const beforeWorktrees = listPorcelain(gitCwd).filter((entry) => isLiveWorktree(entry, repositoryIdentity));
               const outcome = removeWithWorktrunk(worktrunkBackend, gitCwd, victim.path, victim.branch, force);
               if (outcome.kind !== "error") reportWorktrunkStderr(notify, outcome.stderr);
               const victimReal = canonicalPath(victim.path);
-              const afterWorktrees = listPorcelain(gitCwd).filter((entry) => isLiveWorktree(entry));
+              const afterWorktrees = listPorcelain(gitCwd).filter((entry) => isLiveWorktree(entry, repositoryIdentity));
               const stillRegistered = afterWorktrees.some((entry) => canonicalPath(entry.path) === victimReal);
               const removed = !stillRegistered && !existsSync(victim.path);
               const unexpected = beforeWorktrees.filter((entry) =>
@@ -1070,7 +1240,7 @@ export default function (pi) {
         }
 
         if (!selector) {
-          notify("Usage: /wt rm <name|path|self> [-f] [-y] | /wt rm --all [-f] [-y]", "error");
+          notify("Usage: /wtm rm <name|path|self> [-f] [-y] | /wtm rm --all [-f] [-y]", "error");
           return;
         }
 
@@ -1081,7 +1251,7 @@ export default function (pi) {
           ? listPorcelain(ctx.cwd).find((e) => (realPath(e.path) ?? path.resolve(e.path)) === cwdReal) ?? null
           : resolveWorktree(ctx.cwd, selector);
         if (!target) {
-          notify(isSelf ? "Current directory is not a linked worktree (already on the main tree)." : `No worktree matches "${selector}". Try /wt list.`, "error");
+          notify(isSelf ? "Current directory is not a linked worktree (already on the main tree)." : `No live worktree in the current repository matches "${selector}". Try /wtm list.`, "error");
           return;
         }
 
@@ -1092,7 +1262,22 @@ export default function (pi) {
           return;
         }
         if (!isSelf && targetIsCwd) {
-          notify(`This is the session's worktree — use /wt rm self (moves the session back to ${shortPath(mainPath)} first).`, "warning");
+          notify(`This is the session's worktree — use /wtm rm self (prepares a move to ${shortPath(mainPath)} first).`, "warning");
+          return;
+        }
+
+        if (isSelf && targetIsCwd) {
+          if (!mainPath || !repositoryIdentity || !isLiveWorktreePath(mainPath, repositoryIdentity)) {
+            notify("Cannot determine a live primary worktree for the move handoff.", "error");
+            return;
+          }
+          const continuation = `/wtm rm ${JSON.stringify(canonicalPath(target.path))}${force ? " -f" : ""}`;
+          prepareMoveHandoff(mainPath, continuation);
+          return;
+        }
+
+        if (!repositoryIdentity || !isLiveWorktreePath(target.path, repositoryIdentity)) {
+          notify(`Refusing to remove ${shortPath(target.path)} because it is not a live worktree in the current repository.`, "error");
           return;
         }
 
@@ -1114,33 +1299,24 @@ export default function (pi) {
         }
 
         if (!yes) {
-          const msg = `Remove worktree ${shortPath(target.path)}${target.branch ? ` (branch ${target.branch})` : ""}?` +
-            (targetIsCwd ? `\nThe session will move back to ${shortPath(mainPath)} first.` : "") +
+          const msg = `Remove worktree ${shortPath(target.path)}${target.branch ? ` (branch ${target.branch}, HEAD ${target.head.slice(0, 12)})` : ""}?` +
             (dirty ? "\nUncommitted changes will be lost." : "");
           const ok = ctx.hasUI ? await ui.confirm("Remove worktree", msg) : true;
           if (!ok) { notify("Cancelled.", "info"); return; }
         }
 
-        // if the session lives in the target worktree, move it out first
-        if (targetIsCwd) {
-          if (!mainPath || runGit(mainPath, ["rev-parse", "--git-dir"]).code !== 0) {
-            notify(`Cannot determine the main working tree to fall back to. Move out manually (/move <path>) and retry.`, "error");
-            return;
-          }
-          try {
-            await ctx.sessionManager.moveTo(path.resolve(mainPath));
-          } catch (e) {
-            notify(`Moving session back to main tree failed: ${e instanceof Error ? e.message : String(e)}`, "error");
-            return;
-          }
+        if (!isLiveWorktreePath(target.path, repositoryIdentity)) {
+          notify(`Refusing to remove ${shortPath(target.path)} because its repository identity changed after confirmation.`, "error");
+          return;
         }
+
 
         const gitCwd = mainPath || ctx.cwd;
         if (worktrunkBackend) {
-          const beforeWorktrees = listPorcelain(gitCwd).filter((entry) => isLiveWorktree(entry));
+          const beforeWorktrees = listPorcelain(gitCwd).filter((entry) => isLiveWorktree(entry, repositoryIdentity));
           const outcome = removeWithWorktrunk(worktrunkBackend, gitCwd, target.path, target.branch, force);
           if (outcome.kind !== "error") reportWorktrunkStderr(notify, outcome.stderr);
-          const afterWorktrees = listPorcelain(gitCwd).filter((entry) => isLiveWorktree(entry));
+          const afterWorktrees = listPorcelain(gitCwd).filter((entry) => isLiveWorktree(entry, repositoryIdentity));
           const stillRegistered = afterWorktrees.some((entry) => canonicalPath(entry.path) === targetReal);
           const removed = !stillRegistered && !existsSync(target.path);
           const unexpected = beforeWorktrees.filter((entry) =>
@@ -1169,10 +1345,9 @@ export default function (pi) {
           }
           const detail = details.length > 0 ? `; ${details.join("; ")}` : "";
           notify(
-            `Removed worktree ${shortPath(target.path)}${targetIsCwd ? ` — session is on ${shortPath(mainPath)}` : ""}${detail}`,
+            `Removed worktree ${shortPath(target.path)}${detail}`,
             details.length > 0 ? "warning" : "info",
           );
-          if (targetIsCwd) await ctx.reload();
           return;
         }
 
@@ -1185,11 +1360,7 @@ export default function (pi) {
           return;
         }
         runGit(gitCwd, ["worktree", "prune"]);
-        notify(`Removed worktree ${shortPath(target.path)}${targetIsCwd ? ` — session is back on ${shortPath(mainPath)}` : ""}`, "info");
-
-        if (targetIsCwd) {
-          await ctx.reload(); // terminal: refresh cwd-scoped surfaces for the main tree
-        }
+        notify(`Removed worktree ${shortPath(target.path)}`, "info");
         return;
       }
 
@@ -1210,7 +1381,7 @@ export default function (pi) {
 
       const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 12);
       const name = slugify(positional[0] ?? `wt-${stamp}`);
-      const root = runGit(ctx.cwd, ["rev-parse", "--show-toplevel"]).out.trim();
+      const root = stripLineEnding(runGit(ctx.cwd, ["rev-parse", "--show-toplevel"]).out);
       const baseDir = worktreeBaseDir();
       const wtPath = path.join(baseDir, `${path.basename(root)}-${name}`);
 
@@ -1252,7 +1423,7 @@ export default function (pi) {
               const detail = filterWorktrunkStderr(result.err) || `exit ${result.code}`;
               notify(
                 retained
-                  ? `Worktrunk switch failed after retaining ${shortPath(retained.path)}: ${detail}. Retry /wt ${name} to reuse it.`
+                  ? `Worktrunk switch failed after retaining ${shortPath(retained.path)}: ${detail}. Retry /wtm ${name} to reuse it.`
                   : `Worktrunk switch failed: ${detail}`,
                 "error",
               );
@@ -1289,14 +1460,7 @@ export default function (pi) {
             }
             notify(`${worktreeExists ? "Reusing" : "Created"} Worktrunk worktree: ${shortPath(switched.path)} (branch ${switched.branch})`, "info");
             reportWorktrunkStderr(notify, result.err);
-            try {
-              await ctx.sessionManager.moveTo(path.resolve(switched.path));
-            } catch (e) {
-              notify(`Move failed; Worktrunk result remains at ${shortPath(switched.path)}: ${e instanceof Error ? e.message : String(e)}`, "error");
-              return;
-            }
-            notify(`Moved session to ${shortPath(switched.path)} — reloading…`, "info");
-            await ctx.reload();
+            prepareMoveHandoff(switched.path);
             return;
           }
         }
@@ -1323,16 +1487,15 @@ export default function (pi) {
         notify(`Created worktree: ${shortPath(wtPath)} (branch ${name})`, "info");
       }
 
-      // move the session into the worktree (same primitive as built-in /move),
-      // then refresh cwd-scoped surfaces. reload() is terminal for this frame.
-      try {
-        await ctx.sessionManager.moveTo(path.resolve(wtPath));
-      } catch (e) {
-        notify(`Move failed: ${e instanceof Error ? e.message : String(e)}`, "error");
+      const repositoryIdentity = worktreeRepositoryIdentity(ctx.cwd);
+      const destination = listPorcelain(ctx.cwd).find((entry) =>
+        canonicalPath(entry.path) === canonicalPath(wtPath)
+      );
+      if (!destination || destination.branch !== name || !repositoryIdentity || !isLiveWorktree(destination, repositoryIdentity)) {
+        notify(`Cannot verify ${shortPath(wtPath)} as a live registered worktree for branch ${name}.`, "error");
         return;
       }
-      notify(`Moved session to ${shortPath(wtPath)} — reloading…`, "info");
-      await ctx.reload();
+      prepareMoveHandoff(destination.path);
     },
   });
 }

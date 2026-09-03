@@ -11,10 +11,10 @@
   },
   "plugins": [
     {
-      "name": "wt",
-      "description": "Worktree manager: /wt uses Worktrunk for lifecycle hooks and local merge automation, with native Git fallback",
-      "source": "./wt",
-      "version": "1.1.0",
+      "name": "wtm",
+      "description": "WTM worktree manager with Worktrunk lifecycle hooks, local merge automation, and native Git lifecycle fallback",
+      "source": "./wtm",
+      "version": "1.2.0",
       "category": "development",
       "keywords": [
         "worktree",

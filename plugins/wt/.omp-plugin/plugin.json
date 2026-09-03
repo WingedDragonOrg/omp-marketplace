@@ -1,9 +1,0 @@
-{
-  "name": "wt",
-  "version": "1.1.0",
-  "description": "OMP /wt manager with optional Worktrunk lifecycle and merge integration",
-  "author": {
-    "name": "WingedDragonOrg"
-  },
-  "homepage": "https://github.com/WingedDragonOrg/omp-marketplace"
-}

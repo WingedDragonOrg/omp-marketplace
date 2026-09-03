@@ -1,0 +1,9 @@
+{
+  "name": "wtm",
+  "version": "1.2.0",
+  "description": "WTM worktree manager with Worktrunk lifecycle and merge integration",
+  "author": {
+    "name": "WingedDragonOrg"
+  },
+  "homepage": "https://github.com/WingedDragonOrg/omp-marketplace"
+}
