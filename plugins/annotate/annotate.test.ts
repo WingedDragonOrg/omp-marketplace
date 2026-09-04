@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { carryMissingReviewItems, isDispatchConfirmation, validatePendingItems } from "./src/workflow";
+import { carryMissingReviewItems, createAssistantAnnotationDraft, isDispatchConfirmation, validatePendingItems } from "./src/workflow";
 import { readGitSnapshot } from "./src/git";
 import {
   applyReviewEvent,
@@ -9,7 +9,6 @@ import {
   createCodeAnchor,
   deletedReviewItemIds,
   extractAssistantText,
-  findUniqueTextRange,
   parseUnifiedDiff,
   restoreReviewItems,
   validateAssistantAnchor,
@@ -199,10 +198,25 @@ describe("assistant anchors", () => {
     ).toBeNull();
   });
 
-  test("accepts a unique edited excerpt and rejects an ambiguous duplicate", () => {
-    expect(findUniqueTextRange("first target second", "target")).toEqual({ start: 6, end: 12 });
-    expect(findUniqueTextRange("target and target", "target")).toBeNull();
-    expect(findUniqueTextRange("target", "")).toBeNull();
+  test("creates a whole-message annotation draft", () => {
+    const draft = createAssistantAnnotationDraft(
+      "session-1",
+      { id: "assistant-1", text: "Assistant answer." },
+      "  Improve this answer.  ",
+    );
+    expect(draft).toEqual({
+      anchor: {
+        kind: "assistant",
+        sessionId: "session-1",
+        entryId: "assistant-1",
+        start: 0,
+        end: 17,
+        text: "Assistant answer.",
+        before: "",
+        after: "",
+      },
+      body: "Improve this answer.",
+    });
   });
 });
 

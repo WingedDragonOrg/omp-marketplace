@@ -16,7 +16,7 @@ Start a new `omp` session after installation because extension modules load when
 Run `/annotate` in the interactive TUI. The full-screen workbench has two tabs:
 
 - **Code** — browse the staged and unstaged Git diff relative to `HEAD` and annotate a selected diff line.
-- **Assistant** — browse visible assistant messages in the current session branch. Choose a message, leave one unique excerpt in the editor, and add a comment to that excerpt.
+- **Assistant** — browse visible assistant messages in the current session branch. Select a message and enter a comment for that message.
 
 Controls:
 
@@ -35,7 +35,7 @@ A new annotation is saved as `pending` in the current session branch. Sending co
 
 ## Safe stale handling
 
-Every Code annotation records the repository identity, `HEAD`, diff fingerprint, file, line range, and selected text. Every Assistant annotation records the session, entry ID, offset, exact excerpt, and surrounding context. If the repository, diff, file, branch, or assistant message changes before sending, the annotation becomes `stale` and is not sent. Re-select the current content to create a replacement annotation.
+Every Code annotation records the repository identity, `HEAD`, diff fingerprint, file, line range, and selected text. Every Assistant annotation records the session, entry ID, complete message text, and its context. If the repository, diff, file, branch, or assistant message changes before sending, the annotation becomes `stale` and is not sent. Re-select the current content to create a replacement annotation.
 
 Failed sends keep annotations as `pending`. Sent annotations remain in the session as review history. Annotation state follows the current session branch and is not written to project files or remote services.
 

@@ -174,12 +174,6 @@ export function createAssistantAnchor(input: AssistantAnchorInput): AssistantAnc
   };
 }
 
-export function findUniqueTextRange(messageText: string, selection: string): { start: number; end: number } | null {
-  if (!messageText || !selection) return null;
-  const start = messageText.indexOf(selection);
-  if (start < 0 || messageText.indexOf(selection, start + 1) >= 0) return null;
-  return { start, end: start + selection.length };
-}
 
 export function validateAssistantAnchor(
   anchor: AssistantAnchor,

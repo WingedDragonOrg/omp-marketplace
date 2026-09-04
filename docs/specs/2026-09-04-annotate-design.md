@@ -11,7 +11,7 @@ OMP 已提供 `/git` 全屏界面，用于浏览 Git diff、暂存变更和创�
 成功标准：
 
 - 用户可以在一个工作台中用 tab 切换 Code 和 Assistant 两种审阅源；
-- 用户可以对 Git diff 的代码片段和 assistant 文本片段分别添加批注；
+- 用户可以对 Git diff 的代码片段和 assistant 消息分别添加批注；
 - 多条批注可以先集中整理，再一次性发送给当前 session agent；
 - agent 能拿到精确的引用上下文，在当前工作区执行修改或优化；
 - 代码或 session branch 变化造成定位失效时，系统不会把批注静默套用到错误内容；
@@ -25,7 +25,7 @@ OMP 已提供 `/git` 全屏界面，用于浏览 Git diff、暂存变更和创�
 - `/annotate` 扩展命令和全屏审阅 overlay；
 - `Code` 与 `Assistant` 两个 tab，以及在两个 tab 中创建、查看、删除和保留批注的交互；
 - 当前工作区 staged + unstaged Git diff 的代码片段批注；
-- 当前 session branch 中 assistant 可见文本的片段批注；
+- 当前 session branch 中 assistant 可见消息的批注；
 - 当前 session 内的批注持久化、branch 重建和 stale 状态；
 - 批注校验、批量发送和发送失败后的保留行为；
 - TUI、无 Git 变更、无 assistant 消息、agent 忙和定位失效等边界行为。
@@ -58,7 +58,7 @@ OMP 已提供 `/git` 全屏界面，用于浏览 Git diff、暂存变更和创�
 | 用户入口 | `/annotate` | 独立于 OMP 内置 `/git` 与 `/review`，命令语义直接 |
 | 审阅源 | `Code` 与 `Assistant` 两个 tab | 两种产出共用批注和发送模型，用户通过 tab 明确当前批注来源 |
 | Code 锚点 | 文件、old/new 行范围或片段、仓库 identity、HEAD/diff 快照 | 让 agent 能精确定位代码，并能识别工作区变化 |
-| Assistant 锚点 | session entry ID、选中文本、文本偏移和前后文 | 支持 PDF 式文本片段批注，并避免重复文本造成歧义 |
+| Assistant 锚点 | session entry ID、完整消息文本、文本偏移和前后文 | 选择消息后直接进入批注输入 |
 | 执行 agent | 当前 session agent | 复用已有会话上下文和工作区，公共扩展 API 可直接支持 |
 | 发送单位 | 所有有效 pending 批注合并成一次用户消息 | 多条意见保持一致上下文，避免每条意见单独触发模型回合 |
 | 持久化边界 | 当前 session branch 的 custom entries | 支持关闭、重启和 branch 重建，不污染项目文件或远程系统 |
@@ -80,7 +80,7 @@ OMP 已提供 `/git` 全屏界面，用于浏览 Git diff、暂存变更和创�
 
 创建批注的共同流程：
 
-1. 用户在当前源中选择一个可定位的代码片段或 assistant 文本片段；
+1. 用户在当前源中选择一个可定位的代码片段或 assistant 消息；
 2. 用户输入非空批注正文；
 3. 插件保存一条 `pending` review item，并在批注区显示来源和定位摘要；
 4. 用户可以继续切换源、添加批注、删除错误的 pending 批注，或执行发送。
@@ -110,11 +110,11 @@ Assistant 源读取当前 session branch 的 assistant message，提取其中可
 每条 assistant 批注携带：
 
 - 当前 session ID 和 assistant message 对应的 session entry ID；
-- 选中文本在该消息文本中的起止偏移；
-- 选中的精确文本和有限的前后文；
+- 该消息完整文本在 entry 中的起止偏移；
+- 消息的精确文本和有限的前后文；
 - 用户批注正文。
 
-发送前确认 entry ID 仍在当前 branch，且偏移处的文本与保存的精确片段和上下文一致。若文本来自运行中的 display event，还必须使用同一 timestamp 的可见文本完成校验。entry 不在当前 branch、文本不匹配或匹配结果产生歧义时，批注变为 `stale`，不跨 branch 或重复文本猜测迁移。
+发送前确认 entry ID 仍在当前 branch，且消息完整文本与保存的精确文本和上下文一致。若文本来自运行中的 display event，还必须使用同一 timestamp 的可见文本完成校验。entry 不在当前 branch、文本不匹配时，批注变为 `stale`，不跨 branch 猜测迁移。
 
 ### 3. 批注状态与 session 持久化
 
@@ -181,7 +181,7 @@ Review item 使用版本化、JSON 可序列化的数据结构，至少包含：
 
 1. 在安装 Annotate 后，输入 `/annotate` 能打开带 `Code` 和 `Assistant` tab 的全屏审阅工作台；OMP 的 `/git` 和 `/review` 仍按各自既有行为执行。
 2. 在存在 staged 或 unstaged Git diff 的仓库中，用户能选择一段变更代码、输入批注，并在列表中看到带文件和行范围摘要的 pending item。
-3. 在当前 session 存在 assistant 可见文本时，用户能切换到 Assistant tab，选择一段文本、输入批注，并在列表中看到带消息来源摘要的 pending item。
+3. 在当前 session 存在 assistant 可见文本时，用户能切换到 Assistant tab，选择一条消息、输入批注，并在列表中看到带消息来源摘要的 pending item。
 4. Code 与 Assistant tab 之间切换不会丢失或混淆另一来源的 pending item；用户能删除错误的 pending item。
 5. 关闭并重新打开 session 后，当前 session branch 中的合法 pending、sent 和 stale item 能恢复；已删除 item 不重新出现。
 6. 用户一次发送多条有效批注时，当前 session transcript 中出现一条用户消息，消息同时包含每条批注的来源、精确引用和批注正文；不会为每条批注分别触发回合。

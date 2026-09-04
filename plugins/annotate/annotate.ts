@@ -6,7 +6,6 @@ import {
   createAssistantAnchor,
   createCodeAnchor,
   extractAssistantText,
-  findUniqueTextRange,
   restoreReviewItems,
   deletedReviewItemIds,
   REVIEW_CUSTOM_TYPE,
@@ -19,6 +18,7 @@ import {
 import { readGitSnapshot, type GitExecutor } from "./src/git";
 import {
   carryMissingReviewItems,
+  createAssistantAnnotationDraft,
   isDispatchConfirmation,
   validatePendingItems,
   type PendingValidation,
@@ -246,35 +246,17 @@ async function addAssistantAnnotation(
     notify(ctx, "This assistant text is secret-protected and cannot be persisted as an annotation.", "warning");
     return;
   }
-  const selected = await withOverlayHidden(
+  const body = await withOverlayHidden(
     state,
-    () => ctx.ui.editor("Assistant excerpt (keep only the text to annotate)", entry.text),
+    () => ctx.ui.input("Assistant annotation", "Write a note about this message"),
   );
-  if (selected === undefined) return;
-  const excerpt = selected.trim();
-  const range = findUniqueTextRange(entry.text, excerpt);
-  if (!range) {
-    notify(ctx, "Select one unique excerpt; include more context when the text repeats.", "warning");
-    return;
-  }
-  const body = await withOverlayHidden(state, () => ctx.ui.editor("Assistant annotation", ""));
   if (body === undefined) return;
-  if (body.trim().length === 0) {
+  const draft = createAssistantAnnotationDraft(ctx.sessionManager.getSessionId(), entry, body);
+  if (!draft) {
     notify(ctx, "Annotation text cannot be empty.", "warning");
     return;
   }
-  const anchor = createAssistantAnchor({
-    sessionId: ctx.sessionManager.getSessionId(),
-    entryId: entry.id,
-    messageText: entry.text,
-    start: range.start,
-    end: range.end,
-  });
-  if (!anchor) {
-    notify(ctx, "The selected assistant text does not have a stable location.", "warning");
-    return;
-  }
-  const item = newItem({ source: "assistant", anchor }, body.trim());
+  const item = newItem({ source: "assistant", anchor: draft.anchor }, draft.body);
   appendReviewEvent(pi, { action: "upsert", item });
   data.items = [...data.items, item];
   syncReviewState(state, ctx, data.items);

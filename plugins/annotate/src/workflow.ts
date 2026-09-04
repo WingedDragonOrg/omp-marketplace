@@ -1,8 +1,11 @@
 import {
+  createAssistantAnchor,
   extractAssistantText,
   validateAssistantAnchor,
   validateCodeAnchor,
   type AnchorValidation,
+  type AssistantAnchor,
+  type AssistantTextEntry,
   type CodeSnapshot,
   type ReviewItem,
 } from "./model";
@@ -20,6 +23,29 @@ export interface PendingValidation {
 
 function staleItem(item: ReviewItem, validation: Extract<AnchorValidation, { kind: "stale" }>): ReviewItem {
   return { ...item, status: "stale", staleReason: validation.reason };
+}
+
+export interface AssistantAnnotationDraft {
+  anchor: AssistantAnchor;
+  body: string;
+}
+
+/** Create a direct annotation for the selected assistant message. */
+export function createAssistantAnnotationDraft(
+  sessionId: string,
+  entry: Pick<AssistantTextEntry, "id" | "text">,
+  body: string,
+): AssistantAnnotationDraft | null {
+  const trimmedBody = body.trim();
+  if (!sessionId || !entry.id || !entry.text || !trimmedBody) return null;
+  const anchor = createAssistantAnchor({
+    sessionId,
+    entryId: entry.id,
+    messageText: entry.text,
+    start: 0,
+    end: entry.text.length,
+  });
+  return anchor ? { anchor, body: trimmedBody } : null;
 }
 
 /** Validate only pending items and split safe dispatches from stale history. */
