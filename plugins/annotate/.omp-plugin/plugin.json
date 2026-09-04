@@ -1,0 +1,9 @@
+{
+  "name": "annotate",
+  "version": "1.0.0",
+  "description": "Review Git changes and assistant text with durable annotations",
+  "author": {
+    "name": "WingedDragonOrg"
+  },
+  "homepage": "https://github.com/WingedDragonOrg/omp-marketplace"
+}

@@ -1,0 +1,22 @@
+{
+  "name": "annotate",
+  "version": "1.0.0",
+  "description": "Review Git changes and assistant text with durable annotations",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "omp": {
+    "extensions": [
+      "./annotate.ts"
+    ]
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.1.9",
+    "@oh-my-pi/pi-tui": "18.1.9",
+    "@types/bun": "^1.3.14",
+    "typescript": "^5.9.3"
+  }
+}

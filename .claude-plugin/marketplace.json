@@ -113,6 +113,24 @@
         "name": "WingedDragonOrg"
       },
       "license": "MIT"
+    },
+    {
+      "name": "annotate",
+      "description": "Review Git changes and assistant text with durable annotations sent back to the current session agent",
+      "source": "./annotate",
+      "version": "1.0.0",
+      "category": "development",
+      "keywords": [
+        "review",
+        "annotations",
+        "git",
+        "assistant",
+        "extension"
+      ],
+      "author": {
+        "name": "WingedDragonOrg"
+      },
+      "license": "MIT"
     }
   ]
 }

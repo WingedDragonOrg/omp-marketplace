@@ -14,6 +14,7 @@ omp plugin install wtm@winged-dragon-org
 | Plugin | Surface | Description |
 |---|---|---|
 | `wtm` | extension | `/wtm` — manage Git worktrees and Worktrunk merges with OMP-native `/move` handoffs |
+| `annotate` | extension | `/annotate` — review Git changes and assistant text, then send durable annotations to the current session agent |
 | `skill-gate` | extension + skill | `when:` frontmatter gates a skill on env vars, os/arch, cwd, marker files or PATH binaries; `/skill-gate` explains each decision |
 | `spec` | skill | `spec-design` — design interview that converges an idea into an implementable spec in `docs/specs/`, one product-level decision at a time |
 | `multica-mention-guard` | extension | Publishes a Multica task's final message verbatim and gates `session_stop` on valid `mention://` targets, reminding once |
