@@ -23,6 +23,8 @@ import {
   validatePendingItems,
   type PendingValidation,
 } from "./src/workflow";
+import { createAssistantRangeSelector } from "./src/assistant-range-selector";
+import type { AssistantSelectionRange } from "./src/assistant-selection";
 import {
   createAnnotateView,
   type AnnotateViewCallbacks,
@@ -241,17 +243,38 @@ async function addAssistantAnnotation(
   data: AnnotateViewData,
   state: RuntimeState,
   entry: AssistantTextEntry,
+  precise = false,
 ): Promise<void> {
   if (!entry.annotationAllowed) {
     notify(ctx, "This assistant text is secret-protected and cannot be persisted as an annotation.", "warning");
     return;
   }
+
+  let selection: Pick<AssistantSelectionRange, "start" | "end"> | undefined;
+  if (precise) {
+    const selected = await withOverlayHidden(
+      state,
+      () => ctx.ui.custom<AssistantSelectionRange | undefined>(
+        (tui, theme, _keybindings, done) => createAssistantRangeSelector(tui, theme, entry.text, done),
+        {
+          overlay: true,
+          overlayOptions: {
+            fullscreen: true,
+            margin: 1,
+          },
+        },
+      ),
+    );
+    if (!selected) return;
+    selection = selected;
+  }
+
   const body = await withOverlayHidden(
     state,
     () => ctx.ui.input("Assistant annotation", "Write a note about this message"),
   );
   if (body === undefined) return;
-  const draft = createAssistantAnnotationDraft(ctx.sessionManager.getSessionId(), entry, body);
+  const draft = createAssistantAnnotationDraft(ctx.sessionManager.getSessionId(), entry, body, selection);
   if (!draft) {
     notify(ctx, "Annotation text cannot be empty.", "warning");
     return;
@@ -406,6 +429,7 @@ async function openAnnotate(pi: ExtensionAPI, ctx: ExtensionCommandContext, stat
   const callbacks: AnnotateViewCallbacks = {
     addCode: selection => addCodeAnnotation(pi, ctx, data, state, selection),
     addAssistant: entry => addAssistantAnnotation(pi, ctx, data, state, entry),
+    addAssistantPrecise: entry => addAssistantAnnotation(pi, ctx, data, state, entry, true),
     deleteItem: item => deleteAnnotation(pi, ctx, data, state, item),
     refresh: async () => {
       if (await refreshData(pi, ctx, data, exec, state.visibleAssistantTextByTimestamp)) {

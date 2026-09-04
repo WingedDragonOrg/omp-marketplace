@@ -1,6 +1,6 @@
 {
   "name": "annotate",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Review Git changes and assistant text with durable annotations",
   "private": true,
   "type": "module",

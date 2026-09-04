@@ -5,6 +5,7 @@ import {
   validateCodeAnchor,
   type AnchorValidation,
   type AssistantAnchor,
+  type AssistantAnchorInput,
   type AssistantTextEntry,
   type CodeSnapshot,
   type ReviewItem,
@@ -30,11 +31,12 @@ export interface AssistantAnnotationDraft {
   body: string;
 }
 
-/** Create a direct annotation for the selected assistant message. */
+/** Create an annotation for the selected assistant message range. */
 export function createAssistantAnnotationDraft(
   sessionId: string,
   entry: Pick<AssistantTextEntry, "id" | "text">,
   body: string,
+  range?: Pick<AssistantAnchorInput, "start" | "end">,
 ): AssistantAnnotationDraft | null {
   const trimmedBody = body.trim();
   if (!sessionId || !entry.id || !entry.text || !trimmedBody) return null;
@@ -42,8 +44,8 @@ export function createAssistantAnnotationDraft(
     sessionId,
     entryId: entry.id,
     messageText: entry.text,
-    start: 0,
-    end: entry.text.length,
+    start: range?.start ?? 0,
+    end: range?.end ?? entry.text.length,
   });
   return anchor ? { anchor, body: trimmedBody } : null;
 }

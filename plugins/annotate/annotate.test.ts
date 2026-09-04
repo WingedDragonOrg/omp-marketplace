@@ -218,6 +218,31 @@ describe("assistant anchors", () => {
       body: "Improve this answer.",
     });
   });
+  test("creates a precise annotation draft from a selected range", () => {
+    const text = "Before. Select this sentence. After.";
+    const start = text.indexOf("Select");
+    const end = start + "Select this sentence.".length;
+    const draft = createAssistantAnnotationDraft(
+      "session-1",
+      { id: "assistant-1", text },
+      "  Shorten this sentence.  ",
+      { start, end },
+    );
+
+    expect(draft).toEqual({
+      anchor: {
+        kind: "assistant",
+        sessionId: "session-1",
+        entryId: "assistant-1",
+        start,
+        end,
+        text: "Select this sentence.",
+        before: "Before. ",
+        after: " After.",
+      },
+      body: "Shorten this sentence.",
+    });
+  });
 });
 
 describe("unified diff anchors", () => {

@@ -12,6 +12,7 @@ OMP 已提供 `/git` 全屏界面，用于浏览 Git diff、暂存变更和创�
 
 - 用户可以在一个工作台中用 tab 切换 Code 和 Assistant 两种审阅源；
 - 用户可以对 Git diff 的代码片段和 assistant 消息分别添加批注；
+- Assistant 消息支持默认整条批注，也支持按需选择精确字符范围；
 - 多条批注可以先集中整理，再一次性发送给当前 session agent；
 - agent 能拿到精确的引用上下文，在当前工作区执行修改或优化；
 - 代码或 session branch 变化造成定位失效时，系统不会把批注静默套用到错误内容；
@@ -25,7 +26,7 @@ OMP 已提供 `/git` 全屏界面，用于浏览 Git diff、暂存变更和创�
 - `/annotate` 扩展命令和全屏审阅 overlay；
 - `Code` 与 `Assistant` 两个 tab，以及在两个 tab 中创建、查看、删除和保留批注的交互；
 - 当前工作区 staged + unstaged Git diff 的代码片段批注；
-- 当前 session branch 中 assistant 可见消息的批注；
+- 当前 session branch 中 assistant 可见消息的整条或精确范围批注；
 - 当前 session 内的批注持久化、branch 重建和 stale 状态；
 - 批注校验、批量发送和发送失败后的保留行为；
 - TUI、无 Git 变更、无 assistant 消息、agent 忙和定位失效等边界行为。
@@ -38,13 +39,14 @@ OMP 已提供 `/git` 全屏界面，用于浏览 Git diff、暂存变更和创�
 - 独立 review session、并行子 agent、共享工作区协调或自动合并；
 - 自动 commit、push、冲突解决或其他未经用户发送动作授权的代码变更；
 - 将批注保存为项目文件、发送到远程服务或跨 session 共享；
+- 首版不支持鼠标拖选、跨 assistant message 组合选区或修改 assistant 原文；
 - 直接依赖 OMP 私有的 `GitModel`、`DiffPane`、controller 或未公开 session mutation API。
 
 ## 已知约束
 
 - OMP 18.1.9 的 `/git` 是内置全屏 TUI；内置命令名由保留集合管理，扩展注册同名命令会被跳过。`/annotate` 使用独立名称。
-- 公共扩展 API 提供 `ctx.ui.custom()`、`ctx.ui.editor()`、`ctx.ui.notify()`、`ctx.ui.setEditorText()`、`ctx.sessionManager.getBranch()`、`ctx.sessionManager.getLeafId()`、`pi.appendEntry()`、`pi.sendUserMessage()`、`pi.on("message_end")` 和命令上下文的 `waitForIdle()`，未提供内置 Git TUI 的可插拔按钮或数据模型。
-- `/annotate` 必须把 review overlay 作为插件自己的组件实现，并通过公开 API 与当前 session 交互。
+- 公共扩展 API 提供 `ctx.ui.custom()`、`ctx.ui.input()`、`ctx.ui.editor()`、`ctx.ui.notify()`、`ctx.ui.setEditorText()`、`ctx.sessionManager.getBranch()`、`ctx.sessionManager.getLeafId()`、`pi.appendEntry()`、`pi.sendUserMessage()`、`pi.on("message_end")` 和命令上下文的 `waitForIdle()`，未提供内置 Git TUI 的可插拔按钮或数据模型。
+- `/annotate` 必须把 review overlay 和 Assistant 精确范围选择器作为插件自己的组件实现，并通过公开 API 与当前 session 交互。
 - 无 TUI 的 print、RPC 或 ACP 表面不能绘制该 overlay；这些模式只报告需要交互式 TUI，并且不触发 agent turn。
 - marketplace 安装只部署插件文件，不安装运行时 npm 依赖。插件运行时应使用 host 提供的扩展 API、标准 Node/Bun 能力和 argv 形式的 Git 调用；开发依赖不得成为运行时前置条件。
 - `.omp-plugin/marketplace.json` 与 `.claude-plugin/marketplace.json` 必须保持字节一致；插件目录、catalog entry、package 元数据和 manifest 的身份与版本必须一致。
@@ -58,12 +60,13 @@ OMP 已提供 `/git` 全屏界面，用于浏览 Git diff、暂存变更和创�
 | 用户入口 | `/annotate` | 独立于 OMP 内置 `/git` 与 `/review`，命令语义直接 |
 | 审阅源 | `Code` 与 `Assistant` 两个 tab | 两种产出共用批注和发送模型，用户通过 tab 明确当前批注来源 |
 | Code 锚点 | 文件、old/new 行范围或片段、仓库 identity、HEAD/diff 快照 | 让 agent 能精确定位代码，并能识别工作区变化 |
-| Assistant 锚点 | session entry ID、完整消息文本、文本偏移和前后文 | 选择消息后直接进入批注输入 |
+| Assistant 锚点 | 同一 session entry 的完整或精确字符范围、文本偏移和前后文 | 默认整条消息快速批注，按 `p` 进入精确模式；两种模式共用 stale 校验 |
+| 精确模式入口 | Assistant source focus 下的 `p` | 不改变默认 `a` / `Enter` 快速批注路径，用户按需选择更高精度 |
 | 执行 agent | 当前 session agent | 复用已有会话上下文和工作区，公共扩展 API 可直接支持 |
 | 发送单位 | 所有有效 pending 批注合并成一次用户消息 | 多条意见保持一致上下文，避免每条意见单独触发模型回合 |
 | 持久化边界 | 当前 session branch 的 custom entries | 支持关闭、重启和 branch 重建，不污染项目文件或远程系统 |
-| 失效策略 | stale 批注不得静默发送 | 代码行号或 session branch 变化后，安全优先于自动猜测 |
-| UI 实现 | 插件自有全屏 overlay | 内置 `/git` 没有公开扩展 seam，避免绑定私有实现 |
+| 失效策略 | stale 批注不得静默发送 | 代码行号、消息范围或 session branch 变化后，安全优先于自动猜测 |
+| UI 实现 | 插件自有全屏 overlay 和只读范围选择器 | 内置 `/git` 没有公开扩展 seam，避免绑定私有实现 |
 
 ## 设计
 
@@ -78,14 +81,22 @@ OMP 已提供 `/git` 全屏界面，用于浏览 Git diff、暂存变更和创�
 
 关闭工作台不会丢失已经写入 session 的批注。tab 切换只改变当前审阅源，不清空另一源的批注。
 
+Assistant 批注提供两种一次性选择模式：
+
+- **默认整条模式**：在 `Assistant` source focus 下按 `a` 或 `Enter`，直接对当前可见 assistant message 输入批注；anchor 覆盖整条消息。
+- **精准模式**：在 `Assistant` source focus 下按 `p`，打开只读范围选择器；方向键移动光标，`Shift` + 方向键扩展或收缩选区，`Home` / `End` 移动到当前行首尾，普通 `Enter` 确认非空范围，再输入批注。
+- `p` 只对当前一次批注生效，不跨批注操作持久化；范围选择器或批注输入按 `Esc` 都返回工作台。
+
+范围选择器只展示消息文本，不允许修改 assistant 内容。精确范围可以跨行，选择器应高亮选区并让光标和选区在长消息滚动时保持可见。
+
 创建批注的共同流程：
 
-1. 用户在当前源中选择一个可定位的代码片段或 assistant 消息；
+1. 用户在当前源中选择一个可定位的代码片段或 assistant 消息；Assistant 消息可直接使用默认整条模式，也可进入精准模式选择字符范围；
 2. 用户输入非空批注正文；
 3. 插件保存一条 `pending` review item，并在批注区显示来源和定位摘要；
 4. 用户可以继续切换源、添加批注、删除错误的 pending 批注，或执行发送。
 
-选择为空、批注正文为空或来源无法提供稳定定位时，不创建 review item，并显示原因。
+无效代码选区、精准模式空选区、批注正文为空或来源无法提供稳定定位时，不创建 review item，并显示原因。
 
 ### 2. 审阅源
 
@@ -107,14 +118,20 @@ Code 源读取当前工作区相对 `HEAD` 的 staged 与 unstaged 变更，并�
 
 Assistant 源读取当前 session branch 的 assistant message，提取其中可见的 text content。候选内容不包括工具调用结果、命令输出、thinking 或其他非 assistant 文本。对于仍保留 secret placeholder 的历史 entry，插件不把 placeholder 当作可见文本；运行中的 `message_end` display event 提供的可见文本按 message timestamp 暂存，用于当前进程内的浏览，但 secret-protected entry 保持 browse-only，不能创建会把恢复后的 secret 文本写入 session custom entry 的批注。
 
+Assistant source 的每条消息都可从两种模式创建批注：
+
+- 默认整条模式保存 `start=0`、`end=messageText.length`，引用完整可见消息；
+- 精准模式保存范围选择器确认的 `start`、`end` 和精确文本，可跨行；
+- 两种模式都保存有限的 `before` / `after` 上下文；批注正文使用普通 `Enter` 提交。
+
 每条 assistant 批注携带：
 
 - 当前 session ID 和 assistant message 对应的 session entry ID；
-- 该消息完整文本在 entry 中的起止偏移；
+- 消息文本中的起止偏移；
 - 消息的精确文本和有限的前后文；
 - 用户批注正文。
 
-发送前确认 entry ID 仍在当前 branch，且消息完整文本与保存的精确文本和上下文一致。若文本来自运行中的 display event，还必须使用同一 timestamp 的可见文本完成校验。entry 不在当前 branch、文本不匹配时，批注变为 `stale`，不跨 branch 猜测迁移。
+发送前确认 entry ID 仍在当前 branch，且消息文本在保存的起止偏移处与精确文本和上下文一致。若文本来自运行中的 display event，还必须使用同一 timestamp 的可见文本完成校验。entry 不在当前 branch、文本不匹配或范围上下文变化时，批注变为 `stale`，不跨 branch 猜测迁移。
 
 ### 3. 批注状态与 session 持久化
 
@@ -134,7 +151,7 @@ Review item 使用版本化、JSON 可序列化的数据结构，至少包含：
 - 发送失败：原 item 保持 `pending`，不得丢失；
 - `sent` item 保留为审阅历史，不自动重新发送或自动判定为已解决。
 
-### 4. 发送给当前 agent
+### 4. 批注发送给当前 agent
 
 用户显式执行发送动作后，插件按以下顺序处理：
 
@@ -159,7 +176,7 @@ Review item 使用版本化、JSON 可序列化的数据结构，至少包含：
 
 ### 5. 插件与 OMP 的边界
 
-插件注册 `annotate` 扩展命令，并通过公开的 `ctx.ui.custom()` 创建 overlay。Git 读取使用直接的 argv 调用，不通过拼接 shell 命令传入文件路径、引用或用户文本。插件不调用 `sessionManager` 的写入 mutation；批注状态只通过 `pi.appendEntry()` 保存，agent 修改只通过 `pi.sendUserMessage()` 触发正常 agent 工具流程。
+插件注册 `annotate` 扩展命令，并通过公开的 `ctx.ui.custom()` 创建 overlay 和范围选择器。Git 读取使用直接的 argv 调用，不通过拼接 shell 命令传入文件路径、引用或用户文本。插件不调用 `sessionManager` 的写入 mutation；批注状态只通过 `pi.appendEntry()` 保存，agent 修改只通过 `pi.sendUserMessage()` 触发正常 agent 工具流程。
 
 `/git` 仍由 OMP core 负责 diff、暂存和 commit；`/review` 仍由 OMP 的既有代码审查命令负责。Annotate 只提供选区审阅和批注闭环，不试图共享它们的私有内部组件。
 
@@ -169,7 +186,8 @@ Review item 使用版本化、JSON 可序列化的数据结构，至少包含：
 - 没有 staged 或 unstaged 变更：Code tab 显示空状态，Assistant tab 仍可使用；
 - 当前 branch 没有 assistant 可见文本：Assistant tab 显示空状态；
 - 文件被删除、重命名、变成二进制、gitlink、无可读 patch hunk 或 diff fingerprint 变化：相关 Code item 标记 stale；此类文件在 Code tab 中仅浏览，不能创建新的 Code 批注；
-- assistant entry 被 branch 切换移出当前 branch：相关 Assistant item 标记 stale；
+- assistant entry 被 branch 切换移出当前 branch，或精确范围不再匹配当前消息文本：相关 Assistant item 标记 stale；
+- 精准模式确认空范围：不创建 item，并提示用户选择文本范围；
 - agent 正在 streaming：发送动作不抢占当前 turn，pending item 保留；
 - `sendUserMessage()` 失败或未收到可观测的用户消息确认：不更新为 sent，原 pending item 保留并显示错误；
 - session custom entry 数据损坏或 schema 不兼容：跳过该条记录并提示，其他合法 item 继续恢复；
@@ -181,16 +199,17 @@ Review item 使用版本化、JSON 可序列化的数据结构，至少包含：
 
 1. 在安装 Annotate 后，输入 `/annotate` 能打开带 `Code` 和 `Assistant` tab 的全屏审阅工作台；OMP 的 `/git` 和 `/review` 仍按各自既有行为执行。
 2. 在存在 staged 或 unstaged Git diff 的仓库中，用户能选择一段变更代码、输入批注，并在列表中看到带文件和行范围摘要的 pending item。
-3. 在当前 session 存在 assistant 可见文本时，用户能切换到 Assistant tab，选择一条消息、输入批注，并在列表中看到带消息来源摘要的 pending item。
-4. Code 与 Assistant tab 之间切换不会丢失或混淆另一来源的 pending item；用户能删除错误的 pending item。
-5. 关闭并重新打开 session 后，当前 session branch 中的合法 pending、sent 和 stale item 能恢复；已删除 item 不重新出现。
-6. 用户一次发送多条有效批注时，当前 session transcript 中出现一条用户消息，消息同时包含每条批注的来源、精确引用和批注正文；不会为每条批注分别触发回合。
-7. 当前 agent 忙时触发发送不会中断当前 tool batch，pending item 保留，且不会额外触发一个抢占回合。
-8. 在发送前改变 HEAD、index、工作区内容或 Code 文件路径时，无法确认的 Code item 变为 stale，不会被发送为旧行号对应的新代码；仍有效的其他 item 可以独立发送。
-9. 切换 session branch 使 Assistant 引用 entry 不再存在于当前 branch 时，该 item 仍保留并变为 stale，不会跨 branch 猜测迁移。
-10. `sendUserMessage()` 失败时，相关 item 仍为 pending，并可在修复后重试；成功发送的 item 才显示 sent。
-11. 在无 Git 变更、无 assistant 文本或非 TUI 模式下，界面分别显示明确空状态/能力提示，不因打开 Annotate 意外触发 agent turn。
-12. marketplace 两份 catalog 字节一致，`annotate` 目录、manifest、package 元数据、入口和 catalog 版本一致；安装后扩展命令可被 OMP 发现。
+3. 在当前 session 存在 assistant 可见文本时，用户能切换到 Assistant tab；默认 `a` / `Enter` 可直接批注整条消息，`p` 可进入精准模式选择单行或跨行范围，再用普通 `Enter` 提交批注，并在列表中看到 pending item。
+4. 精准模式保存的起止偏移和文本与用户确认的选区完全一致；取消或空选区不创建 item。
+5. Code 与 Assistant tab 之间切换不会丢失或混淆另一来源的 pending item；用户能删除错误的 pending item。
+6. 关闭并重新打开 session 后，当前 session branch 中的合法 pending、sent 和 stale item 能恢复；已删除 item 不重新出现。
+7. 用户一次发送多条有效批注时，当前 session transcript 中出现一条用户消息，消息同时包含每条批注的来源、精确引用和批注正文；不会为每条批注分别触发回合。
+8. 当前 agent 忙时触发发送不会中断当前 tool batch，pending item 保留，且不会额外触发一个抢占回合。
+9. 在发送前改变 HEAD、index、工作区内容或 Code 文件路径时，无法确认的 Code item 变为 stale，不会被发送为旧行号对应的新代码；仍有效的其他 item 可以独立发送。
+10. 切换 session branch 使 Assistant 引用 entry 不再存在于当前 branch，或消息范围不再匹配时，该 item 仍保留并变为 stale，不会跨 branch 猜测迁移。
+11. `sendUserMessage()` 失败时，相关 item 仍为 pending，并可在修复后重试；成功发送的 item 才显示 sent。
+12. 在无 Git 变更、无 assistant 文本或非 TUI 模式下，界面分别显示明确空状态/能力提示，不因打开 Annotate 意外触发 agent turn。
+13. marketplace 两份 catalog 字节一致，`annotate` 目录、manifest、package 元数据、入口和 catalog 版本一致；安装后扩展命令可被 OMP 发现。
 
 ## 未决事项
 

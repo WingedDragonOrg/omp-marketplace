@@ -35,6 +35,7 @@ export interface AnnotateViewData {
 export interface AnnotateViewCallbacks {
   addCode(selection: CodeSelection): Promise<void>;
   addAssistant(entry: AssistantTextEntry): Promise<void>;
+  addAssistantPrecise(entry: AssistantTextEntry): Promise<void>;
   deleteItem(item: ReviewItem): Promise<void>;
   refresh(): Promise<void>;
   send(): Promise<void>;
@@ -146,7 +147,7 @@ class AnnotateView implements Component {
     lines.push(
       this.theme.fg(
         "dim",
-        "↑/↓ select  a/Enter annotate  Space focus list  d delete  s send  r refresh  Esc close",
+        "↑/↓ select  a/Enter annotate  p precise  Space focus list  d delete  s send  r refresh  Esc close",
       ),
     );
     if (this.data.busy) lines.push(this.theme.fg("warning", "Working…"));
@@ -192,6 +193,13 @@ class AnnotateView implements Component {
         this.#reviewIndex = Math.max(0, Math.min(this.#reviewIndex + delta, Math.max(0, count - 1)));
       }
       this.tui.requestRender();
+      return;
+    }
+    if (matchesKey(data, "p")) {
+      if (this.#focus === "source" && this.#activeTab === "assistant") {
+        const selected = this.#sourceItems()[this.#sourceIndex];
+        if (selected && "text" in selected) this.#run(() => this.callbacks.addAssistantPrecise(selected));
+      }
       return;
     }
     if (matchesKey(data, "a") || matchesKey(data, "enter")) {
@@ -254,7 +262,7 @@ class AnnotateView implements Component {
       const pointer = this.#focus === "reviews" && index === this.#reviewIndex ? this.theme.fg("accent", "› ") : "  ";
       const location = item.anchor.kind === "code"
         ? `${oneLine(item.anchor.filePath)}:${item.anchor.newStart || item.anchor.oldStart}`
-        : `entry ${oneLine(item.anchor.entryId)}`;
+        : `entry ${oneLine(item.anchor.entryId)}:${item.anchor.start}–${item.anchor.end}`;
       return `${pointer}${item.source} ${oneLine(statusLabel(item))} ${location} — ${oneLine(item.body, 120)}`;
     });
   }
