@@ -14,7 +14,7 @@
       "name": "wtm",
       "description": "WTM worktree manager with Worktrunk lifecycle hooks, local merge automation, and native Git lifecycle fallback",
       "source": "./wtm",
-      "version": "1.2.0",
+      "version": "1.3.0",
       "category": "development",
       "keywords": [
         "worktree",

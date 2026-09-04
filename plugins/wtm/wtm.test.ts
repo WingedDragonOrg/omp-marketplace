@@ -807,30 +807,29 @@ describe("/wtm Worktrunk removal", () => {
     expect(removeCall).toContain("--force");
   });
 
-  test("prepares a primary move before self removal", async () => {
-    // Catches running removal, hooks, or confirmation while the session still occupies the source.
+  test("removes the current worktree before preparing a primary move", async () => {
+    // Catches failing to remove the source before preparing the move handoff.
     const root = tempRoot();
     const repo = initRepo(root);
     const source = path.join(root, "self topic");
     git(repo, ["worktree", "add", "-b", "self-topic", source]);
-    const log = installFakeWorktrunk(root);
+    const log = installFakeWorktrunk(root, { realRemove: true });
     const harness = makeHarness(source);
 
     await harness.handler("rm self -y", harness.ctx);
 
+    expect(existsSync(source)).toBe(false);
+    expect(runGitBranchExists(repo, "self-topic")).toBe(true);
     expect(harness.editorTexts).toEqual([`/move "${repo}"`]);
     expect(harness.moves).toEqual([]);
     expect(harness.reloads).toBe(0);
     expect(harness.confirmations).toEqual([]);
-    expect(existsSync(source)).toBe(true);
-    expect(fakeCalls(log).some((args) => args.includes("remove") || args.includes("approvals"))).toBe(false);
-    expect(harness.notices.some(({ text }) =>
-      text.includes(`/wtm rm ${JSON.stringify(source)}`) && !text.includes("-y")
-    )).toBe(true);
+    expect(fakeCalls(log).some((args) => args.includes("remove"))).toBe(true);
+    expect(harness.notices.some(({ text }) => text.includes("/wtm rm"))).toBe(false);
   });
 
   test("shows fresh identity before removing a worktree recreated at the same path", async () => {
-    // Catches treating an old path-only continuation as authorization to delete its replacement.
+    // Catches treating a path-only selector as authorization to delete a replacement.
     const root = tempRoot();
     const repo = initRepo(root);
     const source = path.join(root, "recreated-source");
@@ -2045,8 +2044,8 @@ describe("/wtm reviewed reconciliation boundaries", () => {
     expect(harness.notices.at(-1)?.text).toContain(collateral);
   });
 
-  test("uses Worktrunk primary metadata for a self-removal handoff", async () => {
-    // Catches deriving the safe landing from a separate Git metadata directory.
+  test("uses Worktrunk primary metadata while removing itself", async () => {
+    // Catches deriving the move target from a separate Git metadata directory.
     const root = tempRoot();
     const repo = path.join(root, "remove-separate-repo");
     const gitDir = path.join(root, "remove-separate-metadata");
@@ -2072,7 +2071,7 @@ describe("/wtm reviewed reconciliation boundaries", () => {
 
     expect(harness.editorTexts).toEqual([`/move "${repo}"`]);
     expect(harness.moves).toEqual([]);
-    expect(existsSync(source)).toBe(true);
+    expect(existsSync(source)).toBe(false);
     expect(runGitBranchExists(repo, "feature")).toBe(true);
     expect(harness.reloads).toBe(0);
   });

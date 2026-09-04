@@ -5,8 +5,9 @@
 // retain a native Git fallback; merge requires Worktrunk.
 //
 // OMP owns session migration through its built-in `/move`. Worktrunk owns Git
-// lifecycle operations. Cleanup-enabled operations prepare a verified safe
-// landing and an explicit continuation command.
+// lifecycle operations. Cleanup-enabled merge prepares a verified safe landing
+// and an explicit continuation command; self removal deletes its source first,
+// then prepares a `/move` handoff.
 //
 // `OMP_WORKTREE_DIR` overrides Worktrunk's configured path for new worktrees
 // while preserving the historical <repo>-<name> layout.
@@ -20,7 +21,7 @@ const HELP = `Usage:
   /wtm [branch] [--base <ref>]     create/reuse worktree + prepare /move
   /wtm list                        list this repo's worktrees
   /wtm rm <name|path> [-f] [-y]    remove one worktree; keep its branch
-  /wtm rm self [-f] [-y]           prepare /move, then remove current worktree
+  /wtm rm self [-f] [-y]           remove current worktree + prepare /move
   /wtm rm --all [-f] [-y]          remove eligible worktrees except primary/current
   /wtm prune                       prune stale Git worktree metadata
   /wtm merge [target] [flags]      run Worktrunk's local merge pipeline
@@ -30,9 +31,10 @@ Merge flags:
   --stage all|tracked|none  --source <path>  -y
 
 Handoff:
-  Create/reuse and operations that can remove the current worktree prepare /move.
-  Submit /move, then run the printed /wtm continuation. Preparation-stage -y is
-  not carried into remove or merge execution.
+  Create/reuse and cleanup-enabled merge operations prepare /move.
+  Self removal deletes the current worktree, then prepares /move to primary.
+  Submit /move for the prepared handoff. Merge continuations still require
+  a second /wtm invocation. -y skips only the current confirmation.
 
 Backend:
   Stable Worktrunk v0.76.x releases provide paths, lifecycle hooks, approvals, and merge.
@@ -1262,18 +1264,21 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         if (!isSelf && targetIsCwd) {
-          notify(`This is the session's worktree — use /wtm rm self (prepares a move to ${shortPath(mainPath)} first).`, "warning");
+          notify(`This is the session's worktree — use /wtm rm self (removes it and prepares a move to ${shortPath(mainPath)}).`, "warning");
           return;
         }
 
+        let selfMoveDestination: string | null = null;
         if (isSelf && targetIsCwd) {
           if (!mainPath || !repositoryIdentity || !isLiveWorktreePath(mainPath, repositoryIdentity)) {
             notify("Cannot determine a live primary worktree for the move handoff.", "error");
             return;
           }
-          const continuation = `/wtm rm ${JSON.stringify(canonicalPath(target.path))}${force ? " -f" : ""}`;
-          prepareMoveHandoff(mainPath, continuation);
-          return;
+          selfMoveDestination = mainPath;
+          if (!buildMoveCommand(canonicalPath(mainPath))) {
+            prepareMoveHandoff(mainPath);
+            return;
+          }
         }
 
         if (!repositoryIdentity || !isLiveWorktreePath(target.path, repositoryIdentity)) {
@@ -1348,6 +1353,7 @@ export default function (pi: ExtensionAPI) {
             `Removed worktree ${shortPath(target.path)}${detail}`,
             details.length > 0 ? "warning" : "info",
           );
+          if (selfMoveDestination) prepareMoveHandoff(selfMoveDestination);
           return;
         }
 
@@ -1361,6 +1367,7 @@ export default function (pi: ExtensionAPI) {
         }
         runGit(gitCwd, ["worktree", "prune"]);
         notify(`Removed worktree ${shortPath(target.path)}`, "info");
+        if (selfMoveDestination) prepareMoveHandoff(selfMoveDestination);
         return;
       }
 

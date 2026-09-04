@@ -30,7 +30,7 @@ Manual installation remains available by placing `wtm.ts` in `~/.omp/agent/exten
 /wtm [branch] [--base <ref>]                  create/reuse worktree and prepare /move
 /wtm list                                     list this repository's worktrees
 /wtm rm <branch|path> [-f] [-y]               remove one worktree; retain its branch
-/wtm rm self [-f] [-y]                        prepare /move, then remove current worktree
+/wtm rm self [-f] [-y]                        remove current worktree, then prepare /move
 /wtm rm --all [-f] [-y]                       remove eligible worktrees except primary/current
 /wtm prune                                    prune stale Git worktree metadata
 /wtm merge [target] [flags] [--source <path>] run Worktrunk's local merge pipeline
@@ -48,9 +48,9 @@ WTM never changes the active OMP session directory directly. After create or reu
 
 In the TUI the command is placed in the editor. Press Enter to let OMP core relocate the session and refresh project settings, providers, plugins, skills, commands, terminal title, footer, and todos. On non-TUI surfaces WTM prints the same copyable command.
 
-The target is verified when WTM creates the handoff. If it is deleted or replaced before `/move` is submitted, rerun the original `/wtm` command to generate a current handoff. Paths containing a line break or NUL are retained after creation but cannot be placed into a one-line slash command.
+For create/reuse and merge handoffs, the target is verified when WTM creates the handoff. If it is deleted or replaced before `/move` is submitted, rerun the original `/wtm` command to generate a current handoff. `rm self` verifies the primary before deleting its source, then prepares `/move` to that primary. Paths containing a line break or NUL are retained after creation but cannot be placed into a one-line slash command.
 
-Generated `/wtm` continuation commands encode path, target, and ref values as JSON string tokens. This preserves spaces, double quotes, and backslashes. Manually entered unquoted tokens continue to work.
+Generated merge continuation commands encode path, target, and ref values as JSON string tokens. This preserves spaces, double quotes, and backslashes. Manually entered unquoted tokens continue to work.
 
 ### Remove
 
@@ -59,13 +59,12 @@ Generated `/wtm` continuation commands encode path, target, and ref values as JS
 
 Worktrunk removal runs in the foreground with `--no-delete-branch`. `/wtm rm --all` excludes the primary worktree, current session worktree, bare entries, and stale registrations. A final `git worktree prune` removes stale metadata only.
 
-`/wtm rm self` is a two-step operation:
+`/wtm rm self` removes the current linked worktree immediately, then prepares `/move` to the live primary worktree in the same invocation. It preserves the normal dirty-worktree check, project command approval, and confirmation behavior:
 
-1. WTM prepares `/move` to the live primary worktree and prints `/wtm rm "<source-path>"`.
-2. Submit `/move`.
-3. Run the printed remove command.
+- `-f` / `--force` allows removal of a dirty worktree.
+- `-y` / `--yes` skips the confirmation for this invocation.
 
-The continuation omits the preparation-stage `-y`. The second invocation revalidates repository identity, branch, HEAD, dirty state, approvals, and displays a fresh confirmation before removal.
+After `/move` succeeds, no second `/wtm rm` command is needed. The worktree branch remains because removal uses `--no-delete-branch`.
 
 ### Merge
 

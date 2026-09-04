@@ -8,7 +8,7 @@ OMP 18.1.5 已内置 `/wt`，并把 `/wt` 与别名 `/worktree` 设为保留命�
 
 原插件在创建、`rm self` 和 cleanup-enabled merge 中直接调用 `sessionManager.moveTo()`，随后调用 `ctx.reload()`。这只能迁移 session 文件及其记录的 cwd；`ctx.reload()` 只重载 session、transcript 和 todos，不会执行 OMP 内置 `/move` 的 cwd 重定域。实际结果可能是命令执行目录已经改变，但 footer 仍显示旧路径和旧分支，项目 settings、provider globals、plugin roots、capabilities、title prompt、skills 和 slash commands 也未统一切换。
 
-本设计把插件统一改名为 `wtm`，使用 `/wtm` 承载 Worktrunk 生命周期和 merge 能力，并把所有 session cwd 切换交给 OMP 内置 `/move`。在 OMP 18.1.5 的扩展 API 边界内，移动采用明确的两步流程：插件完成 Git/Worktrunk 操作准备并预填 `/move`，用户按 Enter 后由 OMP 完成 session、进程 cwd、项目级状态和 UI 的原子重定域。
+本设计把插件统一改名为 `wtm`，使用 `/wtm` 承载 Worktrunk 生命周期和 merge 能力，并把所有 session cwd 切换交给 OMP 内置 `/move`。Create/reuse 与 cleanup-enabled merge 采用预填 `/move` 的续执行流程；`rm self` 在同一次命令中先删除当前 worktree，再预填迁移到 primary 的 `/move`。用户按 Enter 后由 OMP 完成 session、进程 cwd、项目级状态和 UI 的原子重定域。
 
 成功标准：
 
@@ -16,8 +16,8 @@ OMP 18.1.5 已内置 `/wt`，并把 `/wt` 与别名 `/worktree` 设为保留命�
 - `/wtm` 无 branch 参数时自动生成默认 branch name，有显式参数时使用指定 branch；
 - Worktrunk create/reuse、list、remove、prune、hooks、approvals 和 merge 能力继续可用；
 - 插件不再直接迁移 session，也不把 transcript reload 表述成 cwd 切换完成；
-- 任何可能删除当前 worktree 的 remove 或 merge 都必须先由内置 `/move` 把 session 移到 live safe landing；
-- 两步之间的仓库状态不被缓存为授权，执行阶段重新验证 identity、dirty state、approvals 和 Git 状态。
+- cleanup-enabled merge 必须先由内置 `/move` 把 session 移到 live safe landing；`rm self` 在删除当前 worktree 后准备迁移 handoff；
+- 需要续执行的操作不把仓库状态缓存为授权，执行阶段重新验证 identity、dirty state、approvals 和 Git 状态。
 
 ## 范围
 
@@ -26,7 +26,7 @@ OMP 18.1.5 已内置 `/wt`，并把 `/wt` 与别名 `/worktree` 设为保留命�
 - marketplace、package、plugin manifest、目录、入口文件和 slash command 从 `wt` 统一迁移到 `wtm`；
 - `/wtm` 无参数默认 branch、显式 branch 和 `--base` 行为；
 - Worktrunk 与原生 Git 后端选择；
-- Worktrunk create/reuse、list、remove、remove-all、remove-self 准备流程；
+- Worktrunk create/reuse、list、remove、remove-all 和 remove-self；其中 remove-self 直接删除 source 并准备 move handoff；
 - 保持原有语义的 `git worktree prune`；
 - Worktrunk lifecycle hooks、项目命令审批和后台 hook 日志提示；
 - Worktrunk 完整 merge pipeline 及其原生 flags；
@@ -54,7 +54,7 @@ OMP 18.1.5 已内置 `/wt`，并把 `/wt` 与别名 `/worktree` 设为保留命�
 - `ExtensionCommandContext.sessionManager` 的公开类型是只读视图；完整 session relocation 不是扩展 API。
 - `ctx.reload()` 会 reload 当前 session 并重绘 transcript/todos，但不会调用 `applyCwdChange()`。
 - OMP 内置 `/move` 会保存 settings/回滚 session relocation，并重载进程 cwd、项目 settings、provider globals、plugin roots、capabilities、title prompt、skills、slash commands、terminal title、status line、editor border 和 todos。
-- `ctx.ui.setEditorText()` 只在 TUI 提供后续命令输入面；print/RPC 等无 TUI surface 必须输出完整命令并保持 session 不动。
+- `ctx.ui.setEditorText()` 只在 TUI 提供后续命令输入面；print/RPC 等无 TUI surface 必须输出完整 `/move` 命令并保持 session 不动，`rm self` 则在删除 source 后输出该 handoff；
 - Move handoff 是单行 slash command 协议：目标 path 含 CR、LF 或 NUL 时不能自动预填；其他 path 必须按下文规定可逆序列化。
 - marketplace 安装只部署插件文件，不安装 `wt` 二进制；Worktrunk 必须由用户独立安装。
 - Worktrunk 仍是 1.0 之前的 CLI；兼容 allowlist 固定为已实测的稳定版 v0.76.x，prerelease 和其他版本需完成同一组行为探针后才能加入。
@@ -68,13 +68,13 @@ OMP 18.1.5 已内置 `/wt`，并把 `/wt` 与别名 `/worktree` 设为保留命�
 | 决策 | 选择 | 理由 |
 | --- | --- | --- |
 | 插件身份 | marketplace、package、目录和命令统一为 `wtm` | 避开 OMP 保留命令，并保持安装身份与用户入口一致 |
-| 版本 | `1.2.0` | 同时包含身份迁移和可观察的移动流程变化 |
+| 版本 | `1.3.0` | 直接 self removal 后预填 `/move` 的用户可见行为变化 |
 | 默认 branch | `/wtm` 无参数生成 `wt-<YYYYMMDDHHMM>` | 保留原插件的 branch/path 兼容规则，同时补齐无参数体验 |
 | Session 所有权 | `/move` 独占 session cwd 切换 | 只有 OMP core 能原子更新 session、进程和全部 cwd-scoped surfaces |
 | 移动交互 | TUI 预填 `/move <absolute-path>`，用户确认提交 | 在 18.1.5 支持范围内复用 core 迁移，不伪造输入或调用私有 API |
-| 两步状态 | 不保存 pending operation；后续命令显式携带 source 并重新验证 | 避免取消、重启或仓库变化后误执行 |
+| Merge 两步状态 | 不保存 pending operation；后续命令显式携带 source 并重新验证 | 避免取消、重启或仓库变化后误执行 |
 | Merge source | 新增 `--source <path>` | session 移出 source 后仍能从安全目录对原 worktree 执行 merge |
-| 后续命令编码 | `/move` 使用 raw outer quotes；`/wtm` 参数使用 JSON string token | 分别匹配 OMP 18.1.5 的 freeform `/move` 参数和插件自己的 tokenizer，覆盖空格、引号与反斜杠 |
+| Merge 续命令编码 | `/move` 使用 raw outer quotes；`/wtm` 续命令使用 JSON string token | 分别匹配 OMP 18.1.5 的 freeform `/move` 参数和插件自己的 tokenizer，覆盖空格、引号与反斜杠 |
 | 后端承诺 | Worktrunk 可选增强，原生命令可回退 | marketplace 无法提供外部二进制，同时现有 lifecycle 用户需要继续可用 |
 | Merge 后端 | merge 只使用 Worktrunk | 复制其 commit、squash、rebase、hooks 和 cleanup pipeline 会形成第二套实现 |
 | Hook 审批 | 未永久批准时取消操作，要求通过 Worktrunk 原生流程审批后重试 | 插件不能把只读预检当成可转移或可持久化的授权 |
@@ -89,8 +89,8 @@ OMP 18.1.5 已内置 `/wt`，并把 `/wt` 与别名 `/worktree` 设为保留命�
 
 ```text
 plugins/wtm/
-  package.json              name: wtm, version: 1.2.0
-  .omp-plugin/plugin.json   name: wtm, version: 1.2.0
+  package.json              name: wtm, version: 1.3.0
+  .omp-plugin/plugin.json   name: wtm, version: 1.3.0
   wtm.ts                    omp.extensions entry
   wtm.test.ts
   README.md
@@ -101,7 +101,7 @@ plugins/wtm/
 ```text
 name: wtm
 source: ./wtm
-version: 1.2.0
+version: 1.3.0
 ```
 
 根 README 和插件 README 只把 `/wtm` 作为本插件入口。外部 Worktrunk CLI 仍叫 `wt`；`OMP_WORKTREE_DIR` 和既有 worktree 路径不改名。
@@ -119,7 +119,7 @@ omp plugin install wtm@winged-dragon-org
 /wtm [branch] [--base <ref>]                 create/reuse worktree
 /wtm list                                    list this repository's worktrees
 /wtm rm <branch|path> [-f] [-y]              remove one worktree; retain its branch
-/wtm rm self [-f] [-y]                       prepare move, then remove current worktree
+/wtm rm self [-f] [-y]                       remove current worktree, then prepare /move
 /wtm rm --all [-f] [-y]                      remove eligible worktrees except primary/current
 /wtm prune                                   prune stale Git worktree metadata
 /wtm merge [target] [flags] [--source <path>] run Worktrunk's local merge pipeline
@@ -143,16 +143,16 @@ Worktrunk 变更命令一旦启动，不再切换到原生 Git。退出码非零
 插件以一个共同的 move handoff 行为替代所有直接 session mutation：
 
 1. 生成 handoff 时，目标必须是 canonical path 与 Git metadata 一致、属于当前 repository identity 的 live registered worktree。
-2. 目标绝对路径含 CR、LF 或 NUL 时不生成单行命令；create 已完成则保留 worktree 并报告无法自动 handoff，merge/remove 准备阶段则保持仓库不变。
+2. 目标绝对路径含 CR、LF 或 NUL 时不生成单行命令；create 结果保留，cleanup merge 的准备阶段保持仓库不变，`rm self` 在删除前停止；
 3. TUI 调用 `ctx.ui.setEditorText()` 预填 `/move "<raw-absolute-path>"`；outer quotes 只包住完整 raw path，不对其中的空格、引号或反斜杠做 shell/JSON 转义，以匹配 OMP 18.1.5 对 `/move` 整段参数只去除最外层双引号的行为。
 4. 无 TUI 时输出同一条完整命令；只输出，不提交。
-5. 插件返回时，session、process scope 和 UI 仍位于原目录。
-6. Live registration 与 repository identity 的保证截止到 handoff 生成时。用户提交前目标若消失，采用内置 `/move` 的失败与回滚结果；目标若被替换，`/move` 只保证进入当时存在的目录，后续 `/wtm` 命令会重新执行 Git/repository identity 校验。用户应重新运行原 `/wtm` 命令生成新的 handoff，而不是沿用已变旧的命令。
+5. 插件不直接迁移 session：create/reuse 与 merge 准备阶段保持原目录，`rm self` 在 source 删除后保持原 cwd，直到用户提交 `/move`。
+6. 对 create/reuse 与 merge handoff，live registration 与 repository identity 的保证截止到 handoff 生成时。用户提交前目标若消失，采用内置 `/move` 的失败与回滚结果；目标若被替换，`/move` 只保证进入当时存在的目录，后续 `/wtm` 命令会重新执行 Git/repository identity 校验。`rm self` 的 source 已在 handoff 前删除，primary 失效时保留删除结果并报告 handoff 问题。
 7. 用户提交 `/move` 后，成功/失败、回滚和所有 cwd-scoped refresh 由 OMP core 报告。
 
 插件通知只声明已经发生的 Git/Worktrunk 结果和“move command 已准备”；只有内置 `/move` 成功后才算 session 迁移完成。
 
-插件生成的 `/wtm` 后续命令使用 JSON string literal 表示 path、target 和 ref 等自由文本 token。命令 parser 必须把未加引号 token 与 JSON string token 解析为同一 argv 模型，拒绝无效转义和未闭合字符串；不得再用空白 `split` 解析命令。这样 `--source`、remove selector 和重放的 merge options 可以无损覆盖空格、双引号、反斜杠及以 `-` 开头的值。
+插件生成的 merge 续命令使用 JSON string literal 表示 path、target 和 ref 等自由文本 token。命令 parser 必须把未加引号 token 与 JSON string token 解析为同一 argv 模型，拒绝无效转义和未闭合字符串；不得再用空白 `split` 解析命令。这样 `--source`、remove selector 和重放的 merge options 可以无损覆盖空格、双引号、反斜杠及以 `-` 开头的值。
 
 ### Create 与 reuse
 
@@ -188,15 +188,15 @@ Worktree 已创建但用户取消、未提交或执行 `/move` 失败时，workt
 
 `rm --all` 继续排除 primary、当前 session worktree、bare、prunable 和被普通目录占据的 stale path。各目标按确定顺序删除；单项失败不回滚已完成项，最终逐项报告并执行 `git worktree prune`。
 
-`rm self` 改为两步：
+`rm self` 在同一次调用中完成删除和 move handoff：
 
 1. 验证当前目录是 linked live worktree，并解析同 repository identity 的 live primary；
-2. 不确认删除、不运行 remove hook、不删除任何内容；
-3. 预填 primary 的 `/move`；
-4. 输出迁移后需要运行的 `/wtm rm <json-source-path> [-f]`；保留用户实际提供的 `-f`，但必须移除准备阶段的 `-y`；
-5. 用户完成 `/move` 后执行普通 remove；该次调用重新检查 source identity、实际 branch/head、dirty state 和 approvals，并基于实时摘要强制确认。
+2. 在删除前验证 primary 可表示为单行 `/move` 命令；
+3. 按普通 remove 流程检查 dirty state、project approvals，并根据 `-y` 显示确认；
+4. 使用 Worktrunk 或原生 Git 在 foreground 删除当前 worktree，成功后执行 `git worktree prune`；
+5. 仅在 source worktree 已不再登记且目录已删除后，预填 primary 的 `/move`。用户完成 `/move` 后不需要再次输入 `/wtm rm`。
 
-如果 `/move` 失败，删除不会开始。如果两步之间 source 消失、变成 current/primary 或不再属于同一仓库，第二步停止。原 path 被新的 live worktree 占用时，第二步把它视为新的 remove 目标，必须显示实时 branch/head 且不能继承 `-y`；用户拒绝即不删除。用户若在完成 `/move` 后重新显式输入 `-y`，属于基于当前状态的新指令。
+如果删除失败，不准备 move handoff。删除成功但 primary 在 handoff 前失效时，保留已发生的删除结果并报告 `/move` 无法生成；`rm self` 不保存 pending operation，也不把删除授权转移到后续命令。
 
 ### Project hooks 与审批
 
@@ -208,7 +208,7 @@ wt config approvals list --format=json
 
 相关未批准命令或 stale approval 会取消该阶段，并提示用户通过原生 `wt config approvals add` 审批后重试。插件不写 approvals，不传用于绕过审批的 `--yes` 或 `--no-hooks`。
 
-Create/reuse 的审批在 Worktrunk switch 前执行。`rm self` 的准备阶段不执行 hook，因此 approval 在迁移后的普通 remove 调用中重新读取。Merge 准备阶段不执行 hook，因此 approval 在携带 `--source` 的执行阶段重新读取。
+Create/reuse 的审批在 Worktrunk switch 前执行；`rm self` 在删除前执行 remove approval 检查；Merge 准备阶段不执行 hook，因此 approval 在携带 `--source` 的执行阶段重新读取。
 
 Blocking hook 失败停止 pipeline。Background hook 失败不回滚已完成的 Git 操作；通知提供 `wt config state logs`。
 
@@ -299,7 +299,7 @@ Create 在 Worktrunk error/JSON incompatibility 后再次调用时，必须先�
 - stdout 只按命令对应的 JSON schema 解析；stderr 用于人类诊断和 hook 状态。
 - 所有外部命令使用 argv 数组，不通过 shell 拼接 branch、path 或 ref。
 - Worktrunk 的 shell-integration/cd 提示不展示，因为 OMP `/move` 承担 session 迁移；其他 warning、hook 输出和错误保留。
-- Move handoff 同时显示目标路径和后续命令；路径来自经过 repository identity 对账的绝对路径。
+- Move handoff 显示目标路径；需要续执行的 merge 同时显示后续命令。路径来自经过 repository identity 对账的绝对路径。
 - 操作完成通知只声明已经发生的 Git/Worktrunk 结果，不提前声明 session 已迁移。
 
 ## 错误与边界情况
@@ -312,13 +312,13 @@ Create 在 Worktrunk error/JSON incompatibility 后再次调用时，必须先�
 | Worktrunk 版本或只读 JSON 不兼容 | 变更前按命令类型回退或拒绝 |
 | create 已建 worktree，hook/JSON 失败 | session 不动；重试先对账，已存在则进入 reuse 而非再次 create |
 | create/reuse 成功后用户不执行 `/move` | worktree 保留，session 和 UI 保持原目录 |
-| handoff path 含 CR、LF 或 NUL | 不预填；create 结果保留并报告，merge/remove 准备阶段保持仓库不变 |
+| handoff path 含 CR、LF 或 NUL | 不预填；create 结果保留，cleanup merge 和 `rm self` 在变更前保持仓库不变 |
 | handoff 后目标被删除 | 采用内置 `/move` 的失败/回滚结果，要求重新生成 handoff |
 | handoff 后目标被替换 | `/move` 可能进入替换目录；后续 `/wtm` 重新验证 Git/repository identity 后才允许操作 |
-| TUI editor 不可用 | 输出完整 `/move` 和续执行命令，不自动迁移 |
-| `rm self` 尚未完成 `/move` | 不运行 remove 或 hooks |
-| `rm self` 准备时传 `-y` | 后续命令移除 `-y`，基于迁移后的实时目标强制确认 |
-| `rm self` 两步间 source 状态变化 | 普通 remove 根据实时 identity、branch/head、dirty state 和 approvals 停止或重新确认 |
+| TUI editor 不可用 | 输出完整 `/move`；cleanup merge 另外输出续执行命令，不自动迁移 |
+| `rm self` 删除失败 | 不准备 `/move`，保留 source 现场 |
+| `rm self` 删除成功 | 预填 primary 的 `/move`，不输出 remove 续命令 |
+| `rm self` primary 在删除后失效 | 保留 source 删除结果，报告 `/move` handoff 问题 |
 | cleanup merge 找不到 safe landing | 不启动 Worktrunk，仓库不变 |
 | cleanup merge 未带 `--source` 且当前仍是 source | 只生成 move handoff，不启动 Worktrunk |
 | cleanup merge 准备时传 `-y` | 后续命令移除 `-y`，执行阶段显示实时摘要并确认 |
@@ -346,9 +346,9 @@ Create 在 Worktrunk error/JSON incompatibility 后再次调用时，必须先�
 12. Worktrunk create 未指定 `--base` 时从当前 HEAD 创建，不采用默认 branch 基点。
 13. `/wtm list` 不因用户的 `list.full` 或 `list.summary` 配置触发 forge 请求或 LLM 生成。
 14. Worktrunk remove 默认拒绝 dirty worktree；`-f` 才允许强制；成功删除后 branch 仍存在。
-15. `rm self` 首次调用不移动、不删除、不运行 hooks，并预填 primary 的 `/move` 及显示以原 source path 为 selector 的后续 remove 命令。
-16. `rm self -y` 生成的后续 remove 命令不含 `-y`；完成 `/move` 后必须基于实时 branch/head、dirty state 和 approvals 显示摘要并确认。
-17. `rm self` 的 source path 在两步间被新的 worktree 占用时，第二步显示新目标 identity 并要求确认；拒绝后不删除。
+15. `rm self` 验证当前 live worktree、同仓库 primary、dirty state 和 project approvals，并遵守 `-y` 确认语义。
+16. `rm self` 删除 source 后预填 primary 的 `/move`；成功删除后不需要第二个 `/wtm rm` 命令，branch 仍保留。
+17. `rm self` 在 primary handoff 不可表示或删除结果未确认时不生成 `/move`；删除已发生但 handoff 失败时准确报告已发生的删除。
 18. `rm --all` 不触碰 primary、当前 session worktree、bare、prunable 或被普通目录占据的 stale path，并准确报告部分失败。
 19. Prune 只清 stale metadata；已合并但有效的 worktree 和 branch 保持存在。
 20. Cleanup-enabled merge 从当前 linked source 首次调用时不改变 refs、不运行 hooks、不启动 Worktrunk，并预填 live target/primary safe landing 的 `/move`。
