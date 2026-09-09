@@ -27,7 +27,14 @@ export interface CodeAnchor {
   newStart: number;
   newEnd: number;
   selectedText: string;
+  startOffset?: number;
+  endOffset?: number;
   commitOid?: string;
+}
+
+export interface CodeSelectionRange {
+  startOffset: number;
+  endOffset: number;
 }
 
 export type ReviewAnchor = CodeAnchor | AssistantAnchor;
@@ -404,11 +411,31 @@ export function createCodeAnchor(
   snapshot: CodeSnapshot,
   filePath: string,
   selectedLines: readonly DiffLine[],
+  range?: CodeSelectionRange,
 ): CodeAnchor | null {
-  if (!snapshot.root || !snapshot.repositoryId || !snapshot.headOid || !snapshot.diffFingerprint || !filePath || selectedLines.length === 0) {
+  if (
+    !snapshot.root ||
+    !snapshot.repositoryId ||
+    !snapshot.headOid ||
+    !snapshot.diffFingerprint ||
+    !filePath ||
+    selectedLines.length === 0
+  ) {
     return null;
   }
-  const selectedText = selectedLines.map(line => line.content).join("\n");
+  const fullText = selectedLines.map(line => line.content).join("\n");
+  const startOffset = range?.startOffset ?? 0;
+  const endOffset = range?.endOffset ?? fullText.length;
+  if (
+    !Number.isInteger(startOffset) ||
+    !Number.isInteger(endOffset) ||
+    startOffset < 0 ||
+    endOffset <= startOffset ||
+    endOffset > fullText.length
+  ) {
+    return null;
+  }
+  const selectedText = fullText.slice(startOffset, endOffset);
   if (!selectedText) return null;
 
   const oldNumbers = selectedLines.flatMap(line => (line.oldLine === undefined ? [] : [line.oldLine]));
@@ -426,6 +453,7 @@ export function createCodeAnchor(
     newStart: newNumbers.length > 0 ? Math.min(...newNumbers) : 0,
     newEnd: newNumbers.length > 0 ? Math.max(...newNumbers) : 0,
     selectedText,
+    ...(range === undefined ? {} : { startOffset, endOffset }),
   };
 }
 
@@ -454,7 +482,17 @@ export function validateCodeAnchor(anchor: CodeAnchor, snapshot: CodeSnapshot): 
   if (!file || file.binary) return { kind: "stale", reason: "file-missing" };
   const lines = linesForCodeAnchor(file, anchor);
   if (lines.length === 0) return { kind: "stale", reason: "line-missing" };
-  if (lines.map(line => line.content).join("\n") !== anchor.selectedText) {
+  const fullText = lines.map(line => line.content).join("\n");
+  const startOffset = anchor.startOffset ?? 0;
+  const endOffset = anchor.endOffset ?? fullText.length;
+  if (
+    !Number.isInteger(startOffset) ||
+    !Number.isInteger(endOffset) ||
+    startOffset < 0 ||
+    endOffset <= startOffset ||
+    endOffset > fullText.length ||
+    fullText.slice(startOffset, endOffset) !== anchor.selectedText
+  ) {
     return { kind: "stale", reason: "text-mismatch" };
   }
   return { kind: "valid" };
@@ -499,7 +537,14 @@ function isCodeAnchor(value: unknown): value is CodeAnchor {
     Number.isInteger(value.newStart) &&
     Number.isInteger(value.newEnd) &&
     typeof value.selectedText === "string" &&
-    value.selectedText.length > 0
+    value.selectedText.length > 0 &&
+    ((value.startOffset === undefined && value.endOffset === undefined) ||
+      (typeof value.startOffset === "number" &&
+        typeof value.endOffset === "number" &&
+        Number.isInteger(value.startOffset) &&
+        Number.isInteger(value.endOffset) &&
+        value.startOffset >= 0 &&
+        value.endOffset > value.startOffset))
   );
 }
 
@@ -511,6 +556,11 @@ function isReviewItem(value: unknown): value is ReviewItem {
   if (value.status !== "pending" && value.status !== "sent" && value.status !== "stale") return false;
   if (value.staleReason !== undefined && typeof value.staleReason !== "string") return false;
   return value.source === "code" ? isCodeAnchor(value.anchor) : isAssistantAnchor(value.anchor);
+}
+export function editReviewItem(item: ReviewItem, body: string): ReviewItem | undefined {
+  const trimmedBody = body.trim();
+  if (item.status !== "pending" || trimmedBody.length === 0) return undefined;
+  return { ...item, body: trimmedBody };
 }
 
 function parseReviewEvent(value: unknown): ReviewEvent | null {

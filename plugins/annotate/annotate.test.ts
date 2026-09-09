@@ -8,6 +8,7 @@ import {
   createAssistantAnchor,
   createCodeAnchor,
   deletedReviewItemIds,
+  editReviewItem,
   extractAssistantText,
   parseUnifiedDiff,
   restoreReviewItems,
@@ -316,6 +317,35 @@ describe("unified diff anchors", () => {
     expect(anchor?.commitOid).toBe(historicalCommitOid);
     expect(validateCodeAnchor(anchor!, historicalSnapshot)).toEqual({ kind: "valid" });
     expect(validateCodeAnchor(anchor!, snapshot)).toEqual({ kind: "stale", reason: "snapshot-changed" });
+  });
+  test("captures and validates partial selections across multiple code lines", () => {
+    const file = snapshot.files[0]!;
+    const selectedLines = file.hunks[0]!.lines;
+    const fullText = selectedLines.map(line => line.content).join("\n");
+    const startOffset = 2;
+    const endOffset = fullText.length - 2;
+    const anchor = createCodeAnchor(snapshot, file.path, selectedLines, { startOffset, endOffset });
+
+    expect(anchor?.startOffset).toBe(startOffset);
+    expect(anchor?.endOffset).toBe(endOffset);
+    expect(anchor?.selectedText).toBe(fullText.slice(startOffset, endOffset));
+    expect(validateCodeAnchor(anchor!, snapshot)).toEqual({ kind: "valid" });
+    expect(validateCodeAnchor({ ...anchor!, endOffset: endOffset + 1 }, snapshot)).toEqual({ kind: "stale", reason: "text-mismatch" });
+    expect(createCodeAnchor(snapshot, file.path, selectedLines, { startOffset: 0, endOffset: 0 })).toBeNull();
+  });
+  test("edits a pending annotation body while preserving its code anchor", () => {
+    const item = codeItem(snapshot.files[0]!);
+    const updated = editReviewItem(item, "Use a clearer name.");
+
+    expect(updated).toMatchObject({
+      id: item.id,
+      source: "code",
+      anchor: item.anchor,
+      body: "Use a clearer name.",
+      status: "pending",
+    });
+    expect(editReviewItem(item, "   ")).toBeUndefined();
+    expect(editReviewItem({ ...item, status: "sent" }, "Use a clearer name.")).toBeUndefined();
   });
   test("keeps binary files as browse-only entries", () => {
     const files = parseUnifiedDiff([

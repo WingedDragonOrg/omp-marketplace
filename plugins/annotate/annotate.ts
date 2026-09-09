@@ -1,18 +1,21 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { ensureTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import {
   buildReviewMessage,
   collectAssistantTextEntries,
   createAssistantAnchor,
   createCodeAnchor,
+  editReviewItem,
+  deletedReviewItemIds,
   extractAssistantText,
   restoreReviewItems,
-  deletedReviewItemIds,
   REVIEW_CUSTOM_TYPE,
   type AssistantAnchor,
   type AssistantTextEntry,
   type CodeAnchor,
   type CodeSnapshot,
+  type DiffLine,
   type ReviewEvent,
   type ReviewItem,
 } from "./src/model";
@@ -31,6 +34,7 @@ import {
   type PendingValidation,
 } from "./src/workflow";
 import { createAssistantRangeSelector } from "./src/assistant-range-selector";
+import { createCodeRangeSelector, type CodeRangeSelection } from "./src/code-range-selector";
 import type { AssistantSelectionRange } from "./src/assistant-selection";
 import {
   createAnnotateView,
@@ -329,7 +333,11 @@ async function addCodeAnnotation(
     notify(ctx, "Annotation text cannot be empty.", "warning");
     return false;
   }
-  const anchor = createCodeAnchor(data.codeSnapshot, selection.filePath, [selection.line]);
+  const range =
+    selection.startOffset === undefined || selection.endOffset === undefined
+      ? undefined
+      : { startOffset: selection.startOffset, endOffset: selection.endOffset };
+  const anchor = createCodeAnchor(data.codeSnapshot, selection.filePath, selection.lines, range);
   if (!anchor) {
     notify(ctx, "The selected code does not have a stable location.", "warning");
     return false;
@@ -367,6 +375,37 @@ async function selectAssistantRange(
   );
 }
 
+async function selectCodeRange(
+  ctx: ExtensionContext,
+  state: RuntimeState,
+  filePath: string,
+  lines: readonly DiffLine[],
+): Promise<CodeSelection | undefined> {
+  if (lines.length === 0) return undefined;
+  const range = await withOverlayHidden(
+    state,
+    () =>
+      ctx.ui.custom<CodeRangeSelection | undefined>(
+        (tui, theme, _keybindings, done) => createCodeRangeSelector(tui, theme, lines, done),
+        {
+          overlay: true,
+          overlayOptions: {
+            fullscreen: true,
+            margin: 1,
+          },
+        },
+      ),
+  );
+  if (!range || range.lines.length === 0) return undefined;
+  return {
+    filePath,
+    line: range.lines[0]!,
+    lines: range.lines,
+    startOffset: range.startOffset,
+    endOffset: range.endOffset,
+  };
+}
+
 async function addAssistantAnnotation(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -391,6 +430,29 @@ async function addAssistantAnnotation(
   data.items = [...data.items, item];
   syncReviewState(state, ctx, data.items);
   notify(ctx, "Assistant annotation added.");
+  return true;
+}
+async function updateAnnotation(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  data: AnnotateViewData,
+  state: RuntimeState,
+  item: ReviewItem,
+  body: string,
+): Promise<boolean> {
+  if (item.status !== "pending") {
+    notify(ctx, "Only pending annotations can be edited.", "warning");
+    return false;
+  }
+  const updated = editReviewItem(item, body);
+  if (!updated) {
+    notify(ctx, "Annotation text cannot be empty.", "warning");
+    return false;
+  }
+  appendReviewEvent(pi, { action: "upsert", item: updated });
+  data.items = replaceItem(data.items, updated);
+  syncReviewState(state, ctx, data.items);
+  notify(ctx, "Annotation updated.");
   return true;
 }
 
@@ -518,6 +580,9 @@ async function openAnnotate(pi: ExtensionAPI, ctx: ExtensionCommandContext, stat
     notify(ctx, "/annotate requires the interactive TUI.", "warning");
     return;
   }
+  // DiffPane is shared from the built-in git TUI, whose source module has its
+  // own theme singleton when an extension is loaded outside the CLI bundle.
+  await ensureTheme();
 
   const data: AnnotateViewData = {
     codeSnapshot: undefined,
@@ -544,9 +609,11 @@ async function openAnnotate(pi: ExtensionAPI, ctx: ExtensionCommandContext, stat
     addCode: (selection, body) => addCodeAnnotation(pi, ctx, data, state, selection, body),
     addAssistant: (entry, body, selection) => addAssistantAnnotation(pi, ctx, data, state, entry, body, selection),
     selectAssistantPrecise: entry => selectAssistantRange(ctx, state, entry),
+    selectCodePrecise: (filePath, lines) => selectCodeRange(ctx, state, filePath, lines),
     selectCommit: commit => selectCommitSource(ctx, data, exec, commit),
     selectWorkingTree: () => selectWorkingTreeSource(ctx, data, exec),
     deleteItem: item => deleteAnnotation(pi, ctx, data, state, item),
+    updateItem: (item, body) => updateAnnotation(pi, ctx, data, state, item, body),
     refresh: async () => {
       if (await refreshData(pi, ctx, data, exec, state.visibleAssistantTextByTimestamp)) {
         syncReviewState(state, ctx, data.items);
@@ -563,7 +630,8 @@ async function openAnnotate(pi: ExtensionAPI, ctx: ExtensionCommandContext, stat
       overlayOptions: {
         fullscreen: true,
         width: "100%",
-        margin: 1,
+        margin: 0,
+        mouseTracking: true,
       },
       onHandle: handle => {
         state.overlayHandle = handle;
