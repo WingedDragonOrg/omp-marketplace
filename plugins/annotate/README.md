@@ -11,24 +11,27 @@ omp plugin install annotate@winged-dragon-org
 
 Start a new `omp` session after installation because extension modules load when the session starts.
 
-## Review workflow
+- **Code** — browse the staged and unstaged Git diff relative to `HEAD`, preview the selected line, and annotate it.
+- **Assistant** — browse visible assistant messages in the current session branch, preview the selected message, and annotate the whole message or a precise character range.
 
-- **Code** — browse the staged and unstaged Git diff relative to `HEAD` and annotate a selected diff line.
-- **Assistant** — browse visible assistant messages in the current session branch. Annotate a whole message by default or choose a precise character range when needed.
+The workbench uses the full overlay width: the left column contains source navigation and its preview, while the right column keeps the annotation editor and review history visible together.
 
 Controls:
 ```text
-Tab                 switch Code / Assistant
-Up / Down           select a source row or annotation
-Enter / a           annotate the selected source row
-p                   choose a precise Assistant character range
-Space               move focus between source and annotation lists
+Tab                 switch Code / Assistant while browsing sources
+↑ / ↓               select a source row or annotation
+a / Enter           focus the annotation editor for the selected source
+Enter               submit the editor draft
+Alt+Enter           insert a newline in the editor draft
+p                   choose a precise Assistant character range, then edit
+Space               switch between source and annotation lists
+Ctrl+Space          cycle source → editor → annotation list
+Shift+Tab           move from the editor to annotation history
 d                   delete the focused pending annotation
 s                   validate and send all valid pending annotations
 r                   refresh Git and session sources
 Esc / q             close the workbench
 ```
-
 A new annotation is saved as `pending` in the current session branch. Sending combines all valid pending annotations into one user message for the current session agent. The message contains the exact reference, location metadata, and user comment, and asks the agent to re-check the reference before editing.
 
 ## Safe stale handling

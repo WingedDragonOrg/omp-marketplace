@@ -214,47 +214,43 @@ async function addCodeAnnotation(
   data: AnnotateViewData,
   state: RuntimeState,
   selection: CodeSelection,
-): Promise<void> {
+  body: string,
+): Promise<boolean> {
   if (!data.codeSnapshot) {
     notify(ctx, data.codeError ?? "Code source is unavailable.", "error");
-    return;
+    return false;
   }
-  const body = await withOverlayHidden(state, () => ctx.ui.editor("Code annotation", ""));
-  if (body === undefined) return;
-  if (body.trim().length === 0) {
+  const trimmedBody = body.trim();
+  if (trimmedBody.length === 0) {
     notify(ctx, "Annotation text cannot be empty.", "warning");
-    return;
+    return false;
   }
   const anchor = createCodeAnchor(data.codeSnapshot, selection.filePath, [selection.line]);
   if (!anchor) {
     notify(ctx, "The selected code does not have a stable location.", "warning");
-    return;
+    return false;
   }
-  const item = newItem({ source: "code", anchor }, body.trim());
+  const item = newItem({ source: "code", anchor }, trimmedBody);
   appendReviewEvent(pi, { action: "upsert", item });
   data.items = [...data.items, item];
   syncReviewState(state, ctx, data.items);
   notify(ctx, "Code annotation added.");
+  return true;
 }
 
-async function addAssistantAnnotation(
-  pi: ExtensionAPI,
+async function selectAssistantRange(
   ctx: ExtensionContext,
-  data: AnnotateViewData,
   state: RuntimeState,
   entry: AssistantTextEntry,
-  precise = false,
-): Promise<void> {
+): Promise<AssistantSelectionRange | undefined> {
   if (!entry.annotationAllowed) {
     notify(ctx, "This assistant text is secret-protected and cannot be persisted as an annotation.", "warning");
-    return;
+    return undefined;
   }
-
-  let selection: Pick<AssistantSelectionRange, "start" | "end"> | undefined;
-  if (precise) {
-    const selected = await withOverlayHidden(
-      state,
-      () => ctx.ui.custom<AssistantSelectionRange | undefined>(
+  return withOverlayHidden(
+    state,
+    () =>
+      ctx.ui.custom<AssistantSelectionRange | undefined>(
         (tui, theme, _keybindings, done) => createAssistantRangeSelector(tui, theme, entry.text, done),
         {
           overlay: true,
@@ -264,26 +260,34 @@ async function addAssistantAnnotation(
           },
         },
       ),
-    );
-    if (!selected) return;
-    selection = selected;
+  );
+}
+
+async function addAssistantAnnotation(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  data: AnnotateViewData,
+  state: RuntimeState,
+  entry: AssistantTextEntry,
+  body: string,
+  selection?: Pick<AssistantSelectionRange, "start" | "end">,
+): Promise<boolean> {
+  if (!entry.annotationAllowed) {
+    notify(ctx, "This assistant text is secret-protected and cannot be persisted as an annotation.", "warning");
+    return false;
   }
 
-  const body = await withOverlayHidden(
-    state,
-    () => ctx.ui.input("Assistant annotation", "Write a note about this message"),
-  );
-  if (body === undefined) return;
   const draft = createAssistantAnnotationDraft(ctx.sessionManager.getSessionId(), entry, body, selection);
   if (!draft) {
     notify(ctx, "Annotation text cannot be empty.", "warning");
-    return;
+    return false;
   }
   const item = newItem({ source: "assistant", anchor: draft.anchor }, draft.body);
   appendReviewEvent(pi, { action: "upsert", item });
   data.items = [...data.items, item];
   syncReviewState(state, ctx, data.items);
   notify(ctx, "Assistant annotation added.");
+  return true;
 }
 
 async function deleteAnnotation(
@@ -427,9 +431,9 @@ async function openAnnotate(pi: ExtensionAPI, ctx: ExtensionCommandContext, stat
   state.activeData = data;
 
   const callbacks: AnnotateViewCallbacks = {
-    addCode: selection => addCodeAnnotation(pi, ctx, data, state, selection),
-    addAssistant: entry => addAssistantAnnotation(pi, ctx, data, state, entry),
-    addAssistantPrecise: entry => addAssistantAnnotation(pi, ctx, data, state, entry, true),
+    addCode: (selection, body) => addCodeAnnotation(pi, ctx, data, state, selection, body),
+    addAssistant: (entry, body, selection) => addAssistantAnnotation(pi, ctx, data, state, entry, body, selection),
+    selectAssistantPrecise: entry => selectAssistantRange(ctx, state, entry),
     deleteItem: item => deleteAnnotation(pi, ctx, data, state, item),
     refresh: async () => {
       if (await refreshData(pi, ctx, data, exec, state.visibleAssistantTextByTimestamp)) {
@@ -446,6 +450,7 @@ async function openAnnotate(pi: ExtensionAPI, ctx: ExtensionCommandContext, stat
       overlay: true,
       overlayOptions: {
         fullscreen: true,
+        width: "100%",
         margin: 1,
       },
       onHandle: handle => {
