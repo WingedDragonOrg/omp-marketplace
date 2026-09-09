@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { carryMissingReviewItems, createAssistantAnnotationDraft, isDispatchConfirmation, validatePendingItems } from "./src/workflow";
-import { readGitSnapshot } from "./src/git";
+import { readGitCommits, readGitSnapshot, readGitSnapshotAtCommit } from "./src/git";
 import {
   applyReviewEvent,
   buildReviewMessage,
@@ -308,6 +308,15 @@ describe("unified diff anchors", () => {
       ),
     ).toEqual({ kind: "stale", reason: "text-mismatch" });
   });
+  test("captures and validates a commit revision on historical code anchors", () => {
+    const historicalCommitOid = "b".repeat(40);
+    const historicalSnapshot = { ...snapshot, commitOid: historicalCommitOid };
+    const anchor = createCodeAnchor(historicalSnapshot, snapshot.files[0]!.path, snapshot.files[0]!.hunks[0]!.lines.slice(1, 2));
+
+    expect(anchor?.commitOid).toBe(historicalCommitOid);
+    expect(validateCodeAnchor(anchor!, historicalSnapshot)).toEqual({ kind: "valid" });
+    expect(validateCodeAnchor(anchor!, snapshot)).toEqual({ kind: "stale", reason: "snapshot-changed" });
+  });
   test("keeps binary files as browse-only entries", () => {
     const files = parseUnifiedDiff([
       "diff --git a/assets/image.bin b/assets/image.bin",
@@ -440,6 +449,128 @@ describe("readGitSnapshot", () => {
       stderr: "fatal: not a git repository",
     }), "/tmp/not-a-repo");
     expect(result).toEqual({ kind: "error", detail: "fatal: not a git repository" });
+  });
+});
+describe("readGitCommits", () => {
+  test("parses recent commits from NUL-delimited Git log output", async () => {
+    const firstOid = "a".repeat(40);
+    const secondOid = "b".repeat(40);
+    const result = await readGitCommits(async (_cwd, args) => {
+      if (args[0] === "rev-parse") return { code: 0, stdout: "/tmp/project\n", stderr: "" };
+      expect(args).toEqual(["log", "--no-decorate", "--format=%H%x00%h%x00%cI%x00%s%x00", "-n", "2", "--"]);
+      return {
+        code: 0,
+        stdout: [
+          firstOid,
+          firstOid.slice(0, 7),
+          "2026-09-09T12:00:00+00:00",
+          "Add commit annotations",
+          secondOid,
+          secondOid.slice(0, 7),
+          "2026-09-08T12:00:00+00:00",
+          "Fix the source list",
+          "",
+        ].join("\0"),
+        stderr: "",
+      };
+    }, "/tmp/project", 2);
+
+    expect(result).toEqual({
+      kind: "ok",
+      commits: [
+        {
+          oid: firstOid,
+          shortOid: firstOid.slice(0, 7),
+          timestamp: "2026-09-09T12:00:00+00:00",
+          subject: "Add commit annotations",
+        },
+        {
+          oid: secondOid,
+          shortOid: secondOid.slice(0, 7),
+          timestamp: "2026-09-08T12:00:00+00:00",
+          subject: "Fix the source list",
+        },
+      ],
+    });
+  });
+});
+
+describe("readGitSnapshotAtCommit", () => {
+  test("reads a commit diff without including the commit message", async () => {
+    const commitOid = "c".repeat(40);
+    const calls: string[][] = [];
+    const result = await readGitSnapshotAtCommit(async (_cwd, args) => {
+      calls.push(args);
+      const command = args.join(" ");
+      if (command === "rev-parse --show-toplevel") return { code: 0, stdout: "/tmp/project\n", stderr: "" };
+      if (command === "rev-parse --git-common-dir") return { code: 0, stdout: "/tmp/project/.git\n", stderr: "" };
+      if (command === `show --no-ext-diff --no-color --no-textconv --format= --default-prefix --src-prefix=a/ --dst-prefix=b/ --unified=40 ${commitOid} --`) {
+        return { code: 0, stdout: diff, stderr: "" };
+      }
+      throw new Error(`unexpected git call: ${command}`);
+    }, "/tmp/project", commitOid);
+
+    expect(result.kind).toBe("ok");
+    if (result.kind !== "ok") throw new Error(result.detail);
+    expect(result.snapshot.commitOid).toBe(commitOid);
+    expect(result.snapshot.headOid).toBe(commitOid);
+    expect(result.snapshot.files[0]!.path).toBe("src/demo.ts");
+    expect(calls.every(args => Array.isArray(args))).toBe(true);
+  });
+});
+
+describe("pending historical code validation", () => {
+  test("validates a historical code annotation against its matching commit snapshot", () => {
+    const commitOid = "d".repeat(40);
+    const historicalSnapshot = { ...snapshot, commitOid };
+    const anchor = createCodeAnchor(historicalSnapshot, snapshot.files[0]!.path, snapshot.files[0]!.hunks[0]!.lines.slice(1, 2));
+    if (!anchor) throw new Error("test fixture did not produce an anchor");
+    const item: ReviewItem = {
+      schemaVersion: 1,
+      id: "historical-code",
+      source: "code",
+      anchor,
+      body: "Keep this historical line explicit.",
+      createdAt: "2026-09-09T00:00:00.000Z",
+      status: "pending",
+    };
+
+    expect(
+      validatePendingItems([item], {
+        sessionId: "session-1",
+        branchEntries: [],
+        codeSnapshot: snapshot,
+        codeSnapshots: new Map([[commitOid, historicalSnapshot]]),
+      }),
+    ).toEqual({ valid: [item], stale: [] });
+  });
+
+  test("marks a historical annotation stale when its commit snapshot is unavailable", () => {
+    const commitOid = "e".repeat(40);
+    const historicalSnapshot = { ...snapshot, commitOid };
+    const anchor = createCodeAnchor(historicalSnapshot, snapshot.files[0]!.path, snapshot.files[0]!.hunks[0]!.lines.slice(1, 2));
+    if (!anchor) throw new Error("test fixture did not produce an anchor");
+    const item: ReviewItem = {
+      schemaVersion: 1,
+      id: "missing-historical-code",
+      source: "code",
+      anchor,
+      body: "Re-check this historical line.",
+      createdAt: "2026-09-09T00:00:00.000Z",
+      status: "pending",
+    };
+
+    expect(
+      validatePendingItems([item], {
+        sessionId: "session-1",
+        branchEntries: [],
+        codeSnapshot: snapshot,
+        codeSnapshots: new Map(),
+      }),
+    ).toEqual({
+      valid: [],
+      stale: [{ item: { ...item, status: "stale", staleReason: "commit-not-found" }, reason: "commit-not-found" }],
+    });
   });
 });
 
@@ -614,5 +745,6 @@ describe("buildReviewMessage", () => {
     expect(message).toContain("Keep this value explicit.");
     expect(message).toContain("Make the explanation shorter.");
     expect(message).toContain("quoted reference context");
+    expect(message).toContain("working tree or a specific commit");
   });
 });

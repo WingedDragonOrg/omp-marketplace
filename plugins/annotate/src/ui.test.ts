@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { resolveAnnotateLayout } from "./ui";
+import { codeSourceItems, resolveAnnotateLayout, type CodeSource } from "./ui";
 
 describe("annotate workbench layout", () => {
   test("allocates the full width to source and annotation columns", () => {
@@ -34,5 +34,19 @@ describe("annotate workbench layout", () => {
     expect(layout.bodyHeight).toBe(6);
     expect(layout.sourceHeight + layout.previewHeight + 2).toBe(6);
     expect(layout.draftHeight + layout.reviewHeight + 4).toBe(6);
+  });
+});
+
+describe("annotate code source navigation", () => {
+  test("exposes recent commits as selectable source records", () => {
+    const source: CodeSource = { kind: "commit-list" };
+    const commit = {
+      oid: "a".repeat(40),
+      shortOid: "aaaaaaa",
+      timestamp: "2026-09-09T12:00:00+00:00",
+      subject: "Add historical review",
+    };
+
+    expect(codeSourceItems(undefined, source, [commit])).toEqual([{ kind: "commit", commit }]);
   });
 });

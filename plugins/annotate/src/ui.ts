@@ -18,6 +18,7 @@ import type {
   DiffLine,
   ReviewItem,
 } from "./model";
+import type { GitCommit } from "./git";
 import type { AssistantSelectionRange } from "./assistant-selection";
 
 export type AnnotateTab = "code" | "assistant";
@@ -26,11 +27,35 @@ export type AnnotateFocus = "source" | "editor" | "reviews";
 export interface CodeSelection {
   filePath: string;
   line: DiffLine;
+  commitOid?: string;
 }
+
+export type CodeSource =
+  | { kind: "working-tree" }
+  | { kind: "commit-list" }
+  | { kind: "commit"; commit: GitCommit };
+
+export interface CommitSourceSelection {
+  kind: "commit";
+  commit: GitCommit;
+}
+
+export interface BrowseSelection {
+  filePath: string;
+  label: "binary" | "no selectable patch lines";
+  browseOnly: true;
+}
+
+export type CodeSourceItem = CodeSelection | BrowseSelection | CommitSourceSelection;
 
 export interface AnnotateViewData {
   codeSnapshot: CodeSnapshot | undefined;
+  codeWorkingSnapshot: CodeSnapshot | undefined;
   codeError: string | undefined;
+  codeCommits: GitCommit[];
+  codeSource: CodeSource;
+  codeHistoryError: string | undefined;
+  codeSnapshots: ReadonlyMap<string, CodeSnapshot>;
   assistantEntries: AssistantTextEntry[];
   items: ReviewItem[];
   notice: { message: string; level: "info" | "warning" | "error" } | undefined;
@@ -45,6 +70,8 @@ export interface AnnotateViewCallbacks {
     selection?: Pick<AssistantSelectionRange, "start" | "end">,
   ): Promise<boolean>;
   selectAssistantPrecise(entry: AssistantTextEntry): Promise<AssistantSelectionRange | undefined>;
+  selectCommit(commit: GitCommit): Promise<boolean>;
+  selectWorkingTree(): Promise<boolean>;
   deleteItem(item: ReviewItem): Promise<void>;
   refresh(): Promise<void>;
   send(): Promise<void>;
@@ -178,21 +205,29 @@ function codeSelections(snapshot: CodeSnapshot | undefined): CodeSelection[] {
   for (const file of snapshot.files) {
     if (file.binary) continue;
     for (const hunk of file.hunks) {
-      for (const line of hunk.lines) selections.push({ filePath: file.path, line });
+      for (const line of hunk.lines) {
+        selections.push({
+          filePath: file.path,
+          line,
+          ...(snapshot.commitOid === undefined ? {} : { commitOid: snapshot.commitOid }),
+        });
+      }
     }
   }
   return selections;
 }
 
-interface BrowseSelection {
-  filePath: string;
-  label: "binary" | "no selectable patch lines";
-  browseOnly: true;
+type SourceItem = CodeSourceItem | AssistantTextEntry;
+function isCommitSourceSelection(item: SourceItem | undefined): item is CommitSourceSelection {
+  return item !== undefined && "kind" in item && item.kind === "commit";
 }
 
-type SourceItem = CodeSelection | BrowseSelection | AssistantTextEntry;
-
-function codeSourceItems(snapshot: CodeSnapshot | undefined): Array<CodeSelection | BrowseSelection> {
+export function codeSourceItems(
+  snapshot: CodeSnapshot | undefined,
+  source: CodeSource,
+  commits: readonly GitCommit[],
+): CodeSourceItem[] {
+  if (source.kind === "commit-list") return commits.map(commit => ({ kind: "commit", commit }));
   if (!snapshot) return [];
   return [
     ...codeSelections(snapshot),
@@ -224,7 +259,7 @@ type DraftTarget =
     };
 
 function targetForSource(item: SourceItem | undefined): DraftTarget | undefined {
-  if (!item || "browseOnly" in item) return undefined;
+  if (!item || "browseOnly" in item || isCommitSourceSelection(item)) return undefined;
   if ("line" in item) return { kind: "code", selection: item };
   return item.annotationAllowed ? { kind: "assistant", entry: item } : undefined;
 }
@@ -281,7 +316,7 @@ class AnnotateView implements Component {
     lines.push(
       this.theme.fg(
         "dim",
-        "↑/↓ select  a/Enter draft  p precise  Space lists  s send  r refresh  Tab view  Esc close",
+        "↑/↓ select  a/Enter draft  p precise  Space lists  h commits  w current  s send  r refresh  Tab view  Esc close",
       ),
     );
     if (this.data.busy) lines.push(this.theme.fg("warning", "Working…"));
@@ -305,7 +340,7 @@ class AnnotateView implements Component {
     this.#previewScroll.setHeight(layout.previewHeight);
 
     const leftRows = [
-      this.#panelHeading(`${this.#activeTab === "code" ? "Code" : "Assistant"} source`),
+      this.#panelHeading(this.#activeTab === "code" ? `Code source · ${this.#codeSourceLabel()}` : "Assistant source"),
       ...this.#sourceScroll.render(layout.leftWidth),
       this.#panelHeading("Preview"),
       ...this.#previewScroll.render(layout.leftWidth),
@@ -365,6 +400,23 @@ class AnnotateView implements Component {
     }
 
     if (this.#tabBar.handleInput(data)) return;
+    if (this.#focus === "source" && this.#activeTab === "code") {
+      if (matchesKey(data, "h")) {
+        this.#showCommitList();
+        return;
+      }
+      if (matchesKey(data, "w")) {
+        if (this.data.codeSource.kind !== "working-tree") {
+          this.#run(async () => {
+            if (await this.callbacks.selectWorkingTree()) {
+              this.#sourceIndex = 0;
+              this.#previewScroll.scrollToTop();
+            }
+          });
+        }
+        return;
+      }
+    }
     if (matchesKey(data, "escape") || matchesKey(data, "q")) {
       this.done();
       return;
@@ -417,7 +469,7 @@ class AnnotateView implements Component {
       return;
     }
     if (matchesKey(data, "a") || matchesKey(data, "enter")) {
-      if (this.#focus === "source") this.#beginDraft();
+      if (this.#focus === "source") this.#activateSource();
       return;
     }
     if (matchesKey(data, "d")) {
@@ -442,7 +494,9 @@ class AnnotateView implements Component {
   }
 
   #sourceItems(): SourceItem[] {
-    return this.#activeTab === "code" ? codeSourceItems(this.data.codeSnapshot) : this.data.assistantEntries;
+    return this.#activeTab === "code"
+      ? codeSourceItems(this.data.codeSnapshot, this.data.codeSource, this.data.codeCommits)
+      : this.data.assistantEntries;
   }
 
   #normalizeIndexes(): void {
@@ -457,13 +511,33 @@ class AnnotateView implements Component {
 
   #sourceRows(): string[] {
     if (this.#activeTab === "code") {
+      if (this.data.codeSource.kind === "commit-list") {
+        if (this.data.codeCommits.length === 0) {
+          return [
+            this.data.codeHistoryError
+              ? `Commit history unavailable: ${oneLine(this.data.codeHistoryError)}`
+              : "No recent commits.",
+          ];
+        }
+        return this.data.codeCommits.map((commit, index) => {
+          const pointer = this.#focus === "source" && index === this.#sourceIndex ? this.theme.fg("accent", "› ") : "  ";
+          return `${pointer}${this.theme.fg("accent", commit.shortOid)} ${this.theme.fg("muted", commit.timestamp.slice(0, 10))} ${oneLine(commit.subject)}`;
+        });
+      }
       if (!this.data.codeSnapshot) {
         return [this.data.codeError ? `Code unavailable: ${oneLine(this.data.codeError)}` : "Code source unavailable."];
       }
-      const items = codeSourceItems(this.data.codeSnapshot);
-      if (items.length === 0) return ["No staged or unstaged Git changes."];
+      const items = codeSourceItems(this.data.codeSnapshot, this.data.codeSource, this.data.codeCommits);
+      if (items.length === 0) {
+        return this.data.codeSource.kind === "commit"
+          ? ["No changed lines in this commit.", "Press h to choose another recent commit."]
+          : ["No staged or unstaged Git changes.", "Press h to browse recent commits."];
+      }
       return items.map((item, index) => {
         const pointer = this.#focus === "source" && index === this.#sourceIndex ? this.theme.fg("accent", "› ") : "  ";
+        if (isCommitSourceSelection(item)) {
+          return `${pointer}${this.theme.fg("accent", item.commit.shortOid)} ${oneLine(item.commit.subject)}`;
+        }
         if ("browseOnly" in item) return `${pointer}[${item.label}] ${oneLine(item.filePath)} (browse-only)`;
         const color = item.line.kind === "addition" ? "success" : item.line.kind === "deletion" ? "error" : "muted";
         return `${pointer}${this.theme.fg(color, codeLineLabel(item.line))} ${oneLine(item.filePath)} ${oneLine(item.line.content)}`;
@@ -480,7 +554,19 @@ class AnnotateView implements Component {
 
   #sourcePreviewRows(width: number): string[] {
     const selected = this.#selectedSource();
-    if (!selected) return [this.theme.fg("dim", "Select a source row to preview it here.")];
+    if (!selected) {
+      return this.data.codeSource.kind === "commit-list" && this.#activeTab === "code"
+        ? [this.theme.fg("dim", "Select a recent commit and press Enter to inspect it.")]
+        : [this.theme.fg("dim", "Select a source row to preview it here.")];
+    }
+    if (isCommitSourceSelection(selected)) {
+      return [
+        this.theme.fg("accent", this.theme.bold(`Commit ${oneLine(selected.commit.shortOid)}`)),
+        this.theme.fg("muted", oneLine(selected.commit.timestamp)),
+        ...previewLines(selected.commit.subject, width),
+        this.theme.fg("dim", "Press Enter to inspect changed lines."),
+      ];
+    }
     if ("browseOnly" in selected) {
       return [
         this.theme.fg("muted", `${oneLine(selected.filePath)} · ${selected.label}`),
@@ -490,8 +576,9 @@ class AnnotateView implements Component {
     if ("line" in selected) {
       const marker = selected.line.kind === "addition" ? "+" : selected.line.kind === "deletion" ? "-" : " ";
       const color = selected.line.kind === "addition" ? "success" : selected.line.kind === "deletion" ? "error" : "muted";
+      const revision = selected.commitOid === undefined ? "" : `Commit ${selected.commitOid.slice(0, 7)} · `;
       return [
-        this.theme.fg("accent", this.theme.bold(`${oneLine(selected.filePath)}:${codeLineLabel(selected.line)}`)),
+        this.theme.fg("accent", this.theme.bold(`${revision}${oneLine(selected.filePath)}:${codeLineLabel(selected.line)}`)),
         ...previewLines(`${marker} ${selected.line.content}`, Math.max(1, width)).map(row => this.theme.fg(color, row)),
       ];
     }
@@ -507,7 +594,8 @@ class AnnotateView implements Component {
     const target = this.#draftTarget;
     if (!target) return "Select a source row and press a";
     if (target.kind === "code") {
-      return `Code · ${target.selection.filePath}:${codeLineLabel(target.selection.line)}`;
+      const revision = target.selection.commitOid === undefined ? "" : `commit ${target.selection.commitOid.slice(0, 7)} · `;
+      return `Code · ${revision}${target.selection.filePath}:${codeLineLabel(target.selection.line)}`;
     }
     const range = target.selection ? `chars ${target.selection.start}–${target.selection.end}` : "whole message";
     return `Assistant · ${target.entry.id} · ${range}`;
@@ -519,12 +607,40 @@ class AnnotateView implements Component {
       const pointer = this.#focus === "reviews" && index === this.#reviewIndex ? this.theme.fg("accent", "› ") : "  ";
       const location =
         item.anchor.kind === "code"
-          ? `${oneLine(item.anchor.filePath)}:${item.anchor.newStart || item.anchor.oldStart}`
+          ? `${item.anchor.commitOid === undefined ? "" : `commit ${item.anchor.commitOid.slice(0, 7)} · `}${oneLine(item.anchor.filePath)}:${item.anchor.newStart || item.anchor.oldStart}`
           : `entry ${oneLine(item.anchor.entryId)}:${item.anchor.start}–${item.anchor.end}`;
       const status = this.theme.fg(statusColor(item), statusLabel(item));
       return `${pointer}${this.theme.fg("muted", item.source)} ${status} ${oneLine(location)} — ${oneLine(item.body, 120)}`;
     });
   }
+  #codeSourceLabel(): string {
+    if (this.data.codeSource.kind === "working-tree") return "Working tree";
+    if (this.data.codeSource.kind === "commit-list") return "Recent commits";
+    return `Commit ${oneLine(this.data.codeSource.commit.shortOid)} · ${oneLine(this.data.codeSource.commit.subject, 80)}`;
+  }
+
+  #showCommitList(): void {
+    if (this.data.codeSource.kind === "commit-list") return;
+    this.data.codeSource = { kind: "commit-list" };
+    this.#sourceIndex = 0;
+    this.#previewScroll.scrollToTop();
+    this.data.notice = undefined;
+    this.tui.requestRender();
+  }
+
+  #activateSource(): void {
+    const selected = this.#selectedSource();
+    if (this.#activeTab === "code" && isCommitSourceSelection(selected)) {
+      this.#run(async () => {
+        if (!await this.callbacks.selectCommit(selected.commit)) return;
+        this.#sourceIndex = 0;
+        this.#previewScroll.scrollToTop();
+      });
+      return;
+    }
+    this.#beginDraft();
+  }
+
 
   #panelHeading(value: string): string {
     return this.theme.fg("accent", this.theme.bold(value));
@@ -572,7 +688,9 @@ class AnnotateView implements Component {
           ? "This assistant text is browse-only."
           : selected && "browseOnly" in selected
             ? "This source is browse-only."
-            : "Select an annotatable source row first.";
+            : isCommitSourceSelection(selected)
+              ? "Press Enter to open the commit before annotating a line."
+              : "Select an annotatable source row first.";
       this.data.notice = { message, level: "warning" };
       this.tui.requestRender();
       return;

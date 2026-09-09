@@ -15,6 +15,7 @@ export interface ValidationContext {
   branchEntries: readonly unknown[];
   codeSnapshot: CodeSnapshot | undefined;
   visibleTextByTimestamp?: ReadonlyMap<string, string>;
+  codeSnapshots?: ReadonlyMap<string, CodeSnapshot>;
 }
 
 export interface PendingValidation {
@@ -62,10 +63,12 @@ export function validatePendingItems(
     if (item.status !== "pending") continue;
     let validation: AnchorValidation;
     if (item.anchor.kind === "code") {
+      const snapshot =
+        item.anchor.commitOid === undefined ? context.codeSnapshot : context.codeSnapshots?.get(item.anchor.commitOid);
       validation =
-        context.codeSnapshot === undefined
-          ? { kind: "stale", reason: "repository-changed" }
-          : validateCodeAnchor(item.anchor, context.codeSnapshot);
+        snapshot === undefined
+          ? { kind: "stale", reason: item.anchor.commitOid === undefined ? "repository-changed" : "commit-not-found" }
+          : validateCodeAnchor(item.anchor, snapshot);
     } else {
       validation = validateAssistantAnchor(item.anchor, context.branchEntries, context.sessionId, context.visibleTextByTimestamp);
     }

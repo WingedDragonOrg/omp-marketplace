@@ -11,7 +11,7 @@ omp plugin install annotate@winged-dragon-org
 
 Start a new `omp` session after installation because extension modules load when the session starts.
 
-- **Code** — browse the staged and unstaged Git diff relative to `HEAD`, preview the selected line, and annotate it.
+- **Code** — browse staged/unstaged Git changes relative to `HEAD`, or press `h` to choose a recent commit and inspect its changed lines before annotating.
 - **Assistant** — browse visible assistant messages in the current session branch, preview the selected message, and annotate the whole message or a precise character range.
 
 The workbench uses the full overlay width: the left column contains source navigation and its preview, while the right column keeps the annotation editor and review history visible together.
@@ -20,10 +20,12 @@ Controls:
 ```text
 Tab                 switch Code / Assistant while browsing sources
 ↑ / ↓               select a source row or annotation
-a / Enter           focus the annotation editor for the selected source
+a / Enter           focus the annotation editor; open a selected commit
 Enter               submit the editor draft
 Alt+Enter           insert a newline in the editor draft
 p                   choose a precise Assistant character range, then edit
+h                   choose a recent commit while browsing Code
+w                   return to current working-tree changes while browsing Code
 Space               switch between source and annotation lists
 Ctrl+Space          cycle source → editor → annotation list
 Shift+Tab           move from the editor to annotation history
@@ -36,7 +38,7 @@ A new annotation is saved as `pending` in the current session branch. Sending co
 
 ## Safe stale handling
 
-Every Code annotation records the repository identity, `HEAD`, diff fingerprint, file, line range, and selected text. Every Assistant annotation records the session, entry ID, selected range (the whole message by default or a precise character range), and its context. If the repository, diff, file, branch, or assistant message changes before sending, the annotation becomes `stale` and is not sent. Re-select the current content to create a replacement annotation.
+Every Code annotation records the repository identity, the current `HEAD` or selected commit, the diff fingerprint, file, line range, and selected text. Every Assistant annotation records the session, entry ID, selected range (the whole message by default or a precise character range), and its context. If the repository, selected revision, file, branch, or assistant message changes before sending, the annotation becomes `stale` and is not sent. Re-select the current content to create a replacement annotation.
 
 Failed sends keep annotations as `pending`. Sent annotations remain in the session as review history. Annotation state follows the current session branch and is not written to project files or remote services.
 

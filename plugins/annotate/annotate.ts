@@ -12,10 +12,17 @@ import {
   type AssistantAnchor,
   type AssistantTextEntry,
   type CodeAnchor,
+  type CodeSnapshot,
   type ReviewEvent,
   type ReviewItem,
 } from "./src/model";
-import { readGitSnapshot, type GitExecutor } from "./src/git";
+import {
+  readGitCommits,
+  readGitSnapshot,
+  readGitSnapshotAtCommit,
+  type GitCommit,
+  type GitExecutor,
+} from "./src/git";
 import {
   carryMissingReviewItems,
   createAssistantAnnotationDraft,
@@ -160,26 +167,72 @@ async function refreshData(
   const leafId = ctx.sessionManager.getLeafId();
   const cwd = ctx.sessionManager.getCwd();
   const branchEntries = currentBranch(ctx);
-  const result = await readGitSnapshot(exec, cwd);
+  const [workingResult, commitsResult] = await Promise.all([
+    readGitSnapshot(exec, cwd),
+    readGitCommits(exec, cwd),
+  ]);
   if (
     sessionId !== ctx.sessionManager.getSessionId() ||
     leafId !== ctx.sessionManager.getLeafId() ||
     cwd !== ctx.sessionManager.getCwd()
   ) return false;
+
   const restored = restoreBranchItems(pi, branchEntries, previousItems);
   data.items = restored.items;
   data.assistantEntries = collectAssistantTextEntries(branchEntries, visibleTextByTimestamp);
-  if (result.kind === "ok") {
-    data.codeSnapshot = result.snapshot;
-    data.codeError = undefined;
-  } else {
-    data.codeSnapshot = undefined;
-    data.codeError = result.detail;
+  data.codeCommits = commitsResult.kind === "ok" ? commitsResult.commits : [];
+  data.codeHistoryError = commitsResult.kind === "error" ? commitsResult.detail : undefined;
+
+  if (data.codeSource.kind === "commit" && commitsResult.kind === "ok") {
+    const selectedCommitOid = data.codeSource.commit.oid;
+    const refreshedCommit = commitsResult.commits.find(commit => commit.oid === selectedCommitOid);
+    if (refreshedCommit) data.codeSource = { kind: "commit", commit: refreshedCommit };
   }
+
+  const commitOids = new Set<string>();
+  if (data.codeSource.kind === "commit") commitOids.add(data.codeSource.commit.oid);
+  for (const item of data.items) {
+    if (item.status === "pending" && item.anchor.kind === "code" && item.anchor.commitOid) {
+      commitOids.add(item.anchor.commitOid);
+    }
+  }
+
+  const historicalResults = await Promise.all(
+    [...commitOids].map(async oid => [oid, await readGitSnapshotAtCommit(exec, cwd, oid)] as const),
+  );
+  if (
+    sessionId !== ctx.sessionManager.getSessionId() ||
+    leafId !== ctx.sessionManager.getLeafId() ||
+    cwd !== ctx.sessionManager.getCwd()
+  ) return false;
+
+  const historicalSnapshots = new Map<string, CodeSnapshot>();
+  const historicalErrors = new Map<string, string>();
+  for (const [oid, result] of historicalResults) {
+    if (result.kind === "ok") historicalSnapshots.set(oid, result.snapshot);
+    else historicalErrors.set(oid, result.detail);
+  }
+
+  const workingSnapshot = workingResult.kind === "ok" ? workingResult.snapshot : undefined;
+  data.codeWorkingSnapshot = workingSnapshot;
+  if (data.codeSource.kind === "commit") {
+    const commitOid = data.codeSource.commit.oid;
+    data.codeSnapshot = historicalSnapshots.get(commitOid);
+    data.codeError =
+      data.codeSnapshot === undefined
+        ? historicalErrors.get(commitOid) ?? "Unable to read the selected Git commit."
+        : undefined;
+  } else {
+    data.codeSnapshot = workingSnapshot;
+    data.codeError = workingResult.kind === "error" ? workingResult.detail : undefined;
+  }
+  data.codeSnapshots = historicalSnapshots;
+
   const validation = validatePendingItems(data.items, {
     sessionId: ctx.sessionManager.getSessionId(),
     branchEntries,
-    codeSnapshot: data.codeSnapshot,
+    codeSnapshot: workingSnapshot,
+    codeSnapshots: historicalSnapshots,
     visibleTextByTimestamp,
   });
   persistStaleItems(pi, data, validation.stale);
@@ -190,6 +243,57 @@ async function refreshData(
       "warning",
     );
   }
+  return true;
+}
+
+async function selectCommitSource(
+  ctx: ExtensionContext,
+  data: AnnotateViewData,
+  exec: GitExecutor,
+  commit: GitCommit,
+): Promise<boolean> {
+  const sessionId = ctx.sessionManager.getSessionId();
+  const leafId = ctx.sessionManager.getLeafId();
+  const cwd = ctx.sessionManager.getCwd();
+  const result = await readGitSnapshotAtCommit(exec, cwd, commit.oid);
+  if (
+    sessionId !== ctx.sessionManager.getSessionId() ||
+    leafId !== ctx.sessionManager.getLeafId() ||
+    cwd !== ctx.sessionManager.getCwd()
+  ) return false;
+  if (result.kind === "error") {
+    notify(ctx, result.detail, "error");
+    return false;
+  }
+  data.codeSource = { kind: "commit", commit };
+  data.codeSnapshot = result.snapshot;
+  data.codeError = undefined;
+  data.codeSnapshots = new Map(data.codeSnapshots).set(commit.oid, result.snapshot);
+  return true;
+}
+
+async function selectWorkingTreeSource(
+  ctx: ExtensionContext,
+  data: AnnotateViewData,
+  exec: GitExecutor,
+): Promise<boolean> {
+  const sessionId = ctx.sessionManager.getSessionId();
+  const leafId = ctx.sessionManager.getLeafId();
+  const cwd = ctx.sessionManager.getCwd();
+  const result = await readGitSnapshot(exec, cwd);
+  if (
+    sessionId !== ctx.sessionManager.getSessionId() ||
+    leafId !== ctx.sessionManager.getLeafId() ||
+    cwd !== ctx.sessionManager.getCwd()
+  ) return false;
+  if (result.kind === "error") {
+    notify(ctx, result.detail, "error");
+    return false;
+  }
+  data.codeSource = { kind: "working-tree" };
+  data.codeWorkingSnapshot = result.snapshot;
+  data.codeSnapshot = result.snapshot;
+  data.codeError = undefined;
   return true;
 }
 
@@ -371,7 +475,8 @@ async function sendAnnotations(
   const validation = validatePendingItems(data.items, {
     sessionId: ctx.sessionManager.getSessionId(),
     branchEntries,
-    codeSnapshot: data.codeSnapshot,
+    codeSnapshot: data.codeWorkingSnapshot,
+    codeSnapshots: data.codeSnapshots,
     visibleTextByTimestamp: state.visibleAssistantTextByTimestamp,
   });
 
@@ -416,7 +521,12 @@ async function openAnnotate(pi: ExtensionAPI, ctx: ExtensionCommandContext, stat
 
   const data: AnnotateViewData = {
     codeSnapshot: undefined,
+    codeWorkingSnapshot: undefined,
     codeError: undefined,
+    codeCommits: [],
+    codeSource: { kind: "working-tree" },
+    codeHistoryError: undefined,
+    codeSnapshots: new Map(),
     assistantEntries: [],
     items: restoreReviewItems(currentBranch(ctx)),
     notice: undefined,
@@ -434,6 +544,8 @@ async function openAnnotate(pi: ExtensionAPI, ctx: ExtensionCommandContext, stat
     addCode: (selection, body) => addCodeAnnotation(pi, ctx, data, state, selection, body),
     addAssistant: (entry, body, selection) => addAssistantAnnotation(pi, ctx, data, state, entry, body, selection),
     selectAssistantPrecise: entry => selectAssistantRange(ctx, state, entry),
+    selectCommit: commit => selectCommitSource(ctx, data, exec, commit),
+    selectWorkingTree: () => selectWorkingTreeSource(ctx, data, exec),
     deleteItem: item => deleteAnnotation(pi, ctx, data, state, item),
     refresh: async () => {
       if (await refreshData(pi, ctx, data, exec, state.visibleAssistantTextByTimestamp)) {
