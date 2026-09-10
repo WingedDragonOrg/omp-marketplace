@@ -1,0 +1,9 @@
+{
+  "name": "managed-skill-manager",
+  "version": "1.0.0",
+  "description": "审计并合并膨胀的 managed skill 库：按判据聚类、并行无损合并、结构校验与 headless 加载探针",
+  "author": {
+    "name": "WingedDragonOrg"
+  },
+  "homepage": "https://github.com/WingedDragonOrg/omp-marketplace"
+}

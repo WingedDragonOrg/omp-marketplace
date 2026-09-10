@@ -145,6 +145,25 @@
         "name": "WingedDragonOrg"
       },
       "license": "MIT"
+    },
+    {
+      "name": "managed-skill-manager",
+      "description": "审计并合并膨胀的 managed skill 库：按判据聚类、并行无损合并、结构校验与 headless 加载探针",
+      "source": "./managed-skill-manager",
+      "version": "1.0.0",
+      "category": "development",
+      "keywords": [
+        "skills",
+        "managed-skills",
+        "consolidation",
+        "merge",
+        "audit",
+        "subagents"
+      ],
+      "author": {
+        "name": "WingedDragonOrg"
+      },
+      "license": "MIT"
     }
   ]
 }
