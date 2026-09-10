@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 import { accessSync, constants, existsSync, realpathSync } from "node:fs";
 
 const HELP = `Usage:
+  /wtm init                        ask the agent to initialize .config/wt.toml
   /wtm [branch] [--base <ref>]     create/reuse worktree + prepare /move
   /wtm list                        list this repo's worktrees
   /wtm rm <name|path> [-f] [-y]    remove one worktree; keep its branch
@@ -42,6 +43,31 @@ Backend:
   Unapproved project commands must first be approved with 'wt config approvals add'.
   -y skips only the current OMP confirmation. OMP_WORKTREE_DIR preserves the
   <repo>-<name> layout for newly created worktrees.`;
+
+const INIT_PROMPT = `Initialize Worktrunk for the current repository.
+
+First confirm that the current directory is a non-bare Git checkout. If it is a
+bare repository, explain that a project \`.config/wt.toml\` needs a checkout and
+stop. Otherwise, read the WTM documentation at \`skill://wtm\`. Then inspect the
+repository's actual toolchain, package scripts, build/test/start commands,
+current Worktrunk version, and any existing \`.config/wt.toml\`.
+
+Create or minimally update \`.config/wt.toml\` with a practical project setup:
+dependency/bootstrap hooks when the repository needs them, a non-blocking
+post-start development command when one is clearly available, a pre-merge
+validation command when one is clearly available, and a per-branch \`[list]\`
+URL only when the project exposes a local development server. Use only commands
+that the repository already defines or documents, choose safe branch-derived
+values for ports and paths, and wrap long-running post-start commands with
+\`wt step tether -- ...\` so their process tree follows worktree removal.
+
+Preserve existing configuration and unrelated project behavior. Keep secrets
+and personal preferences out of the project file. Explain the resulting hooks,
+approval steps, and validation commands, and verify the TOML with Worktrunk's
+read-only commands or dry-run facilities. Do not commit changes, install
+software, start a long-running server, or perform destructive Git operations.
+If Worktrunk is unavailable or the project lacks enough information, report the
+exact next step instead of inventing configuration.`;
 
 type CommandArgumentParse =
   | { kind: "ok"; args: string[] }
@@ -789,6 +815,7 @@ export default function (pi: ExtensionAPI) {
       if (arg.includes(" ")) return null;
       const c = arg.trim().toLowerCase();
       const items = [
+        { label: "init", value: "init", description: "ask the agent to initialize .config/wt.toml" },
         { label: "list", value: "list", description: "list this repo's worktrees" },
         { label: "merge", value: "merge ", description: "run Worktrunk's local merge pipeline" },
         { label: "rm", value: "rm ", description: "remove a worktree" },
@@ -849,6 +876,22 @@ export default function (pi: ExtensionAPI) {
       // ---- shared precondition: git repo ----
       if (runGit(ctx.cwd, ["rev-parse", "--git-dir"]).code !== 0) {
         notify("Not a git repository — /wtm needs a git checkout.", "error");
+        return;
+      }
+
+      // ---- Worktrunk project configuration ----
+      if (sub === "init") {
+        if (runGit(ctx.cwd, ["rev-parse", "--is-bare-repository"]).out.trim() === "true") {
+          notify("/wtm init requires a non-bare Git checkout.", "error");
+          return;
+        }
+        try {
+          await pi.sendUserMessage(INIT_PROMPT);
+          notify("Sent the Worktrunk initialization prompt to the agent.", "info");
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          notify(`Could not send the Worktrunk initialization prompt: ${detail}`, "error");
+        }
         return;
       }
 

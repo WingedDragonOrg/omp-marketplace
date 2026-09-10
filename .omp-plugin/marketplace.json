@@ -12,9 +12,9 @@
   "plugins": [
     {
       "name": "wtm",
-      "description": "WTM worktree manager with Worktrunk lifecycle hooks, local merge automation, and native Git lifecycle fallback",
+      "description": "WTM worktree manager with Worktrunk lifecycle hooks, local merge automation, project configuration guidance, and native Git lifecycle fallback",
       "source": "./wtm",
-      "version": "1.3.0",
+      "version": "1.4.0",
       "category": "development",
       "keywords": [
         "worktree",
@@ -22,7 +22,9 @@
         "merge",
         "git",
         "extension",
-        "session"
+        "skill",
+        "configuration",
+        "toml"
       ],
       "author": {
         "name": "WingedDragonOrg"

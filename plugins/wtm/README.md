@@ -1,6 +1,6 @@
 # WTM
 
-WTM is an Oh My Pi (`omp`) extension for Git worktree lifecycle management and Worktrunk-powered local merges. Its slash command is `/wtm`; OMP's built-in `/wt` and `/worktree` commands remain available.
+WTM is an Oh My Pi (`omp`) extension for Git worktree lifecycle management and Worktrunk-powered local merges. It also bundles the model-readable `wtm` skill for `.config/wt.toml` configuration. Its slash command is `/wtm`; OMP's built-in `/wt` and `/worktree` commands remain available.
 
 Compatible Worktrunk releases provide structured worktree operations, project hooks, command approvals, configured paths, and merge automation. Create, list, remove, and prune retain a native Git fallback.
 
@@ -27,6 +27,7 @@ Manual installation remains available by placing `wtm.ts` in `~/.omp/agent/exten
 ## Commands
 
 ```text
+/wtm init                                      ask the agent to initialize .config/wt.toml from the bundled skill
 /wtm [branch] [--base <ref>]                  create/reuse worktree and prepare /move
 /wtm list                                     list this repository's worktrees
 /wtm rm <branch|path> [-f] [-y]               remove one worktree; retain its branch
@@ -37,6 +38,12 @@ Manual installation remains available by placing `wtm.ts` in `~/.omp/agent/exten
 ```
 
 A missing branch defaults to `wt-<YYYYMMDDHHMM>`. New branches start from the current `HEAD` unless `--base <ref>` is supplied.
+
+## Agent-assisted Worktrunk configuration
+
+The plugin ships `skills/wtm/SKILL.md`, discovered by OMP as the `wtm` skill. The skill explains the distinction between user configuration (`~/.config/worktrunk/config.toml`) and the committed project file (`.config/wt.toml`), hook forms, template variables, approvals, and Node/Python/Rust examples. The agent can read it explicitly with `skill://wtm` or `/skill:wtm`.
+
+Run `/wtm init` from a Git repository to send the agent a ready-made initialization prompt. It asks the agent to inspect the repository's real commands, preserve existing configuration, create or minimally update `.config/wt.toml`, and verify the result with read-only or dry-run Worktrunk commands. The command does not install Worktrunk, start long-running services, commit changes, or perform destructive Git operations.
 
 ### Session move handoff
 

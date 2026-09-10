@@ -35,6 +35,7 @@ interface RegisteredCommand {
 interface Harness {
   handler: RegisteredCommand["handler"];
   notices: Notice[];
+  sentMessages: string[];
   editorTexts: string[];
   moves: string[];
   confirmations: Array<{ title: string; message: string }>;
@@ -137,12 +138,16 @@ function initMergeSource(root: string, branch = "feature"): { repo: string; sour
 function makeHarness(cwd: string): Harness {
   let command: RegisteredCommand | undefined;
   const notices: Notice[] = [];
+  const sentMessages: string[] = [];
   const editorTexts: string[] = [];
   const moves: string[] = [];
   const confirmations: Array<{ title: string; message: string }> = [];
   const state = { reloads: 0 };
   registerWorktreeManager({
     setLabel() {},
+    sendUserMessage(content: string) {
+      sentMessages.push(content);
+    },
     registerCommand(name: string, spec: unknown) {
       if (name === "wtm" && isRegisteredCommand(spec)) command = spec;
     },
@@ -178,6 +183,7 @@ function makeHarness(cwd: string): Harness {
   return {
     handler: command.handler,
     notices,
+    sentMessages,
     editorTexts,
     moves,
     confirmations,
@@ -571,6 +577,34 @@ describe("/wtm backend selection", () => {
     });
 
     expect(names).toEqual(["wtm"]);
+  });
+
+  test("sends the Worktrunk initialization prompt to the agent", async () => {
+    const root = tempRoot();
+    const repo = initRepo(root);
+    const harness = makeHarness(repo);
+
+    await harness.handler("init", harness.ctx);
+
+    expect(harness.sentMessages).toHaveLength(1);
+    expect(harness.sentMessages[0]).toContain("skill://wtm");
+    expect(harness.sentMessages[0]).toContain(".config/wt.toml");
+    expect(harness.sentMessages[0]).toContain("Preserve existing configuration");
+    expect(harness.sentMessages[0]).toContain("wt step tether");
+    expect(harness.sentMessages[0]).toContain("non-bare Git checkout");
+
+  });
+
+  test("rejects initialization from a bare Git repository", async () => {
+    const root = tempRoot();
+    const bare = path.join(root, "repo.git");
+    git(root, ["init", "--bare", bare]);
+    const harness = makeHarness(bare);
+
+    await harness.handler("init", harness.ctx);
+
+    expect(harness.sentMessages).toEqual([]);
+    expect(harness.notices.at(-1)?.text).toContain("non-bare Git checkout");
   });
 
   test("prints a copyable move command when no TUI is available", async () => {

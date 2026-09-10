@@ -32,6 +32,8 @@ OMP 18.1.5 已内置 `/wt`，并把 `/wt` 与别名 `/worktree` 设为保留命�
 - Worktrunk 完整 merge pipeline 及其原生 flags；
 - cleanup-enabled merge 的显式 `--source <path>` 续执行契约；
 - TUI 中预填 `/move`，以及无 TUI 时输出可复制的后续命令；
+- WTM agent-facing 配置 skill：说明 `.config/wt.toml` 的用途、配置层级、hooks、模板变量、审批和常用案例；
+- `/wtm init` 初始化 prompt：读取 skill、检查仓库真实命令，并指导 agent 创建或最小化更新项目配置；
 - README、命令帮助、补全、测试和既有规格同步更新。
 
 ### 不包含
@@ -68,7 +70,7 @@ OMP 18.1.5 已内置 `/wt`，并把 `/wt` 与别名 `/worktree` 设为保留命�
 | 决策 | 选择 | 理由 |
 | --- | --- | --- |
 | 插件身份 | marketplace、package、目录和命令统一为 `wtm` | 避开 OMP 保留命令，并保持安装身份与用户入口一致 |
-| 版本 | `1.3.0` | 直接 self removal 后预填 `/move` 的用户可见行为变化 |
+| 版本 | `1.4.0` | 新增 agent-facing Worktrunk 配置 skill 与 `/wtm init` 初始化 prompt |
 | 默认 branch | `/wtm` 无参数生成 `wt-<YYYYMMDDHHMM>` | 保留原插件的 branch/path 兼容规则，同时补齐无参数体验 |
 | Session 所有权 | `/move` 独占 session cwd 切换 | 只有 OMP core 能原子更新 session、进程和全部 cwd-scoped surfaces |
 | 移动交互 | TUI 预填 `/move <absolute-path>`，用户确认提交 | 在 18.1.5 支持范围内复用 core 迁移，不伪造输入或调用私有 API |
@@ -89,22 +91,22 @@ OMP 18.1.5 已内置 `/wt`，并把 `/wt` 与别名 `/worktree` 设为保留命�
 
 ```text
 plugins/wtm/
-  package.json              name: wtm, version: 1.3.0
-  .omp-plugin/plugin.json   name: wtm, version: 1.3.0
+  package.json              name: wtm, version: 1.4.0
+  .omp-plugin/plugin.json   name: wtm, version: 1.4.0
   wtm.ts                    omp.extensions entry
   wtm.test.ts
   README.md
-```
+  skills/wtm/SKILL.md
 
 两份 marketplace catalog 保持字节一致，entry 使用：
 
 ```text
 name: wtm
 source: ./wtm
-version: 1.3.0
+version: 1.4.0
 ```
 
-根 README 和插件 README 只把 `/wtm` 作为本插件入口。外部 Worktrunk CLI 仍叫 `wt`；`OMP_WORKTREE_DIR` 和既有 worktree 路径不改名。
+根 README 和插件 README 把 `/wtm` 作为本插件入口，并通过 `wtm` skill 提供 agent-facing 配置文档；外部 Worktrunk CLI 仍叫 `wt`；`OMP_WORKTREE_DIR` 和既有 worktree 路径不改名。
 
 这是 marketplace identity 迁移，不保留 `wt` catalog entry、package alias 或 `/wt` 扩展命令。已安装用户需要先卸载旧 entry，再安装：
 
@@ -115,7 +117,7 @@ omp plugin install wtm@winged-dragon-org
 
 ### 命令面
 
-```text
+/wtm init                                    ask the agent to initialize `.config/wt.toml` from the bundled WTM skill
 /wtm [branch] [--base <ref>]                 create/reuse worktree
 /wtm list                                    list this repository's worktrees
 /wtm rm <branch|path> [-f] [-y]              remove one worktree; retain its branch
@@ -123,9 +125,10 @@ omp plugin install wtm@winged-dragon-org
 /wtm rm --all [-f] [-y]                      remove eligible worktrees except primary/current
 /wtm prune                                   prune stale Git worktree metadata
 /wtm merge [target] [flags] [--source <path>] run Worktrunk's local merge pipeline
-```
 
 `/wtm` 与 `/wtm --base <ref>` 都是 create：没有 positional branch 时生成 `wt-<YYYYMMDDHHMM>`。显式 branch 继续经过既有 slug 规范化。新分支默认从当前 `HEAD` 创建；指定 `--base` 时使用该 ref。
+
+`/wtm init` 只在 Git checkout 中 dispatch。它向当前 agent 发送固定 prompt；agent 先读取 `skill://wtm`，检查仓库实际命令和现有 `.config/wt.toml`，再创建或最小化更新项目配置，并使用只读或 dry-run 命令验证。prompt 不要求安装软件、启动长期服务、提交变更或执行破坏性 Git 操作。
 
 ### 后端选择
 
@@ -368,6 +371,10 @@ Create 在 Worktrunk error/JSON incompatibility 后再次调用时，必须先�
 34. 首轮只有稳定版 Worktrunk v0.76.x 进入增强后端，一次命令始终调用同一绝对可执行文件。
 35. 源码中不再通过扩展 context 调用 `sessionManager.moveTo()` 完成 cwd 切换，也不以 `ctx.reload()` 代替 `/move`。
 36. README 和命令帮助准确说明插件身份、默认 branch、两步移动、`--source`、参数编码、审批、merge pipeline 和 marketplace 迁移步骤。
+
+37. `skills/wtm/SKILL.md` 作为 marketplace plugin skill 被发现，并准确说明 `.config/wt.toml`、user/project 配置层级、hooks、模板变量、审批和可运行案例。
+38. `/wtm init` 在 Git checkout 中发送包含 `skill://wtm` 和 `.config/wt.toml` 约束的固定 prompt，不修改仓库、不移动 session、不启动新的 Worktrunk 操作。
+39. `/wtm init` 在 TUI、headless 和消息发送失败时分别遵守现有扩展 API 与通知错误边界；README、命令帮助、根 README、版本元数据和两份 catalog 与该行为一致。
 
 ## 未决事项
 
