@@ -11,6 +11,18 @@
   },
   "plugins": [
     {
+      "name": "dispatcher",
+      "description": "已确认 spec 与跨模块任务的实施调度 Skill：subagent 实现，Main 调度、审查和验证，默认中文交互",
+      "source": "./dispatcher",
+      "version": "1.0.0",
+      "category": "development",
+      "keywords": ["dispatcher", "skill", "spec", "subagents", "parallel", "review"],
+      "author": {
+        "name": "WingedDragonOrg"
+      },
+      "license": "MIT"
+    },
+    {
       "name": "wtm",
       "description": "WTM worktree manager with Worktrunk lifecycle hooks, local merge automation, project configuration guidance, and native Git lifecycle fallback",
       "source": "./wtm",
