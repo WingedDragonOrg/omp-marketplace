@@ -190,7 +190,7 @@ class AssistantRangeSelector implements Component {
     const cursorOffset = this.#selection.cursor;
     const cursorPiece = pieces.findIndex(piece => piece.start >= cursorOffset);
     const cursorPieceIndex = cursorPiece === -1 ? pieces.length : cursorPiece;
-    const pointer = current ? this.theme.fg("accent", "› ") : "  ";
+    const pointer = current ? this.theme.fg("accent", `${this.theme.nav.cursor} `) : "  ";
     const prefixWidth = 2;
     const caretWidth = current ? 1 : 0;
     const availableWidth = Math.max(1, width - prefixWidth - caretWidth);

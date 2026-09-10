@@ -1,8 +1,8 @@
 import type { DiffDocument } from "@oh-my-pi/pi-coding-agent/cli/git-tui/diff-pane";
+import type { Theme } from "@oh-my-pi/pi-coding-agent";
 import { replaceTabs, visibleWidth } from "@oh-my-pi/pi-tui";
 import type { CodeAnchor, CodeSnapshot, DiffFile, DiffLine, ReviewItem } from "../model";
-import type { GitCommit } from "../git";
-import type { CodeSelection, CodeSource, CodeSourceItem } from "./types";
+import type { CodeSelection } from "./types";
 
 function codeAnchorTouchesLine(anchor: CodeAnchor, line: DiffLine): boolean {
   const oldMatches =
@@ -39,52 +39,19 @@ export function codeAnnotationsForLine(
   );
 }
 
-export function annotationRailGlyph(annotationCount: number, hasPrevious: boolean, hasNext: boolean): string {
+export function annotationRailGlyph(
+  theme: Theme,
+  annotationCount: number,
+  hasPrevious: boolean,
+  hasNext: boolean,
+): string {
   if (annotationCount <= 0) return " ";
   if (annotationCount >= 10) return "9+";
   if (annotationCount > 1) return String(annotationCount);
-  if (hasPrevious && hasNext) return "│";
-  if (hasPrevious) return "└";
-  if (hasNext) return "┌";
-  return "◆";
-}
-
-function codeSelections(snapshot: CodeSnapshot | undefined): CodeSelection[] {
-  if (!snapshot) return [];
-  const selections: CodeSelection[] = [];
-  for (const file of snapshot.files) {
-    if (file.binary) continue;
-    for (const hunk of file.hunks) {
-      for (const line of hunk.lines) {
-        selections.push({
-          filePath: file.path,
-          line,
-          lines: [line],
-          ...(snapshot.commitOid === undefined ? {} : { commitOid: snapshot.commitOid }),
-        });
-      }
-    }
-  }
-  return selections;
-}
-
-export function codeSourceItems(
-  snapshot: CodeSnapshot | undefined,
-  source: CodeSource,
-  commits: readonly GitCommit[],
-): CodeSourceItem[] {
-  if (source.kind === "commit-list") return commits.map(commit => ({ kind: "commit", commit }));
-  if (!snapshot) return [];
-  return [
-    ...codeSelections(snapshot),
-    ...snapshot.files
-      .filter(file => file.binary || file.hunks.length === 0)
-      .map(file => ({
-        filePath: file.path,
-        label: file.binary ? ("binary" as const) : ("no selectable patch lines" as const),
-        browseOnly: true as const,
-      })),
-  ];
+  if (hasPrevious && hasNext) return theme.boxSharp.vertical;
+  if (hasPrevious) return theme.boxSharp.bottomLeft;
+  if (hasNext) return theme.boxSharp.topLeft;
+  return theme.format.bullet;
 }
 
 type PaneRow = {

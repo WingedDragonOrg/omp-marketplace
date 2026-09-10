@@ -11,33 +11,43 @@ omp plugin install annotate@winged-dragon-org
 
 Start a new `omp` session after installation because extension modules load when the session starts.
 
-- **Code** — browse changes in a full-height `/git`-style evidence pane; the right dock lists files or recent commits, keeps the draft target visible, and shows the review queue.
-- **Assistant** — read the selected assistant message in a full-height evidence pane; the right dock lists messages, keeps the draft target visible, and shows the review queue.
+- **Code** — read the working tree or a recent commit in a full-height `/git`-style evidence pane. A margin rail beside the diff marks every line you have already annotated.
+- **Assistant** — read one assistant message in the same pane and annotate the whole message or an exact phrase.
 
-Controls:
+The dock beside the evidence follows the review flow: pick evidence in **Sources**, write in **Draft**, check **Queue** before sending. `▸` marks the focused section, `·` keeps a parked selection visible, and each heading counts what it holds.
+
+Press `?` inside the workbench for the keymap, which is generated from the same table that dispatches the keys:
 ```text
-Tab / Shift+Tab     switch focus between the evidence pane and dock
-1 / 2               switch Code / Assistant
-↑ / ↓, j / k        move in the focused pane or source/queue list
-Enter               open the selected file/commit/message
-a                   create a new annotation for the selected line/range or whole message
-p                   choose precise code text in Code, or assistant text from its dock
-e                   edit the hovered code annotation or focused pending queue item
-[/]                 previous/next Code file while viewing the diff
-h                   choose a recent commit while browsing Code
-w                   return to current working-tree changes while browsing Code
-Space               focus the review queue from the dock
-Ctrl+Space          cycle evidence → sources → draft → queue (when active)
-Shift+↑ / Shift+↓   extend a Code selection in split / inline views
-v                   cycle split / inline / hunk diff views
-d                   delete the focused pending annotation
-s                   validate and send all valid pending annotations
+tab / shift+tab     move through sources, evidence, draft, queue
+1 / 2               code changes / assistant output
+↑ ↓ (j k)           move in the focused pane, or between hunks in hunk view
+enter               open the selected source, jump to a queued annotation, or annotate from the evidence pane
+a                   annotate the current selection
+p                   pick exact text inside the current hunk or message
+e                   edit the hovered or selected pending annotation
+i                   read every annotation on the current line in a card
+x                   discard the draft
+d                   delete the selected annotation (queue)
+s                   send every valid pending annotation
+H                   list the working tree and recent commits together
+[ ]                 previous / next changed file
+v                   split / inline / hunk view
+w                   wrap long lines
+f                   give the evidence pane the whole frame
 r                   refresh Git and session sources
-Esc / q             close the workbench (Esc returns to the dock from the editor)
+shift+↑ / shift+↓   extend a Code selection in split and inline views
+q / esc             close the workbench (esc leaves the draft editor first)
 ```
-The dock follows the review flow: choose evidence in **Sources**, write in **Draft**, then check **Queue** before sending. The focused dock section is marked with `▸`; its heading keeps the current source or queue summary visible (`pending / stale / sent`) whenever the dock has room.
+
+Writing a draft is safe to interrupt: `esc` leaves the editor and keeps what you typed, pointing it at another line keeps the words and re-aims them, and `x` (or the `✕` in the draft heading) throws the draft away. `H` lists the working tree next to recent commits; `enter` opens whichever row you choose.
+
+The header reports what happened while the workbench is open — what a send delivered, what it skipped as stale, why nothing was sent. Confirmations fade after a few seconds; failures stay until the next action. The toolbar's Send button carries the exact count it would deliver, with the number of stale annotations it would skip.
 
 A new annotation is saved as `pending` in the current session branch. Every activation creates a separate annotation, including when its code location matches an existing annotation. Code `a` can cover full diff lines; Code `p` selects grapheme text within the current hunk and can cross lines. Sending combines all valid pending annotations into one user message for the current session agent. The message contains the exact reference, location metadata, and user comment, and asks the agent to re-check the reference before editing.
+
+Clicking a rail mark, pressing `i`, or double-clicking a line that already carries a mark opens the annotation card: it shows every annotation on that line and offers the next moves inline — `a` to annotate the same line again, `e` to edit the selected one, `d` to delete it, `esc` to close. A marked line takes as many annotations as you write, so `a` from the card is the way to add a second note to content you already flagged. `↑ ↓` move between the card's annotations and the wheel scrolls a long one.
+
+Mouse works throughout: the toolbar switches tabs, revision, view, Send and Refresh; a source row opens its source and a queue row jumps to that annotation and opens its card; a single click on a diff line selects it and dragging extends the selection; double-clicking a bare changed line drafts an annotation for it; hovering a rail mark highlights it and shows that annotation in the header.
 
 ## Safe stale handling
 

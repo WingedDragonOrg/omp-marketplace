@@ -1,6 +1,7 @@
 import type { AssistantSelectionRange } from "../assistant-selection";
 import type { AssistantTextEntry, CodeSnapshot, DiffLine, ReviewItem } from "../model";
 import type { GitCommit } from "../git";
+import type { Notice } from "./notice";
 
 export type AnnotateTab = "code" | "assistant";
 export type AnnotateFocus = "diff" | "source" | "editor" | "reviews";
@@ -14,23 +15,8 @@ export interface CodeSelection {
   commitOid?: string;
 }
 
-export type CodeSource =
-  | { kind: "working-tree" }
-  | { kind: "commit-list" }
-  | { kind: "commit"; commit: GitCommit };
-
-export interface CommitSourceSelection {
-  kind: "commit";
-  commit: GitCommit;
-}
-
-export interface BrowseSelection {
-  filePath: string;
-  label: "binary" | "no selectable patch lines";
-  browseOnly: true;
-}
-
-export type CodeSourceItem = CodeSelection | BrowseSelection | CommitSourceSelection;
+/** The revision being read. Browsing revisions is view state, not a source. */
+export type CodeSource = { kind: "working-tree" } | { kind: "commit"; commit: GitCommit };
 
 export interface AnnotateViewData {
   codeSnapshot: CodeSnapshot | undefined;
@@ -42,8 +28,10 @@ export interface AnnotateViewData {
   codeSnapshots: ReadonlyMap<string, CodeSnapshot>;
   assistantEntries: AssistantTextEntry[];
   items: ReviewItem[];
-  notice: { message: string; level: "info" | "warning" | "error" } | undefined;
+  notice: Notice | undefined;
   busy: boolean;
+  /** Set by the view so work finishing outside the input loop repaints. */
+  onChange?: () => void;
 }
 
 export interface AnnotateViewCallbacks {
@@ -72,4 +60,3 @@ export interface AnnotateLayout {
   draftHeight: number;
   reviewHeight: number;
 }
-

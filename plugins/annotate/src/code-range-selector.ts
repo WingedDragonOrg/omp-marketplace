@@ -131,7 +131,7 @@ function stylePiece(theme: Theme, piece: DisplayPiece, range: AssistantSelection
 }
 
 function linePrefix(theme: Theme, line: DiffLine, current: boolean): string {
-  const pointer = current ? theme.fg("accent", "›") : " ";
+  const pointer = current ? theme.fg("accent", theme.nav.cursor) : " ";
   const color = line.kind === "addition" ? "toolDiffAdded" : line.kind === "deletion" ? "toolDiffRemoved" : "toolDiffContext";
   const lineNumber = line.kind === "deletion" ? line.oldLine : line.newLine ?? line.oldLine;
   const marker = line.kind === "addition" ? "+" : line.kind === "deletion" ? "−" : " ";

@@ -118,7 +118,7 @@
       "name": "annotate",
       "description": "Review Git changes, recent commits, and assistant text with durable annotations sent back to the current session agent",
       "source": "./annotate",
-      "version": "1.4.0",
+      "version": "1.9.0",
       "category": "development",
       "keywords": [
         "review",

@@ -4,7 +4,6 @@ import { ensureTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import {
   buildReviewMessage,
   collectAssistantTextEntries,
-  createAssistantAnchor,
   createCodeAnchor,
   editReviewItem,
   deletedReviewItemIds,
@@ -42,6 +41,7 @@ import {
   type AnnotateViewData,
   type CodeSelection,
 } from "./src/ui";
+import { createNotice, type NoticeLevel } from "./src/ui/notice";
 
 interface OverlayHandle {
   setHidden(hidden: boolean): void;
@@ -70,7 +70,17 @@ function messageForError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function notify(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error" = "info"): void {
+function notify(
+  state: RuntimeState,
+  ctx: ExtensionContext,
+  message: string,
+  level: NoticeLevel = "info",
+): void {
+  if (state.activeData) {
+    state.activeData.notice = createNotice(message, level);
+    state.activeData.onChange?.();
+    return;
+  }
   if (ctx.mode !== "tui") {
     console.error(message);
     return;
@@ -127,6 +137,7 @@ function persistStaleItems(pi: ExtensionAPI, data: AnnotateViewData, staleItems:
     appendReviewEvent(pi, { action: "upsert", item: stale.item });
     data.items = replaceItem(data.items, stale.item);
   }
+  if (staleItems.length > 0) data.onChange?.();
 }
 
 
@@ -145,9 +156,10 @@ function markDispatchSent(
     pending.data.items = replaceItem(pending.data.items, sent);
     sentCount += 1;
   }
+  if (sentCount > 0) pending.data.onChange?.();
   syncReviewState(state, ctx, pending.data.items);
   if (sentCount > 0) {
-    notify(ctx, `Sent ${sentCount} annotation${sentCount === 1 ? "" : "s"} to the current agent.`);
+    notify(state, ctx, `Delivered ${sentCount} annotation${sentCount === 1 ? "" : "s"} to the agent.`, "info");
   }
 }
 async function withOverlayHidden<T>(state: RuntimeState, operation: () => Promise<T>): Promise<T> {
@@ -163,6 +175,7 @@ async function refreshData(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   data: AnnotateViewData,
+  state: RuntimeState,
   exec: GitExecutor,
   visibleTextByTimestamp: ReadonlyMap<string, string>,
   previousItems: readonly ReviewItem[] = [],
@@ -240,8 +253,10 @@ async function refreshData(
     visibleTextByTimestamp,
   });
   persistStaleItems(pi, data, validation.stale);
+  data.onChange?.();
   if (restored.invalidCount > 0) {
     notify(
+      state,
       ctx,
       `Skipped ${restored.invalidCount} invalid Annotate record${restored.invalidCount === 1 ? "" : "s"}.`,
       "warning",
@@ -253,6 +268,7 @@ async function refreshData(
 async function selectCommitSource(
   ctx: ExtensionContext,
   data: AnnotateViewData,
+  state: RuntimeState,
   exec: GitExecutor,
   commit: GitCommit,
 ): Promise<boolean> {
@@ -266,19 +282,21 @@ async function selectCommitSource(
     cwd !== ctx.sessionManager.getCwd()
   ) return false;
   if (result.kind === "error") {
-    notify(ctx, result.detail, "error");
+    notify(state, ctx, result.detail, "error");
     return false;
   }
   data.codeSource = { kind: "commit", commit };
   data.codeSnapshot = result.snapshot;
   data.codeError = undefined;
   data.codeSnapshots = new Map(data.codeSnapshots).set(commit.oid, result.snapshot);
+  data.onChange?.();
   return true;
 }
 
 async function selectWorkingTreeSource(
   ctx: ExtensionContext,
   data: AnnotateViewData,
+  state: RuntimeState,
   exec: GitExecutor,
 ): Promise<boolean> {
   const sessionId = ctx.sessionManager.getSessionId();
@@ -291,13 +309,14 @@ async function selectWorkingTreeSource(
     cwd !== ctx.sessionManager.getCwd()
   ) return false;
   if (result.kind === "error") {
-    notify(ctx, result.detail, "error");
+    notify(state, ctx, result.detail, "error");
     return false;
   }
   data.codeSource = { kind: "working-tree" };
   data.codeWorkingSnapshot = result.snapshot;
   data.codeSnapshot = result.snapshot;
   data.codeError = undefined;
+  data.onChange?.();
   return true;
 }
 
@@ -325,12 +344,12 @@ async function addCodeAnnotation(
   body: string,
 ): Promise<boolean> {
   if (!data.codeSnapshot) {
-    notify(ctx, data.codeError ?? "Code source is unavailable.", "error");
+    notify(state, ctx, data.codeError ?? "Code source is unavailable.", "error");
     return false;
   }
   const trimmedBody = body.trim();
   if (trimmedBody.length === 0) {
-    notify(ctx, "Annotation text cannot be empty.", "warning");
+    notify(state, ctx, "Annotation text cannot be empty.", "warning");
     return false;
   }
   const range =
@@ -339,14 +358,15 @@ async function addCodeAnnotation(
       : { startOffset: selection.startOffset, endOffset: selection.endOffset };
   const anchor = createCodeAnchor(data.codeSnapshot, selection.filePath, selection.lines, range);
   if (!anchor) {
-    notify(ctx, "The selected code does not have a stable location.", "warning");
+    notify(state, ctx, "The selected code does not have a stable location.", "warning");
     return false;
   }
   const item = newItem({ source: "code", anchor }, trimmedBody);
   appendReviewEvent(pi, { action: "upsert", item });
   data.items = [...data.items, item];
+  data.onChange?.();
   syncReviewState(state, ctx, data.items);
-  notify(ctx, "Code annotation added.");
+  notify(state, ctx, "Code annotation added.");
   return true;
 }
 
@@ -356,7 +376,7 @@ async function selectAssistantRange(
   entry: AssistantTextEntry,
 ): Promise<AssistantSelectionRange | undefined> {
   if (!entry.annotationAllowed) {
-    notify(ctx, "This assistant text is secret-protected and cannot be persisted as an annotation.", "warning");
+    notify(state, ctx, "This assistant text is secret-protected and cannot be persisted as an annotation.", "warning");
     return undefined;
   }
   return withOverlayHidden(
@@ -416,20 +436,21 @@ async function addAssistantAnnotation(
   selection?: Pick<AssistantSelectionRange, "start" | "end">,
 ): Promise<boolean> {
   if (!entry.annotationAllowed) {
-    notify(ctx, "This assistant text is secret-protected and cannot be persisted as an annotation.", "warning");
+    notify(state, ctx, "This assistant text is secret-protected and cannot be persisted as an annotation.", "warning");
     return false;
   }
 
   const draft = createAssistantAnnotationDraft(ctx.sessionManager.getSessionId(), entry, body, selection);
   if (!draft) {
-    notify(ctx, "Annotation text cannot be empty.", "warning");
+    notify(state, ctx, "Annotation text cannot be empty.", "warning");
     return false;
   }
   const item = newItem({ source: "assistant", anchor: draft.anchor }, draft.body);
   appendReviewEvent(pi, { action: "upsert", item });
   data.items = [...data.items, item];
+  data.onChange?.();
   syncReviewState(state, ctx, data.items);
-  notify(ctx, "Assistant annotation added.");
+  notify(state, ctx, "Assistant annotation added.");
   return true;
 }
 async function updateAnnotation(
@@ -441,18 +462,19 @@ async function updateAnnotation(
   body: string,
 ): Promise<boolean> {
   if (item.status !== "pending") {
-    notify(ctx, "Only pending annotations can be edited.", "warning");
+    notify(state, ctx, "Only pending annotations can be edited.", "warning");
     return false;
   }
   const updated = editReviewItem(item, body);
   if (!updated) {
-    notify(ctx, "Annotation text cannot be empty.", "warning");
+    notify(state, ctx, "Annotation text cannot be empty.", "warning");
     return false;
   }
   appendReviewEvent(pi, { action: "upsert", item: updated });
   data.items = replaceItem(data.items, updated);
+  data.onChange?.();
   syncReviewState(state, ctx, data.items);
-  notify(ctx, "Annotation updated.");
+  notify(state, ctx, "Annotation updated.");
   return true;
 }
 
@@ -464,13 +486,14 @@ async function deleteAnnotation(
   item: ReviewItem,
 ): Promise<void> {
   if (item.status !== "pending") {
-    notify(ctx, "Only pending annotations can be deleted.", "warning");
+    notify(state, ctx, "Only pending annotations can be deleted.", "warning");
     return;
   }
   appendReviewEvent(pi, { action: "delete", id: item.id });
   data.items = data.items.filter(candidate => candidate.id !== item.id);
+  data.onChange?.();
   syncReviewState(state, ctx, data.items);
-  notify(ctx, "Annotation deleted.");
+  notify(state, ctx, "Annotation deleted.");
 }
 
 async function reconcilePendingDispatch(
@@ -482,14 +505,14 @@ async function reconcilePendingDispatch(
   if (!pending) return false;
   if (pending.sessionId !== ctx.sessionManager.getSessionId()) {
     state.pendingDispatch = undefined;
-    notify(ctx, "The pending annotation delivery belongs to another session; annotations remain pending.", "warning");
+    notify(state, ctx, "The pending annotation delivery belongs to another session; annotations remain pending.", "warning");
     return false;
   }
   await ctx.waitForIdle();
   if (state.pendingDispatch !== pending) return false;
   if (pending.sessionId !== ctx.sessionManager.getSessionId()) {
     state.pendingDispatch = undefined;
-    notify(ctx, "The pending annotation delivery belongs to another session; annotations remain pending.", "warning");
+    notify(state, ctx, "The pending annotation delivery belongs to another session; annotations remain pending.", "warning");
     return false;
   }
   const branchEntries = currentBranch(ctx);
@@ -522,14 +545,14 @@ async function sendAnnotations(
   exec: GitExecutor,
 ): Promise<void> {
   if (!ctx.isIdle()) {
-    notify(ctx, "The agent is busy; pending annotations were kept for later.", "warning");
+    notify(state, ctx, "The agent is busy — annotations stay pending.", "warning");
     return;
   }
   if (state.pendingDispatch && await reconcilePendingDispatch(pi, ctx, state)) return;
 
-  const refreshed = await refreshData(pi, ctx, data, exec, state.visibleAssistantTextByTimestamp);
+  const refreshed = await refreshData(pi, ctx, data, state, exec, state.visibleAssistantTextByTimestamp);
   if (!refreshed) {
-    notify(ctx, "The session changed while loading annotations; refresh and retry.", "warning");
+    notify(state, ctx, "The session changed while loading annotations. Press r to refresh, then send again.", "warning");
     return;
   }
   syncReviewState(state, ctx, data.items);
@@ -545,15 +568,22 @@ async function sendAnnotations(
   persistStaleItems(pi, data, validation.stale);
   syncReviewState(state, ctx, data.items);
   if (!ctx.isIdle()) {
-    notify(ctx, "The agent became busy; pending annotations were kept for later.", "warning");
+    notify(state, ctx, "The agent is busy — annotations stay pending.", "warning");
     return;
   }
   if (state.pendingDispatch) {
-    notify(ctx, "A previous annotation delivery is still awaiting confirmation.", "warning");
+    notify(state, ctx, "A previous delivery is still awaiting confirmation.", "warning");
     return;
   }
   if (validation.valid.length === 0) {
-    notify(ctx, "No valid pending annotations to send.", "warning");
+    notify(
+      state,
+      ctx,
+      validation.stale.length > 0
+        ? `Nothing was sent — ${validation.stale.length} annotation${validation.stale.length === 1 ? "" : "s"} became stale. Re-select the current content.`
+        : "Nothing pending to send.",
+      "warning",
+    );
     return;
   }
 
@@ -569,15 +599,22 @@ async function sendAnnotations(
     pi.sendUserMessage(content, { deliverAs: "aside" });
   } catch (error) {
     state.pendingDispatch = undefined;
-    notify(ctx, `Sending annotations failed: ${messageForError(error)}`, "error");
+    notify(state, ctx, `Sending annotations failed: ${messageForError(error)}`, "error");
     return;
   }
-  notify(ctx, `Sending ${validation.valid.length} annotation${validation.valid.length === 1 ? "" : "s"} to the current agent.`);
+  notify(
+    state,
+    ctx,
+    validation.stale.length > 0
+      ? `Sending ${validation.valid.length} annotation${validation.valid.length === 1 ? "" : "s"}; ${validation.stale.length} stale skipped.`
+      : `Sending ${validation.valid.length} annotation${validation.valid.length === 1 ? "" : "s"}…`,
+    "info",
+  );
 }
 
 async function openAnnotate(pi: ExtensionAPI, ctx: ExtensionCommandContext, state: RuntimeState, exec: GitExecutor): Promise<void> {
   if (!ctx.hasUI || ctx.mode !== "tui") {
-    notify(ctx, "/annotate requires the interactive TUI.", "warning");
+    notify(state, ctx, "/annotate requires the interactive TUI.", "warning");
     return;
   }
   // DiffPane is shared from the built-in git TUI, whose source module has its
@@ -597,9 +634,9 @@ async function openAnnotate(pi: ExtensionAPI, ctx: ExtensionCommandContext, stat
     notice: undefined,
     busy: false,
   };
-  const refreshed = await refreshData(pi, ctx, data, exec, state.visibleAssistantTextByTimestamp);
+  const refreshed = await refreshData(pi, ctx, data, state, exec, state.visibleAssistantTextByTimestamp);
   if (!refreshed) {
-    notify(ctx, "The session changed while loading annotations; refresh and retry.", "warning");
+    notify(state, ctx, "The session changed while loading annotations. Press r to refresh, then send again.", "warning");
     return;
   }
   syncReviewState(state, ctx, data.items);
@@ -610,12 +647,12 @@ async function openAnnotate(pi: ExtensionAPI, ctx: ExtensionCommandContext, stat
     addAssistant: (entry, body, selection) => addAssistantAnnotation(pi, ctx, data, state, entry, body, selection),
     selectAssistantPrecise: entry => selectAssistantRange(ctx, state, entry),
     selectCodePrecise: (filePath, lines) => selectCodeRange(ctx, state, filePath, lines),
-    selectCommit: commit => selectCommitSource(ctx, data, exec, commit),
-    selectWorkingTree: () => selectWorkingTreeSource(ctx, data, exec),
+    selectCommit: commit => selectCommitSource(ctx, data, state, exec, commit),
+    selectWorkingTree: () => selectWorkingTreeSource(ctx, data, state, exec),
     deleteItem: item => deleteAnnotation(pi, ctx, data, state, item),
     updateItem: (item, body) => updateAnnotation(pi, ctx, data, state, item, body),
     refresh: async () => {
-      if (await refreshData(pi, ctx, data, exec, state.visibleAssistantTextByTimestamp)) {
+      if (await refreshData(pi, ctx, data, state, exec, state.visibleAssistantTextByTimestamp)) {
         syncReviewState(state, ctx, data.items);
       }
     },
@@ -676,13 +713,14 @@ export default function annotateExtension(pi: ExtensionAPI): void {
     const pending = state.pendingDispatch;
     if (pending && (pending.sessionId !== sessionId || pending.baseLeafId !== leafId)) {
       state.pendingDispatch = undefined;
-      notify(ctx, "The pending annotation delivery was cancelled by a session branch change.", "warning");
+      notify(state, ctx, "The pending annotation delivery was cancelled by a session branch change.", "warning");
     }
     if (!state.activeData) {
       const restored = restoreBranchItems(pi, currentBranch(ctx), previousItems);
       syncReviewState(state, ctx, restored.items);
       if (restored.invalidCount > 0) {
         notify(
+          state,
           ctx,
           `Skipped ${restored.invalidCount} invalid Annotate record${restored.invalidCount === 1 ? "" : "s"}.`,
           "warning",
@@ -690,7 +728,7 @@ export default function annotateExtension(pi: ExtensionAPI): void {
       }
       return;
     }
-    if (await refreshData(pi, ctx, state.activeData, exec, state.visibleAssistantTextByTimestamp, previousItems)) {
+    if (await refreshData(pi, ctx, state.activeData, state, exec, state.visibleAssistantTextByTimestamp, previousItems)) {
       syncReviewState(state, ctx, state.activeData.items);
     }
 
@@ -710,10 +748,13 @@ export default function annotateExtension(pi: ExtensionAPI): void {
     if (!activeData) return;
     ctx.setTimeout(() => {
       if (state.activeData !== activeData) return;
-      void refreshData(pi, ctx, activeData, exec, state.visibleAssistantTextByTimestamp).then(refreshed => {
-        if (refreshed) syncReviewState(state, ctx, activeData.items);
+      void refreshData(pi, ctx, activeData, state, exec, state.visibleAssistantTextByTimestamp).then(refreshed => {
+        if (refreshed) {
+          syncReviewState(state, ctx, activeData.items);
+          activeData.onChange?.();
+        }
       }).catch(error => {
-        notify(ctx, `Unable to refresh assistant text: ${messageForError(error)}`, "error");
+        notify(state, ctx, `Unable to refresh assistant text: ${messageForError(error)}`, "error");
       });
     }, 0);
   });
@@ -725,13 +766,13 @@ export default function annotateExtension(pi: ExtensionAPI): void {
     const branchEntries = currentBranch(ctx);
     if (pending.baseLeafId !== null && !branchEntries.some(entry => entry.id === pending.baseLeafId)) {
       state.pendingDispatch = undefined;
-      notify(ctx, "Annotation delivery reached a different branch; annotations remain pending.", "error");
+      notify(state, ctx, "Annotation delivery reached a different branch; annotations remain pending.", "error");
       return;
     }
     const branchItems = restoreReviewItems(branchEntries);
     if (!pending.itemIds.every(itemId => branchItems.some(item => item.id === itemId && item.status === "pending"))) {
       state.pendingDispatch = undefined;
-      notify(ctx, "Annotation delivery reached a different branch; annotations remain pending.", "error");
+      notify(state, ctx, "Annotation delivery reached a different branch; annotations remain pending.", "error");
       return;
     }
     pending.data.items = branchItems;
@@ -743,7 +784,7 @@ export default function annotateExtension(pi: ExtensionAPI): void {
     if (!pending || event.willContinue === true) return;
     if (pending.sessionId !== ctx.sessionManager.getSessionId()) return;
     state.pendingDispatch = undefined;
-    notify(ctx, "Annotation delivery did not reach the current agent; annotations remain pending.", "error");
+    notify(state, ctx, "Annotation delivery did not reach the current agent; annotations remain pending.", "error");
   });
   pi.on("session_start", restoreActiveBranch);
   pi.on("session_tree", restoreActiveBranch);

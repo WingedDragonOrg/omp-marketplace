@@ -5,13 +5,28 @@ const MAX_DRAFT_HEIGHT = 8;
 
 /**
  * Keep the evidence canvas dominant while reserving enough dock width for a
- * readable source row, draft target, and review status.
+ * readable source row, draft target, and review status. A collapsed dock hands
+ * the whole frame to the evidence pane for reading long hunks.
  */
-export function resolveAnnotateLayout(width: number, height: number): AnnotateLayout {
+export function resolveAnnotateLayout(width: number, height: number, dockCollapsed = false): AnnotateLayout {
   const safeWidth = Number.isFinite(width) ? Math.max(1, Math.trunc(width)) : 1;
+  const bodyHeight = Number.isFinite(height) ? Math.max(1, Math.trunc(height)) : 1;
+  if (dockCollapsed) {
+    return {
+      leftWidth: safeWidth,
+      dividerWidth: 0,
+      rightWidth: 0,
+      bodyHeight,
+      sourceHeight: 0,
+      draftHeight: 0,
+      reviewHeight: 0,
+    };
+  }
+
   const dividerWidth = safeWidth >= 3 ? 1 : 0;
   const usableWidth = Math.max(1, safeWidth - dividerWidth);
-  const sidebarRatio = safeWidth >= 80 ? 0.3 : 0.36;
+  const narrowness = Math.max(0, Math.min(1, (96 - safeWidth) / 36));
+  const sidebarRatio = 0.3 + narrowness * 0.1;
   let rightWidth = Math.max(1, Math.floor(usableWidth * sidebarRatio));
   let leftWidth = usableWidth - rightWidth;
   if (leftWidth < 1) {
@@ -19,7 +34,6 @@ export function resolveAnnotateLayout(width: number, height: number): AnnotateLa
     rightWidth = Math.max(0, usableWidth - leftWidth);
   }
 
-  const bodyHeight = Number.isFinite(height) ? Math.max(1, Math.trunc(height)) : 1;
   const chrome = Math.min(SIDEBAR_CHROME, bodyHeight);
   const available = Math.max(0, bodyHeight - chrome);
   let sourceHeight = available > 0 ? Math.max(1, Math.floor(available * 0.52)) : 0;
