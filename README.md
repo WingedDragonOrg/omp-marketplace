@@ -23,6 +23,7 @@ omp plugin install wtm@winged-dragon-org
 | `managed-skill-manager` | skill | `managed-skill-merge` — 审计并合并膨胀的 managed skill 库：按判据聚类、并行无损合并，附 `skill_audit.py`（清单 / 重叠排名 / 结构与链接校验） |
 | `octo-developer` | extension + skill | `octo_pr` + `octo-pr` — 监听 Mininglamp-OSS/octo-server PR review，按当前 head 两票门禁完成安全修复并交由有权限人员合并 |
 | `auto-learn-scope` | extension | `learn` / `manage_skill` — auto-learn skill 写入支持显式 `global` 或 `project` scope；memory 始终走 native backend |
+| `delegate` | extension | `/delegate <work>` — 使用原生 `/tan` 后台生命周期，但从纯净对话上下文启动 |
 
 ### Dispatcher
 

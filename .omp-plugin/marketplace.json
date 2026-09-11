@@ -202,6 +202,24 @@
         "name": "WingedDragonOrg"
       },
       "license": "MIT"
+    },
+    {
+      "name": "delegate",
+      "description": "Run a full background agent with a clean conversation context",
+      "source": "./delegate",
+      "version": "1.0.0",
+      "category": "development",
+      "keywords": [
+        "background",
+        "delegation",
+        "clean-context",
+        "subagent",
+        "extension"
+      ],
+      "author": {
+        "name": "WingedDragonOrg"
+      },
+      "license": "MIT"
     }
   ]
 }

@@ -1,0 +1,21 @@
+{
+  "name": "delegate",
+  "version": "1.0.0",
+  "description": "Run clean-context background delegation jobs in Oh My Pi",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "omp": {
+    "extensions": [
+      "./delegate.ts"
+    ]
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.1.17",
+    "@types/bun": "^1.3.14",
+    "typescript": "^5.9.3"
+  }
+}

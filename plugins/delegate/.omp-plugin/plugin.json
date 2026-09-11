@@ -1,0 +1,9 @@
+{
+  "name": "delegate",
+  "version": "1.0.0",
+  "description": "Run clean-context background delegation jobs in Oh My Pi",
+  "author": {
+    "name": "WingedDragonOrg"
+  },
+  "homepage": "https://github.com/WingedDragonOrg/omp-marketplace"
+}
