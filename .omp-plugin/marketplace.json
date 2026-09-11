@@ -164,6 +164,44 @@
         "name": "WingedDragonOrg"
       },
       "license": "MIT"
+    },
+    {
+      "name": "octo-developer",
+      "description": "Mininglamp-OSS/octo-server GitHub PR review watcher and current-head merge workflow",
+      "source": "./octo-developer",
+      "version": "1.0.0",
+      "category": "development",
+      "keywords": [
+        "github",
+        "pull-request",
+        "review",
+        "octo-server",
+        "watcher",
+        "merge"
+      ],
+      "author": {
+        "name": "WingedDragonOrg"
+      },
+      "license": "MIT"
+    },
+    {
+      "name": "auto-learn-scope",
+      "description": "Add explicit global/project scope to OMP auto-learn tools while preserving native memory and capture behavior",
+      "source": "./auto-learn-scope",
+      "version": "1.0.0",
+      "category": "development",
+      "keywords": [
+        "auto-learn",
+        "autolearn",
+        "memory",
+        "skills",
+        "project-scope",
+        "extension"
+      ],
+      "author": {
+        "name": "WingedDragonOrg"
+      },
+      "license": "MIT"
     }
   ]
 }

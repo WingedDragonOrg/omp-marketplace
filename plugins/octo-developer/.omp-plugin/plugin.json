@@ -1,0 +1,9 @@
+{
+  "name": "octo-developer",
+  "version": "1.0.0",
+  "description": "octo-server GitHub PR review watcher and current-head merge workflow",
+  "author": {
+    "name": "WingedDragonOrg"
+  },
+  "homepage": "https://github.com/WingedDragonOrg/omp-marketplace"
+}
