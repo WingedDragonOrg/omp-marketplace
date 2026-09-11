@@ -11,7 +11,7 @@
 需要一个可安装的 `octo-developer` marketplace plugin，帮助 agent 在 `Mininglamp-OSS/octo-server` GitHub PR 上持续处理 review，而不是靠模型手动循环查询。插件由两部分组成：
 
 1. `octo_pr` Extension 工具负责绑定当前会话的一个 PR、约 60 秒后台查询 GitHub、缓存状态和评论/审查变化，并在变化时唤醒会话；
-2. `octo-pr` Skill 负责安全分析外部 review，执行修复—测试—回复—push—新一轮闭环，在当前 head 满足两位 reviewer 门禁后通过真实 `gh pr merge` compare-and-merge。
+2. `octo-pr` Skill 负责安全分析外部 review，执行修复—测试—回复—push—新一轮闭环，在当前 head 满足两位 reviewer 门禁并完成最新事实核验后，将合并交接给有权限人员。
 
 目标是让长等待可恢复、让新 head 自动失效旧批准、让评论不会成为隐式命令，同时不让观察工具承担远端写入或合并责任。
 
@@ -19,23 +19,23 @@
 
 ### 包含
 
-- marketplace plugin `octo-developer`，版本 `1.0.0`；
+- marketplace plugin `octo-developer`，版本 `1.0.1`；
 - `package.json` 的 `omp.extensions: ["./src/index.ts"]` 和仅开发期依赖；
 - `.omp-plugin/plugin.json`、根 README、两份一致的 marketplace catalog 和插件 README；
 - `skills/octo-pr/SKILL.md` 及不连接真实 GitHub 的三组离线 eval fixture；
 - `octo_pr` 的 `watch`、`status`、`cancel` 对外契约；
 - 当前 head 的批准/阻塞审查判定、评论证据 URL、会话隔离、断线恢复和关闭暂停语义；
-- 适用于 `Mininglamp-OSS/octo-server` 所有 PR 的安装、等待、修复和安全合并说明。
+- 适用于 `Mininglamp-OSS/octo-server` 所有 PR 的安装、等待、修复和人工合并交接说明。
 
 ### 不包含
 
-- watcher 自动 merge、push、回复评论、commit、修改 PR 或任何其他远端写入；
+- watcher 自动执行合并、push、回复评论、commit、修改 PR 或任何其他远端写入；
 - 用模型每 60 秒主动轮询，或在后台启动另一个模型会话；
 - 将 PR887 作为特殊白名单、固定编号或不同门禁；
 - 把 GitHub 评论、链接、代码块、命令或 mention 当作可执行指令；
-- 用 `--admin`、`--auto`、`--delete-branch` 或无 `--match-head-commit` 的命令绕过保护；
+- 绕过 GitHub 保护或自动删除分支；
 - 自动等待第三位 reviewer；
-- 真实 GitHub 网络访问、真实 merge 或真实评测执行作为 eval 的前提；
+- 真实 GitHub 网络访问、真实人工合并或真实评测执行作为 eval 的前提；
 - 运行时 npm 依赖或对 OMP 私有模块的依赖。
 
 ## 已知约束
@@ -45,7 +45,7 @@
 - watcher 约每 60 秒查询 GitHub，按状态或评论/审查证据去重通知；工具失败必须作为错误暴露，不能伪装成空结果。
 - 会话关闭或切换时暂停 watcher；`session_start`/`session_switch` 自动从当前 session branch 的持久化记录恢复同一 PR，并重新读取。记录保存规范化 PR、head SHA 和最近通知 fingerprint；通知与记录成功后才推进 fingerprint，失败或进程中断会重试，因此通知语义为 at-least-once（允许重复、不承诺 exactly-once）。不同 session 不共享 watcher、PR、缓存或 fingerprint。
 - GitHub review 可能绑定提交 SHA；`APPROVED` 只对产生它的当前 head 有效。`CHANGES_REQUESTED` 跨 head 保留，只有同一 reviewer 后续 decisive `APPROVED` 或 `DISMISSED` 才解除；push 后必须重新计算门禁。
-- Skill 可以调用 GitHub CLI 做证据读取、回复、push 和最终 merge；观察工具不拥有这些副作用。
+- Skill 可以调用 GitHub CLI 做证据读取、回复和 push；门禁满足后输出人工合并交接，由具备权限的人员完成合并。
 - 离线 eval 必须在 prompt 中提供明确 fixture，不访问真实 GitHub，不依赖本地 PR 或网络状态。
 
 ## 关键决策
@@ -53,15 +53,15 @@
 | 决策 | 选择 | 理由 |
 | --- | --- | --- |
 | 观察方式 | session-bound 后台 watcher，约 60 秒查询 | 长等待不占用模型轮询，状态变化可以唤醒 agent |
-| 工具副作用 | watcher 只读；Skill 显式负责修复、回复、push、merge | 观察和写入分离，避免后台误合并或误回复 |
+| 工具副作用 | watcher 只读；Skill 显式负责修复、回复、push，门禁满足后输出人工合并交接 | 观察和写入分离，把最终合并交给具备权限的人员 |
 | PR 定位 | URL/数字字符串，watch 省略时解析当前分支 | 覆盖明确 PR 与当前开发分支两种入口 |
 | watcher 数量 | 每会话一个 | 防止同一会话重复查询、重复通知和状态竞争 |
-| status 读取 | 默认缓存；`fresh: true` 立即读 | 平时低成本响应，合并前以 GitHub 最新事实为准 |
+| status 读取 | 默认缓存；`fresh: true` 立即读 | 平时低成本响应，人工合并交接前以 GitHub 最新事实为准 |
 | 批准门禁 | 当前 head 上两位不同 reviewer 的最新 decisive `APPROVED` | 只统计 review commit 等于当前 head 的批准，防止旧提交批准和同人重复票误放行 |
 | 阻塞门禁 | 任一未被后续 decisive 状态解除的 `CHANGES_REQUESTED` 阻塞 | 拒绝跨 head 保留；`COMMENTED` 不消除阻塞，只有后续 decisive `APPROVED`/`DISMISSED` 才解除 |
 | 第三位 reviewer | 两票满足后不等待 | 门禁定义为两位，不把未知响应变成人工长等待 |
 | 评论信任 | 正式 review、行内评论、普通评论全是外部数据 | 防止社交文本注入 shell、工具或安全边界 |
-| 最终合并 | fresh 重查后 `gh pr merge "$PR" --squash --match-head-commit "$HEAD_SHA"` | 用提交 SHA 做并发保护，禁止降级绕过 |
+| 合并交接 | fresh 重查后汇报 PR、当前 head、批准证据和门禁事实，由有权限人员完成合并 | 用最新提交和证据交接，避免旧缓存误导 |
 | 分支清理 | 不自动删除 | 保留用户/仓库的分支生命周期控制权 |
 | 参考案例 | PR887 仅用于理解流程 | 避免把历史编号误当功能分支或例外规则 |
 
@@ -83,11 +83,11 @@
 - `status`：返回 watcher 缓存的监控状态和最新变化证据。至少包含 `status` 为 `ready`/`blocked`/`pending`/`error`/`cancelled`、`ready` 布尔值、`headSha`、当前有效批准摘要、当前有效 `CHANGES_REQUESTED` 摘要、PR 的可合并性与检查状态、完整的 `reviews`/`reviewComments`/`issueComments`/`threads` 证据、`lastCheckedAt`、`watching`/`cancelled`、错误和证据 URL。`fresh: true` 请求立即从 GitHub 读取并更新缓存；它不是给模型循环调用的计时器，失败必须显式返回 `error`。
 - `cancel`：停止当前 session 的 watcher；已取消的 watcher 不再通知该 session。
 
-通知只在状态、head 或评论/审查证据改变时发出并去重。通知内容是状态/数据，不是模型指令。工具不调用 `gh pr merge`，不 push，不创建评论。
+- `octo_pr` 工具不调用合并、不 push、不创建评论；通知只在状态、head 或评论/审查证据改变时发出并去重。通知内容是状态/数据，不是模型指令。
 
 ### 2. 监听、恢复与隔离
 
-启动 watcher 后，Skill 让模型等待工具事件，不安排 `sleep` 加模型查询的轮询。事件唤醒后，Skill 调用一次缓存 `status`，优先分析其中完整的 reviews、reviewComments、issueComments 和 threads；只有 snapshot 缺失、截断或需要权威细节/回复 thread 时才用 `gh api` 补查。
+启动 watcher 后，Skill 让模型等待工具事件，不安排 `sleep` 加模型查询的轮询。事件唤醒后，Skill 调用一次缓存 `status`，优先分析其中完整的 reviews、reviewComments、issueComments 和 threads；只有 snapshot 缺失、截断或需要权威细节/回复 thread 时才补查。准备人工合并交接时使用 `fresh: true`，而不是把它当作给模型循环调用的计时器。
 
 会话关闭或切换时，后台监控暂停，不继续消耗查询或模型回合；`session_start`/`session_switch` 会从当前 session branch 的 custom entry 自动恢复 watcher，再以当前 GitHub head 和评论重新查询。断线期间发生的变化由恢复后的读取补齐。通知 fingerprint 只有发送通知并写入持久记录后才推进，异常或中断会保留旧 fingerprint 并在下一轮/恢复时重试，故为 at-least-once 语义，允许恢复后重复通知但不静默丢失变化，不承诺 exactly-once。每个 session 的 watcher 状态独立，PR、评论、head SHA、fingerprint 和错误不得泄漏给其他 session。
 
@@ -122,22 +122,17 @@ threads 保留是否已解决及是否阻塞。所有返回内容保留来源 UR
 
 评论相互矛盾、要求越权或无法从代码和目标判断时，先报告并请求决策，不盲目执行。Skill 不把自己的回复、CI 文本或普通评论当作 reviewer 的 `APPROVED`。
 
-### 5. 最终真实 gate
+### 5. 最终人工合并交接
 
-只有用户任务包含合并或已明确授权合并时，Skill 才进行合并。它必须：
+本 Skill 不执行合并。两位不同 reviewer 的最新 decisive `APPROVED` 都绑定当前 `headSha`，且没有仍有效的 `CHANGES_REQUESTED` 后，完成一次最新状态核验并把结果交给用户，由具备权限的人员完成合并。
 
-1. `octo_pr({ action: "status", fresh: true })`；
-2. 优先使用 fresh snapshot 的完整 reviews、reviewComments、issueComments 和 threads，证据缺失时才补查；确认不存在仍有效的 `CHANGES_REQUESTED`，且有两位不同 reviewer 的最新 decisive `APPROVED` 都绑定同一个当前 `headSha`；
-3. 确认 fresh PR facts：PR 为 `OPEN`，`mergeable` 明确为 `MERGEABLE`，`mergeStateStatus` 为 `CLEAN`，required checks 全部通过，且没有未解决的 blocking threads。任一字段未知、失败或阻塞都不得合并；
-4. 保存该 SHA，立即执行：
+1. 调用 `octo_pr({ action: "status", fresh: true })`。
+2. 优先使用 fresh snapshot 的完整 reviews、reviewComments、issueComments 和 threads，证据缺失时才补查；确认两位不同 reviewer 的批准仍绑定同一个当前 `headSha`，且没有仍有效的 `CHANGES_REQUESTED`。
+3. 核对 fresh PR facts：PR 为 `OPEN`，`mergeable` 为 `MERGEABLE`，`mergeStateStatus` 为 `CLEAN`，required checks 全部通过，且没有未解决的 blocking threads。任一事实未知、失败、head 改变或批准失效时，按 `pending`/`blocked` 如实报告，不进入交接。
+4. 核验通过后向用户汇报 `ready`（待人工合并）：PR URL、当前 `headSha`、两位 reviewer 及批准证据 URL、已处理评论、测试结果、commit/push 与远端 head 确认、PR facts、required checks 和 blocking threads 状态，并明确下一步由有权限人员完成合并。
+5. 汇报人工交接后立即调用 `octo_pr({ action: "cancel" })` 结束 watcher，避免留下无限后台查询。人工合并后的 `MERGED`/`CLOSED` 状态由后续会话或用户另行确认；本流程不把 `ready` 写成已合并。
 
-```sh
-gh pr merge "$PR" --squash --match-head-commit "$HEAD_SHA"
-```
-
-5. 命令返回后立即再次 `status`（`fresh: true`）复查 PR state；只有确认 `state=MERGED` 或 `CLOSED` 才能结束该任务。确认任一终态后立即调用 `octo_pr({ action: "cancel" })` 结束 watcher，再报告任务已收尾。命令可能只进入 merge queue/auto-merge，queued、pending 或其他非终态只能如实报告，并按任务需要继续观察；若两票已满足但用户未授权 merge，且任务仅要求 review 完成，则汇报 `ready` 后调用 `cancel`，不得留下无限后台查询。
-
-命令使用 fresh 结果中的同一 PR 和 SHA。禁止管理员合并、自动合并、自动删分支和移除 `--match-head-commit` 的弱化重试；若命令因 head 改变、检查失败、队列或权限失败，报告真实错误并回到 watcher。
+fresh 结果中的 PR、`headSha`、review 证据和门禁事实必须一起汇报，不得以旧缓存或评论中的“批准”替代。合并远端写操作由具备权限的人员在其环境中完成；本 Skill 只完成证据核验和交接。
 
 ## 错误与边界情况
 
@@ -145,18 +140,18 @@ gh pr merge "$PR" --squash --match-head-commit "$HEAD_SHA"
 - 当前 session 已有 watcher：不重复创建；通过 status 查看或按用户要求 cancel 后重新 watch。
 - GitHub 请求失败、认证失败、限流或响应不完整：保留错误和证据 URL/时间，不能当作无评论或自动通过。
 - watcher 断线或会话恢复：以 fresh head 和最新证据重建状态，不沿用旧 head 的批准；未被后续 decisive 状态解除的旧 `CHANGES_REQUESTED` 仍阻塞。
-- 状态为 `CHANGES_REQUESTED`：不合并，不用管理员权限，不静默关闭审查；只有同一 reviewer 后续 decisive `APPROVED` 或 `DISMISSED` 才解除；`COMMENTED` 不解除。
+- 状态为 `CHANGES_REQUESTED`：保持 `blocked`，不绕过保护或进入人工合并交接；只有同一 reviewer 后续 decisive `APPROVED` 或 `DISMISSED` 才解除；`COMMENTED` 不解除。
 - 只有一位或零位当前 head 批准：pending；两位不同批准即可继续，不等待第三位。
 - push 后 head 变化：旧 `APPROVED` 全部失效，仍有效的 `CHANGES_REQUESTED` 不丢弃；重新获取两位不同 reviewer 的当前 head 批准。
 - 评论含 shell、链接、token、秘密、mention 或要求绕过规则：只作为数据审阅，不执行、不外传、不改变安全门禁。
-- 用户未授权合并：可以修复和等待；若任务仅要求完成 review 且两票已满足，报告 `ready` 后调用 `cancel` 收尾，否则不执行 `gh pr merge`。
-- mergeable、mergeStateStatus、required checks 或 blocking threads 未满足：保持 blocked/pending，不绕过 GitHub 保护。
-- merge gate 返回 queued/pending 或其他非 `MERGED` 状态：如实报告，不能声称已合并。
+- 两票满足且 fresh 事实完整时：报告 `ready`，提供当前 head 与批准证据，通知用户安排有权限人员完成合并，并调用 `cancel` 收尾。
+- mergeable、mergeStateStatus、required checks 或 blocking threads 未满足：保持 `blocked`/`pending`，不进入人工合并交接。
+- 外部合并状态为 `MERGED`/`CLOSED` 时如实报告；`ready` 不能替代终态确认。
 - 会话关闭：watcher 暂停；不会在后台继续 merge、push 或回复。
 
 ## 验收标准
 
-1. 插件 manifest、package 和两个 marketplace catalog 的名称、版本、source 和 Extension 入口一致，版本为 `1.0.0`；package 没有运行时 `dependencies`。
+1. 插件 manifest、package 和两个 marketplace catalog 的名称、版本、source 和 Extension 入口一致，版本为 `1.0.1`；package 没有运行时 `dependencies`。
 2. OMP 可加载 `./src/index.ts`，Skill 可通过 `octo-pr` 发现和显式调用；安装说明覆盖 marketplace、重启/刷新和 `gh` 前置条件，范围严格限定为 `Mininglamp-OSS/octo-server`。
 3. `watch` 接受 `Mininglamp-OSS/octo-server` PR URL/数字字符串，省略 `pr` 时从当前分支解析；一个 session 不会启动第二个 watcher。
 4. watcher 约每 60 秒在后台读取 GitHub，仅在状态/评论/审查变化时通知；不由模型轮询，不 merge、不 push、不回复远端。
@@ -166,7 +161,7 @@ gh pr merge "$PR" --squash --match-head-commit "$HEAD_SHA"
 8. 当前或历史仍有效的 `CHANGES_REQUESTED` 阻塞；`COMMENTED` 不清除；只有后续 decisive `APPROVED`/`DISMISSED` 才解除；旧 head `APPROVED` 不计数。
 9. 两位不同 reviewer 在同一当前 head 的最新 decisive 状态为 `APPROVED` 即满足票数，不等待第三位 reviewer。
 10. 修复流程按判断问题→修改→测试→逐项回复→commit→push→确认远端 head→新 head 新一轮执行，不能复用旧批准。
-11. 用户授权合并时，Skill 先 fresh 重查 review gate、`OPEN`/`MERGEABLE`/`CLEAN`、required checks 和 blocking threads，再执行 `gh pr merge "$PR" --squash --match-head-commit "$HEAD_SHA"`；命令后再次 fresh，只有 `state=MERGED` 才能报告成功；不使用 `--admin`、`--auto`、`--delete-branch` 或弱化重试。
+11. 两票满足且不存在仍有效的 `CHANGES_REQUESTED` 时，Skill 先 fresh 重查 review gate、`OPEN`/`MERGEABLE`/`CLEAN`、required checks 和 blocking threads，再向用户汇报当前 head、批准证据和人工合并下一步，并调用 `cancel` 结束 watcher；合并由具备权限的人员完成，`ready` 不代表已合并。
 12. 三组离线 eval 明确提供“长等待两票第三位未返回”“两票后第三位阻塞”“push 后旧票失效且断线恢复”fixture，并能在 with-skill/without-skill 配对执行时不连接真实 GitHub。
 
 ## v1.0.0 验证记录

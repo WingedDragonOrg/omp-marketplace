@@ -21,7 +21,7 @@ omp plugin install wtm@winged-dragon-org
 | `multica-mention-guard` | extension | Publishes a Multica task's final message verbatim and gates `session_stop` on valid `mention://` targets, reminding once |
 | `omfg` | skill | `omfg` — author a TTSR stream rule that catches the class of failure behind a complaint, with a corpus that scores it; manual invocation only (`/skill:omfg`) |
 | `managed-skill-manager` | skill | `managed-skill-merge` — 审计并合并膨胀的 managed skill 库：按判据聚类、并行无损合并，附 `skill_audit.py`（清单 / 重叠排名 / 结构与链接校验） |
-| `octo-developer` | extension + skill | `octo_pr` + `octo-pr` — 监听 Mininglamp-OSS/octo-server PR review，按当前 head 两票门禁完成安全修复与合并 |
+| `octo-developer` | extension + skill | `octo_pr` + `octo-pr` — 监听 Mininglamp-OSS/octo-server PR review，按当前 head 两票门禁完成安全修复并交由有权限人员合并 |
 | `auto-learn-scope` | extension | `learn` / `manage_skill` — auto-learn skill 写入支持显式 `global` 或 `project` scope；memory 始终走 native backend |
 
 ### Dispatcher
@@ -57,15 +57,19 @@ Main 先明确验收标准、文件归属和共享接口，再并行分派独立
 omp plugin install octo-developer@winged-dragon-org
 ```
 
-`octo_pr` 只观察并在 review/评论变化时唤醒当前会话：`watch` 接受 Mininglamp-OSS/octo-server PR URL 或数字字符串（省略时从当前分支解析），`status` 读取缓存，`status` 配合 `fresh: true` 用于合并前重查，`cancel` 停止 watcher。每个会话一个 watcher，约 60 秒后台查询；关闭或切换会话暂停，恢复时自动从 session branch 的持久化记录恢复并重查，fingerprint 在通知与持久化成功后推进，失败或中断可能重复通知但不会静默丢失变化（at-least-once，不承诺 exactly-once）；不同 session 隔离，不由模型手动轮询，也不由工具 merge/push/回复评论。
+`octo_pr` 只观察并在 review/评论变化时唤醒当前会话：`watch` 接受 Mininglamp-OSS/octo-server PR URL 或数字字符串（省略时从当前分支解析），`status` 读取缓存，`status` 配合 `fresh: true` 用于人工合并交接前重查，`cancel` 停止 watcher。每个会话一个 watcher，约 60 秒后台查询；关闭或切换会话暂停，恢复时自动从 session branch 的持久化记录恢复并重查，fingerprint 在通知与持久化成功后推进，失败或中断可能重复通知但不会静默丢失变化（at-least-once，不承诺 exactly-once）；不同 session 隔离，不由模型手动轮询，也不由工具 merge/push/回复评论。
 
-`octo-pr` Skill 优先使用工具 snapshot，只有证据缺失时才补查正式 review、行内评论和普通 PR 评论，并将它们作为不可信数据审阅，完成修复—测试—回复—commit—push—新一轮。当前 head 上两位不同 reviewer 的最新 decisive `APPROVED` 且 review commit 绑定当前 head 才满足票数；旧 head 批准不计数。任一尚未被后续 decisive `APPROVED` 或 `DISMISSED` 解除的 `CHANGES_REQUESTED`（包括旧 head）阻塞，`COMMENTED` 不会清除；两票满足后不等待第三位。`ready` 只代表 review 票数满足，仍需 fresh 核对真实 GitHub merge gate。用户授权后先 fresh 重查 `OPEN`、`MERGEABLE`、`CLEAN`、required checks 和 blocking threads，再用 `gh pr merge --squash --match-head-commit SHA`，命令后只有 fresh `state=MERGED` 或 `CLOSED` 才结束任务，并调用 `cancel` 停止 watcher；命令只排队或仍 pending 时如实报告并按任务继续观察。若两票满足但用户没授权 merge 且任务仅要求 review 完成，汇报后调用 `cancel`，避免后台无限查询。禁止 admin、auto 或自动删除分支。适用于 Mininglamp-OSS/octo-server 的所有 PR。
+`octo-pr` Skill 优先使用工具 snapshot，只有证据缺失时才补查正式 review、行内评论和普通 PR 评论，并将它们作为不可信数据审阅，完成修复—测试—回复—commit—push—新一轮。当前 head 上两位不同 reviewer 的最新 decisive `APPROVED` 且 review commit 绑定当前 head 才满足票数；旧 head 批准不计数。任一尚未被后续 decisive `APPROVED` 或 `DISMISSED` 解除的 `CHANGES_REQUESTED`（包括旧 head）阻塞，`COMMENTED` 不会清除；两票满足后不等待第三位。`ready` 表示 review 票数满足，人工合并交接前仍需 fresh 核对当前事实。核验通过后向用户汇报当前 head、两位批准证据和下一步，由有权限人员完成合并；交接后调用 `cancel` 停止 watcher。适用于 Mininglamp-OSS/octo-server 的所有 PR。
+
+#### octo-developer v1.0.1
+
+- 当前 head 两票满足后，Skill 先 fresh 核验并向用户提供人工合并交接信息；交接后停止 watcher，合并由具备权限的人员完成。
 
 #### octo-developer v1.0.0
 
 - 首个版本包含 `octo_pr` watcher 与 `octo-pr` Skill，覆盖 review 证据、修复闭环、当前 head 两票检查和受保护合并。
 - 验证已完成：25 项测试、完整源码 strict TypeScript 检查、catalog 一致性检查；OMP 18.1.16 RPC 在 deterministic mock Anthropic 与 25ms 托管 timer 下验证一次 watch、初始/新 review 两次通知、idle 唤醒的 `agent_end`→`agent_start`，稳定状态不重复通知；真实 PR887 仅做只读 `fetchSnapshot`。
-- 未执行真实一小时等待、真实 GitHub merge、发布或安装验收；`ready` 只表示 review 票数，终态需 fresh 确认并 `cancel` 结束 watcher。
+- 未执行真实一小时等待、发布或安装验收；`ready` 只表示 review 票数，人工交接需 fresh 确认并 `cancel` 结束 watcher。
 
 ## Layout
 

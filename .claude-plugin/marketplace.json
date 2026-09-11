@@ -167,9 +167,9 @@
     },
     {
       "name": "octo-developer",
-      "description": "Mininglamp-OSS/octo-server GitHub PR review watcher and current-head merge workflow",
+      "description": "Mininglamp-OSS/octo-server GitHub PR review watcher and human merge handoff workflow",
       "source": "./octo-developer",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "category": "development",
       "keywords": [
         "github",

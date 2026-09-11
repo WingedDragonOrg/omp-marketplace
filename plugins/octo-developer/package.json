@@ -1,7 +1,7 @@
 {
   "name": "octo-developer",
-  "version": "1.0.0",
-  "description": "octo-server GitHub PR review watcher and current-head merge workflow",
+  "version": "1.0.1",
+  "description": "octo-server GitHub PR review watcher and human merge handoff workflow",
   "private": true,
   "type": "module",
   "omp": {
