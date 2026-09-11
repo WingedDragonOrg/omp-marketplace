@@ -1,0 +1,9 @@
+{
+  "name": "auto-learn-scope",
+  "version": "1.0.0",
+  "description": "Add explicit global/project scope to OMP auto-learn tools while preserving native memory and capture behavior",
+  "author": {
+    "name": "WingedDragonOrg"
+  },
+  "homepage": "https://github.com/WingedDragonOrg/omp-marketplace"
+}

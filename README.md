@@ -22,6 +22,7 @@ omp plugin install wtm@winged-dragon-org
 | `omfg` | skill | `omfg` — author a TTSR stream rule that catches the class of failure behind a complaint, with a corpus that scores it; manual invocation only (`/skill:omfg`) |
 | `managed-skill-manager` | skill | `managed-skill-merge` — 审计并合并膨胀的 managed skill 库：按判据聚类、并行无损合并，附 `skill_audit.py`（清单 / 重叠排名 / 结构与链接校验） |
 | `octo-developer` | extension + skill | `octo_pr` + `octo-pr` — 监听 Mininglamp-OSS/octo-server PR review，按当前 head 两票门禁完成安全修复与合并 |
+| `auto-learn-scope` | extension | `learn` / `manage_skill` — auto-learn skill 写入支持显式 `global` 或 `project` scope；memory 始终走 native backend |
 
 ### Dispatcher
 
