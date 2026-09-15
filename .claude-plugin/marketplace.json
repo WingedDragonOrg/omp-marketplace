@@ -12,7 +12,7 @@
   "plugins": [
     {
       "name": "dispatcher",
-      "description": "已确认 spec 与跨模块任务的实施调度 Skill：subagent 实现，Main 调度、审查和验证，默认中文交互",
+      "description": "已确认 spec 与跨模块任务的实施调度 Skill：subagent 承担主体实现，Main 调度、审查、验证及少量低成本配套修改，默认中文交互",
       "source": "./dispatcher",
       "version": "1.0.0",
       "category": "development",

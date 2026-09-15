@@ -15,7 +15,7 @@ omp plugin install wtm@winged-dragon-org
 |---|---|---|
 | `wtm` | extension + skill | `/wtm` — manage Git worktrees and Worktrunk merges; `/wtm init` asks the agent to initialize `.config/wt.toml` using the bundled configuration skill |
 | `annotate` | extension | `/annotate` — review Git changes, recent commits, and assistant text, then send durable annotations to the current session agent |
-| `dispatcher` | skill | 已确认 spec 与可拆分跨模块任务的实施调度；subagent 实现，Main 调度、审查和验证，默认中文交互 |
+| `dispatcher` | skill | 已确认 spec 与可拆分跨模块任务的实施调度；subagent 承担主体实现，Main 调度、审查、验证及少量低成本配套修改，默认中文交互 |
 | `skill-gate` | extension + skill | `when:` frontmatter gates a skill on env vars, os/arch, cwd, marker files or PATH binaries; `/skill-gate` explains each decision |
 | `spec` | skill | `spec-design` — design interview that converges an idea into an implementable spec in `docs/specs/`, one product-level decision at a time |
 | `multica-mention-guard` | extension | Publishes a Multica task's final message verbatim and gates `session_stop` on valid `mention://` targets, reminding once |
@@ -42,8 +42,10 @@ omp plugin install dispatcher@winged-dragon-org
 以及未要求委派的局部小改动，不属于触发场景，即使小改动引用了已有规格。
 
 Main 先明确验收标准、文件归属和共享接口，再并行分派独立任务；有依赖的任务分波次执行。
-实现、测试、文档、集成及修复由 subagent 修改，Main 审查真实改动，并在编辑收敛后统一验证。
-不可拆分的任务由一名实现代理处理，Main 保持调度和审查职责。
+主体实现和复杂修复由 subagent 完成，Main 审查真实改动，并在编辑收敛后统一格式化和验证。
+上下文已掌握、范围明确且低风险的少量配套修改由 Main 直接完成，例如补一条忽略规则或已确定的简单集成项；
+修改前确认文件归属，修改后复核并验证，避免与代理并发编辑同一文件。
+不可拆分的主体实现由一名实现代理处理；Main 的直接修改保持少量，为整体调度和审查留出注意力。
 主会话负责整体调度，实现 subagent 直接完成获派切片；进一步委派由 Main 决定。
 
 问答、进度、派工、审查反馈及最终交付默认使用简体中文，subagent 的汇报也遵循此约定。
