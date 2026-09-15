@@ -490,6 +490,7 @@ afterEach(() => {
   for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
+
 describe("/wtm backend selection", () => {
   test("rejects merge without Worktrunk before changing the repository", async () => {
     // Catches treating the new `merge` subcommand as a worktree name on the native backend.
@@ -579,19 +580,20 @@ describe("/wtm backend selection", () => {
     expect(names).toEqual(["wtm"]);
   });
 
-  test("sends the Worktrunk initialization prompt to the agent", async () => {
+  test("sends the Worktrunk initialization prompt in the current session language", async () => {
     const root = tempRoot();
     const repo = initRepo(root);
     const harness = makeHarness(repo);
 
     await harness.handler("init", harness.ctx);
 
-    expect(harness.sentMessages).toHaveLength(1);
     expect(harness.sentMessages[0]).toContain("skill://wtm");
     expect(harness.sentMessages[0]).toContain(".config/wt.toml");
-    expect(harness.sentMessages[0]).toContain("Preserve existing configuration");
+    expect(harness.sentMessages[0]).toContain("请使用触发本命令的用户当前会话语言回答");
+    expect(harness.sentMessages[0]).toContain("默认使用简体中文回答");
+    expect(harness.sentMessages[0]).toContain("保留现有配置");
     expect(harness.sentMessages[0]).toContain("wt step tether");
-    expect(harness.sentMessages[0]).toContain("non-bare Git checkout");
+    expect(harness.sentMessages[0]).toContain("非裸 Git checkout");
 
   });
 

@@ -44,30 +44,21 @@ Backend:
   -y skips only the current OMP confirmation. OMP_WORKTREE_DIR preserves the
   <repo>-<name> layout for newly created worktrees.`;
 
-const INIT_PROMPT = `Initialize Worktrunk for the current repository.
+const INIT_PROMPT = `请为当前仓库初始化 Worktrunk。
 
-First confirm that the current directory is a non-bare Git checkout. If it is a
-bare repository, explain that a project \`.config/wt.toml\` needs a checkout and
-stop. Otherwise, read the WTM documentation at \`skill://wtm\`. Then inspect the
-repository's actual toolchain, package scripts, build/test/start commands,
-current Worktrunk version, and any existing \`.config/wt.toml\`.
+语言要求：请使用触发本命令的用户当前会话语言回答；本会话使用中文时，默认使用简体中文回答，所有说明、结果和下一步都使用简体中文。代码、命令、路径和原始报错保留原文。
 
-Create or minimally update \`.config/wt.toml\` with a practical project setup:
-dependency/bootstrap hooks when the repository needs them, a non-blocking
-post-start development command when one is clearly available, a pre-merge
-validation command when one is clearly available, and a per-branch \`[list]\`
-URL only when the project exposes a local development server. Use only commands
-that the repository already defines or documents, choose safe branch-derived
-values for ports and paths, and wrap long-running post-start commands with
-\`wt step tether -- ...\` so their process tree follows worktree removal.
+首先确认当前目录是非裸 Git checkout。如果是裸仓库，说明项目级 \`.config/wt.toml\` 需要 checkout，然后停止。否则，读取 WTM 文档 \`skill://wtm\`。接着检查仓库实际使用的工具链、package scripts、构建/测试/启动命令、当前 Worktrunk 版本以及已有的 \`.config/wt.toml\`。
 
-Preserve existing configuration and unrelated project behavior. Keep secrets
-and personal preferences out of the project file. Explain the resulting hooks,
-approval steps, and validation commands, and verify the TOML with Worktrunk's
-read-only commands or dry-run facilities. Do not commit changes, install
-software, start a long-running server, or perform destructive Git operations.
-If Worktrunk is unavailable or the project lacks enough information, report the
-exact next step instead of inventing configuration.`;
+根据实际情况创建或最小化更新 \`.config/wt.toml\`：
+- 仓库需要时添加依赖/初始化 hook；
+- 明确存在时添加非阻塞的 post-start 开发命令；
+- 明确存在时添加 pre-merge 校验命令；
+- 只有项目提供本地开发服务器时，才添加按分支区分的 \`[list]\` URL。
+只使用仓库已经定义或文档说明的命令；端口和路径使用由分支安全派生的值；长时间运行的 post-start 命令用 \`wt step tether -- ...\` 包装，让进程树随 worktree 删除而结束。
+
+保留现有配置和无关的项目行为。不要把 secrets 和个人偏好写入项目文件。说明最终的 hooks、审批步骤和校验命令，并用 Worktrunk 的只读命令或 dry-run 功能验证 TOML。不要提交变更、安装软件、启动长时间运行的服务器，也不要执行破坏性 Git 操作。
+如果 Worktrunk 不可用，或项目信息不足以安全配置，请报告准确的下一步，不要自行编造配置。`;
 
 type CommandArgumentParse =
   | { kind: "ok"; args: string[] }
