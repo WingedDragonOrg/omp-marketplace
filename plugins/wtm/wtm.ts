@@ -353,28 +353,31 @@ function parseWorktrunkRemove(out: string): WorktrunkRemoveResult | null {
   } catch {
     return null;
   }
+  // Worktrunk prints one array entry per removal; each WTM call removes exactly one worktree.
+  if (!Array.isArray(value) || value.length !== 1) return null;
+  const entry: unknown = value[0];
   if (
-    value === null ||
-    typeof value !== "object" ||
-    Array.isArray(value) ||
-    !("kind" in value) ||
-    value.kind !== "worktree" ||
-    !("branch" in value) ||
-    (value.branch !== null && typeof value.branch !== "string") ||
-    !("path" in value) ||
-    typeof value.path !== "string" ||
-    !path.isAbsolute(value.path) ||
-    !("branch_outcome" in value) ||
-    value.branch_outcome !== "not_attempted" ||
-    !("branch_checked_out_at" in value) ||
-    (value.branch_checked_out_at !== null && typeof value.branch_checked_out_at !== "string")
+    entry === null ||
+    typeof entry !== "object" ||
+    Array.isArray(entry) ||
+    !("kind" in entry) ||
+    entry.kind !== "worktree" ||
+    !("branch" in entry) ||
+    (entry.branch !== null && typeof entry.branch !== "string") ||
+    !("path" in entry) ||
+    typeof entry.path !== "string" ||
+    !path.isAbsolute(entry.path) ||
+    !("branch_outcome" in entry) ||
+    entry.branch_outcome !== "not_attempted" ||
+    !("branch_checked_out_at" in entry) ||
+    (entry.branch_checked_out_at !== null && typeof entry.branch_checked_out_at !== "string")
   ) {
     return null;
   }
   return {
-    branch: value.branch,
-    path: value.path,
-    branchOutcome: value.branch_outcome,
+    branch: entry.branch,
+    path: entry.path,
+    branchOutcome: entry.branch_outcome,
   };
 }
 

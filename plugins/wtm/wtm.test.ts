@@ -203,6 +203,7 @@ function installFakeWorktrunk(root: string, options: {
   removeResult?: unknown;
   removeExit?: number;
   realRemove?: boolean;
+  removeRaw?: string;
   removeReportedPath?: string;
   removeCollateral?: string;
   mergeResult?: unknown;
@@ -388,13 +389,17 @@ if (args.includes("--version")) {
         process.exit(collateralRemoval.exitCode ?? 1);
       }
     }
-    console.log(JSON.stringify({
-      kind: "worktree",
-      branch,
-      path: process.env.WT_FAKE_REMOVE_REPORTED_PATH || target,
-      branch_outcome: "not_attempted",
-      branch_checked_out_at: null,
-    }));
+    if (process.env.WT_FAKE_REMOVE_RAW) {
+      console.log(process.env.WT_FAKE_REMOVE_RAW);
+    } else {
+      console.log(JSON.stringify([{
+        kind: "worktree",
+        branch,
+        path: process.env.WT_FAKE_REMOVE_REPORTED_PATH || target,
+        branch_outcome: "not_attempted",
+        branch_checked_out_at: null,
+      }]));
+    }
   } else {
     console.log(process.env.WT_FAKE_REMOVE);
   }
@@ -427,6 +432,7 @@ if (args.includes("--version")) {
   process.env.WT_FAKE_REMOVE = JSON.stringify(options.removeResult ?? {});
   process.env.WT_FAKE_REMOVE_EXIT = String(options.removeExit ?? 0);
   process.env.WT_FAKE_REAL_REMOVE = options.realRemove ? "1" : "0";
+  process.env.WT_FAKE_REMOVE_RAW = options.removeRaw ?? "";
   process.env.WT_FAKE_REMOVE_REPORTED_PATH = options.removeReportedPath ?? "";
   process.env.WT_FAKE_REMOVE_COLLATERAL = options.removeCollateral ?? "";
   process.env.WT_FAKE_MERGE_RAW = options.mergeRaw ?? JSON.stringify(options.mergeResult ?? {
@@ -470,6 +476,7 @@ afterEach(() => {
   delete process.env.WT_FAKE_REMOVE;
   delete process.env.WT_FAKE_REMOVE_EXIT;
   delete process.env.WT_FAKE_REAL_REMOVE;
+  delete process.env.WT_FAKE_REMOVE_RAW;
   delete process.env.WT_FAKE_REMOVE_REPORTED_PATH;
   delete process.env.WT_FAKE_REMOVE_COLLATERAL;
   delete process.env.WT_TEST_MOVED_TO;
@@ -803,6 +810,8 @@ describe("/wtm Worktrunk removal", () => {
 
     expect(existsSync(target)).toBe(false);
     expect(git(repo, ["show-ref", "--verify", "refs/heads/remove-topic"])).not.toBe("");
+    expect(harness.notices.at(-1)?.level).toBe("info");
+    expect(harness.notices.at(-1)?.text).toContain(`Removed worktree ${target}`);
     const removeCall = fakeCalls(log).find((args) => args.includes("remove"));
     expect(removeCall).toContain("--no-delete-branch");
     expect(removeCall).toContain("--foreground");
@@ -2078,6 +2087,41 @@ describe("/wtm reviewed reconciliation boundaries", () => {
     expect(harness.notices.at(-1)?.level).toBe("warning");
     expect(harness.notices.at(-1)?.text).toContain("unexpectedly removed");
     expect(harness.notices.at(-1)?.text).toContain(collateral);
+  });
+
+  test("flags removal output with more than one record", async () => {
+    // Catches trusting ambiguous Worktrunk output for a worktree that is already gone.
+    const root = tempRoot();
+    const repo = initRepo(root);
+    const target = path.join(root, "multi-record");
+    git(repo, ["worktree", "add", "-b", "multi-record", target]);
+    installFakeWorktrunk(root, {
+      realRemove: true,
+      removeRaw: JSON.stringify([
+        {
+          kind: "worktree",
+          branch: "multi-record",
+          path: target,
+          branch_outcome: "not_attempted",
+          branch_checked_out_at: null,
+        },
+        {
+          kind: "worktree",
+          branch: "other-topic",
+          path: path.join(root, "other-topic"),
+          branch_outcome: "not_attempted",
+          branch_checked_out_at: null,
+        },
+      ]),
+    });
+    const harness = makeHarness(repo);
+
+    await harness.handler("rm multi-record -y", harness.ctx);
+
+    expect(existsSync(target)).toBe(false);
+    expect(harness.notices.at(-1)?.level).toBe("warning");
+    expect(harness.notices.at(-1)?.text).toContain("incompatible Worktrunk JSON");
+    expect(harness.notices.at(-1)?.text).toContain(target);
   });
 
   test("uses Worktrunk primary metadata while removing itself", async () => {
