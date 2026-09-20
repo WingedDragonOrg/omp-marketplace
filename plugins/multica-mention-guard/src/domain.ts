@@ -91,8 +91,8 @@ export function validateMentionBody(
   selfAgentId: string,
 ): MentionValidation {
   const self = normalizeUuid(selfAgentId);
-  const agentIds = normalizedIdSet(roster.agentIds);
-  const memberIds = normalizedIdSet(roster.memberIds);
+  let agentIds: Set<string> | undefined;
+  let memberIds: Set<string> | undefined;
   const uniqueTargets = new Set<string>();
   let participantMentionCount = 0;
 
@@ -103,7 +103,9 @@ export function validateMentionBody(
     const id = normalizeUuid(match[3]);
     const valid =
       id !== undefined &&
-      (type === "agent" ? id !== self && agentIds.has(id) : memberIds.has(id));
+      (type === "agent"
+        ? id !== self && (agentIds ??= normalizedIdSet(roster.agentIds)).has(id)
+        : (memberIds ??= normalizedIdSet(roster.memberIds)).has(id));
     if (!valid) return { ok: false, reason: "invalid-target" };
     uniqueTargets.add(`${type}:${id}`);
   }
