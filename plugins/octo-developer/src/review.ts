@@ -174,7 +174,7 @@ function reviewTimestamp(reviewItem: ReviewRecord): number {
 
 function latestDecisiveReviews(reviews: readonly ReviewRecord[]): Map<string, ReviewRecord> {
   const latest = new Map<string, ReviewRecord>();
-  reviews.forEach((reviewItem, index) => {
+  reviews.forEach(reviewItem => {
     if (reviewItem.state !== "APPROVED" && reviewItem.state !== "CHANGES_REQUESTED" && reviewItem.state !== "DISMISSED") return;
     const key = reviewerName(reviewItem);
     if (!key) return;
@@ -185,7 +185,8 @@ function latestDecisiveReviews(reviews: readonly ReviewRecord[]): Map<string, Re
     }
     const previousTime = reviewTimestamp(previous);
     const currentTime = reviewTimestamp(reviewItem);
-    if (currentTime > previousTime || (currentTime === previousTime && reviews.indexOf(previous) < index)) {
+    // The previous winner was visited earlier, so equal timestamps favor this entry.
+    if (currentTime >= previousTime) {
       latest.set(key, reviewItem);
     }
   });
