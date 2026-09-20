@@ -598,12 +598,14 @@ export function applyReviewEvent(items: Map<string, ReviewItem>, event: ReviewEv
 }
 
 export function restoreReviewItems(entries: readonly unknown[], onInvalid?: () => void): ReviewItem[] {
-  let items = new Map<string, ReviewItem>();
+  const items = new Map<string, ReviewItem>();
   for (const entry of entries) {
     if (!isRecord(entry) || entry.type !== "custom" || entry.customType !== REVIEW_CUSTOM_TYPE) continue;
     const event = parseReviewEvent(entry.data);
     if (event) {
-      items = applyReviewEvent(items, event);
+      // Parsed events are validated; this replay owns its map exclusively.
+      if (event.action === "delete") items.delete(event.id);
+      else items.set(event.item.id, event.item);
     } else {
       onInvalid?.();
     }
