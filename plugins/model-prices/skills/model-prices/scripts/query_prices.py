@@ -138,12 +138,14 @@ def litellm_entries(catalog: dict[str, Any]) -> Iterable[dict[str, Any]]:
         pricing = empty_core_pricing()
         extras: list[dict[str, str]] = []
         for field, raw_value in details.items():
+            if field not in LITELLM_CORE_FIELDS and "cost_per" not in field:
+                continue
             value = as_decimal(raw_value)
             if value is None:
                 continue
             if field in LITELLM_CORE_FIELDS:
                 pricing[LITELLM_CORE_FIELDS[field]] = price_item(field, value, "token")
-            elif "cost_per" in field:
+            else:
                 extras.append(price_item(field, value, litellm_unit(field)))
         search_prices = details.get("search_context_cost_per_query")
         if isinstance(search_prices, dict):
