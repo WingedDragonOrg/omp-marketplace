@@ -10,7 +10,7 @@ description: This skill should be used when initializing, reviewing, or repairin
 - `wt` 是单独安装的 Worktrunk CLI；`/wtm` 是 OMP 的 worktree 管理入口。
 - 本文所说的项目级 `wt.toml`，准确路径是 **`.config/wt.toml`**，不是仓库根目录下的 `wt.toml`。
 - WTM 当前只把稳定的 Worktrunk `v0.76.x` 当作增强后端。先用 `wt --version` 确认版本。
-- WTM 负责 worktree 生命周期和 merge handoff；Worktrunk 负责 hooks、路径模板、审批和 merge pipeline。
+- WTM 负责 worktree 生命周期和 `/move` handoff；Worktrunk 负责 hooks、路径模板、审批和 merge pipeline（含 source worktree 与 branch 清理）。
 - 没有兼容的 `wt` 时，创建、列表、删除、prune 仍可使用原生 Git；`/wtm merge` 需要 Worktrunk。
 
 ## 快速开始
@@ -345,9 +345,9 @@ server = "wt step tether -- npm run dev -- --port {{ branch | hash_port }}"
 3. 使用 `wt config approvals add` 审批项目 hooks。
 4. 运行 `/wtm <branch>` 创建或复用 worktree。
 5. 在 TUI 中提交 WTM 准备好的 `/move`，进入新 worktree。
-6. 开发完成后运行 `/wtm merge`；清理型 merge 会先准备安全落点和后续命令。
+6. 开发完成后运行 `/wtm merge`；它先用 `git merge-tree` 做冲突预检，再由 Worktrunk 完成 merge 与 source worktree/branch 清理，最后准备 `/move`。
 
-WTM 的 `/move` handoff 是 OMP session 迁移的一部分。创建 worktree 成功不等于当前 session 已经移动；必须提交生成的 `/move` 命令。
+WTM 的 `/move` handoff 是 OMP session 迁移的一部分。创建 worktree 成功不等于当前 session 已经移动；必须提交生成的 `/move` 命令。清理型 `/wtm merge` 删除 source worktree 后同样只准备 handoff，session 需要提交 `/move` 才离开已被删除的目录。
 
 ## 常见问题
 

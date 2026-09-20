@@ -55,9 +55,9 @@ WTM never changes the active OMP session directory directly. After create or reu
 
 In the TUI the command is placed in the editor. Press Enter to let OMP core relocate the session and refresh project settings, providers, plugins, skills, commands, terminal title, footer, and todos. On non-TUI surfaces WTM prints the same copyable command.
 
-For create/reuse and merge handoffs, the target is verified when WTM creates the handoff. If it is deleted or replaced before `/move` is submitted, rerun the original `/wtm` command to generate a current handoff. `rm self` verifies the primary before deleting its source, then prepares `/move` to that primary. Paths containing a line break or NUL are retained after creation but cannot be placed into a one-line slash command.
+For create/reuse handoffs, the target is verified when WTM creates the handoff. If it is deleted or replaced before `/move` is submitted, rerun the original `/wtm` command to generate a current handoff. `rm self` verifies the primary before deleting its source, then prepares `/move` to that primary; a cleanup-enabled merge verifies a landing worktree before the pipeline starts and prepares `/move` once Worktrunk removed the source. Paths containing a line break or NUL are retained after creation but cannot be placed into a one-line slash command.
 
-Generated merge continuation commands encode path, target, and ref values as JSON string tokens. This preserves spaces, double quotes, and backslashes. Manually entered unquoted tokens continue to work.
+Generated `/move` commands wrap the raw absolute path in outer double quotes and escape nothing, matching how OMP passes the `/move` argument through. `/wtm` itself accepts JSON string tokens, so `--source`, branch, and target values keep spaces, double quotes, and backslashes.
 
 ### Remove
 
@@ -98,15 +98,32 @@ The default Worktrunk pipeline:
 
 The target defaults to Worktrunk's detected default branch. WTM does not fetch before merge or push afterward. Commit messages come from existing commits, the user's Worktrunk generator, or Worktrunk's deterministic fallback.
 
-A cleanup-enabled merge from the current linked source is also two-step:
+#### Conflict pre-check
 
-1. WTM selects a live target worktree when available, otherwise the live primary worktree.
-2. It prepares `/move` and prints a complete `/wtm merge ... --source "<source-path>"` continuation without `-y`.
-3. After `/move`, run the continuation. WTM revalidates both worktrees, refs, dirty state, Git recovery state, approvals, and asks for confirmation before invoking Worktrunk.
+Worktrunk v0.76.x has no dry-run for `wt merge`, and a conflicting rebase stops with the rebase left open in the source worktree. Before Worktrunk starts, WTM replays the conflict-relevant steps with `git merge-tree`:
 
-`--no-remove`, a primary source, or a source branch equal to the target can run directly. An explicit `--source` can run from any other live worktree in the same repository.
+- the squashed change for the default pipeline;
+- every replayed commit for `--no-squash` and `--no-commit`, including uncommitted changes committed by `--stage all|tracked|none`;
+- the merge commit for `--no-rebase --no-ff`;
+- nothing for `--no-rebase` without `--no-ff`, because a fast-forward cannot conflict.
 
-After every merge attempt, WTM reconciles the target ref, source worktree registration, source branch, and source path. A failed or incompatible Worktrunk result never triggers native Git mutation. Resolve or abort an active rebase, merge, cherry-pick, or revert before retrying. When the target already contains the source but cleanup remains, inspect `wt config state logs` and finish cleanup with native Worktrunk rather than replaying the merge pipeline.
+Worktrunk reports `Already up to date` — and merges without replaying anything — only while the measurement base is an ancestor of the source with no merge commit in between, so a source that merged the target or a side branch still replays its commits and the pre-check follows that. The measurement base is the target branch, or its fetched upstream when the target lags that upstream and the source is based on it. A target that kept its own commits while its upstream gained others cannot fast-forward, so a source based on that upstream is refused before Worktrunk starts, matching Worktrunk's own refusal.
+
+The replay runs in a sandboxed object store (`GIT_OBJECT_DIRECTORY` plus a private copy of the index, so staged content takes part without the real index being written), leaving refs, index, worktree, and object database untouched. A predicted conflict stops with the conflicting files named, and Worktrunk is not started. States the pre-check cannot verify — a missing merge base, `--no-commit` with a dirty source, or a Git older than 2.38 — stop before Worktrunk and report the reason. `wt merge <target>` remains available to run the pipeline without the pre-check.
+
+#### One-invocation merge
+
+A cleanup-enabled merge runs the whole Worktrunk pipeline from the source worktree and lets Worktrunk remove the source worktree and branch. It finishes by preparing `/move` to a live landing worktree, so the session leaves the deleted directory without a second `/wtm` invocation:
+
+1. WTM picks a landing worktree: the live target worktree, otherwise Worktrunk's primary, otherwise the main worktree from Git's worktree list. No usable landing stops the command before Worktrunk starts, as does a landing path that cannot be represented as one `/move` command.
+2. Approvals, the conflict pre-check, and the confirmation summary run before Worktrunk starts.
+3. Worktrunk performs commit, squash, rebase, validation, merge, and cleanup.
+4. WTM reconciles the target ref, source worktree registration, source branch, and source path from the landing worktree, so reconciliation never runs in the deleted source.
+5. When the source worktree is gone, or Worktrunk reports `removed=true`, WTM prepares `/move "<landing-path>"`.
+
+`--no-remove`, a primary source, or a source branch equal to the target keep the session where it is. An explicit `--source` can name any live branch worktree of the same repository, including the one the session occupies.
+
+After every merge attempt, WTM reconciles the target ref, source worktree registration, source branch, and source path. A failed or incompatible Worktrunk result never triggers native Git mutation. Resolve or abort an active rebase, merge, cherry-pick, or revert before retrying.
 
 ## Project command approvals
 

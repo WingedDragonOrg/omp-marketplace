@@ -5,17 +5,19 @@
 // retain a native Git fallback; merge requires Worktrunk.
 //
 // OMP owns session migration through its built-in `/move`. Worktrunk owns Git
-// lifecycle operations. Cleanup-enabled merge prepares a verified safe landing
-// and an explicit continuation command; self removal deletes its source first,
-// then prepares a `/move` handoff.
+// lifecycle operations. A cleanup-enabled merge runs the whole Worktrunk pipeline
+// in one invocation — Worktrunk removes the source worktree and branch — and then
+// prepares a `/move` handoff; self removal deletes its source first, then prepares
+// the handoff. Merge pre-checks conflicts in a sandboxed object store, so a
+// conflicting source stops before Worktrunk touches the repository.
 //
 // `OMP_WORKTREE_DIR` overrides Worktrunk's configured path for new worktrees
 // while preserving the historical <repo>-<name> layout.
 
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import * as path from "node:path";
-import { homedir } from "node:os";
-import { accessSync, constants, existsSync, realpathSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { accessSync, constants, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from "node:fs";
 
 const HELP = `Usage:
   /wtm init                        ask the agent to initialize .config/wt.toml
@@ -32,10 +34,16 @@ Merge flags:
   --stage all|tracked|none  --source <path>  -y
 
 Handoff:
-  Create/reuse and cleanup-enabled merge operations prepare /move.
-  Self removal deletes the current worktree, then prepares /move to primary.
-  Submit /move for the prepared handoff. Merge continuations still require
-  a second /wtm invocation. -y skips only the current confirmation.
+  Create/reuse prepares /move. A cleanup-enabled merge runs the pipeline, lets
+  Worktrunk remove the source worktree and branch, then prepares /move to a live
+  landing worktree. Self removal deletes the current worktree, then prepares
+  /move to primary. Submit /move to apply a prepared handoff. -y skips only the
+  current confirmation.
+
+Conflict pre-check:
+  Merge first verifies the integration in a sandboxed object store. A conflicting
+  squash, rebase, or merge commit stops before Worktrunk runs; refs, index, and
+  worktree stay unchanged.
 
 Backend:
   Stable Worktrunk v0.76.x releases provide paths, lifecycle hooks, approvals, and merge.
@@ -127,9 +135,15 @@ function worktreeBaseDir(): string {
 
 interface CommandResult { code: number; out: string; err: string }
 
-function runCommand(cwd: string, command: string[]): CommandResult {
+function runCommand(cwd: string, command: string[], env?: Record<string, string>): CommandResult {
   try {
-    const proc = Bun.spawnSync(command, { cwd, env: process.env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawnSync(command, {
+      cwd,
+      env: env ? { ...process.env, ...env } : process.env,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
     return {
       code: proc.exitCode ?? -1,
       out: new TextDecoder().decode(proc.stdout),
@@ -615,17 +629,6 @@ function parseMergeArguments(args: string[]): MergeArgumentParse {
   return { kind: "ok", options };
 }
 
-function buildMergeContinuation(target: string, options: MergeOptions, sourcePath: string): string {
-  const args = [`/wtm merge`, JSON.stringify(target)];
-  if (options.noSquash) args.push("--no-squash");
-  if (options.noCommit) args.push("--no-commit");
-  if (options.noRebase) args.push("--no-rebase");
-  if (options.noRemove) args.push("--no-remove");
-  if (options.noFf) args.push("--no-ff");
-  args.push("--stage", options.stage, "--source", JSON.stringify(sourcePath));
-  return args.join(" ");
-}
-
 function activeGitOperation(cwd: string): string | null {
   const statePaths: Array<[string, string]> = [
     ["rebase-merge", "rebase"],
@@ -643,6 +646,263 @@ function activeGitOperation(cwd: string): string | null {
     return "merge conflict";
   }
   return null;
+}
+
+// ---- merge conflict pre-check ----
+//
+// Worktrunk v0.76.x has no dry-run for `wt merge`, and a conflicting rebase stops with the
+// rebase left open in the source worktree. WTM therefore replays the conflict-relevant parts
+// of the pipeline — commit, squash, rebase, and the --no-ff merge commit — with
+// `git merge-tree` in a sandboxed object store: a conflicting source is reported before
+// Worktrunk starts, and the repository keeps its refs, index, and worktree.
+
+const TREE_OID = /^[0-9a-f]{40,64}$/;
+const MERGE_TREE_REQUIREMENT = "merge-tree --write-tree needs git 2.38 or newer";
+
+interface SandboxedGit {
+  directory: string;
+  env: Record<string, string>;
+}
+
+/** Redirect object writes and index reads so the pre-check cannot modify the repository. */
+function createSandboxedGit(cwd: string): SandboxedGit | null {
+  const objects = runGit(cwd, ["rev-parse", "--path-format=absolute", "--git-path", "objects"]);
+  const index = runGit(cwd, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+  if (objects.code !== 0 || index.code !== 0) return null;
+  try {
+    const directory = mkdtempSync(path.join(tmpdir(), "wtm-merge-check-"));
+    const sandboxObjects = path.join(directory, "objects");
+    mkdirSync(sandboxObjects);
+    const sandboxIndex = path.join(directory, "index");
+    const indexPath = stripLineEnding(index.out);
+    // Worktrunk stages into the real index and reads its already-staged content, so the
+    // pre-check works on a copy: every later git add/write-tree touches only the copy.
+    copyFileSync(indexPath, sandboxIndex);
+    const indexDirectory = path.dirname(indexPath);
+    for (const name of readdirSync(indexDirectory)) {
+      if (name.startsWith("sharedindex.")) copyFileSync(path.join(indexDirectory, name), path.join(directory, name));
+    }
+    return {
+      directory,
+      env: {
+        GIT_OBJECT_DIRECTORY: sandboxObjects,
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: stripLineEnding(objects.out),
+        GIT_INDEX_FILE: sandboxIndex,
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+type MergeTreeProbe =
+  | { kind: "clean"; tree: string; paths: string[] }
+  | { kind: "conflict"; tree: string; paths: string[] }
+  | { kind: "unavailable"; detail: string };
+
+function mergeTreeConflictPaths(out: string): string[] {
+  const paths = new Set<string>();
+  for (const line of out.split("\n")) {
+    const match = /^\d{6,7} [0-9a-f]{40,64} [123]\t(.+)$/.exec(line);
+    if (match) paths.add(match[1]);
+  }
+  return [...paths];
+}
+
+/** Three-way merge in the object store; exit code 1 means conflicts, and nothing is checked out. */
+function probeMergeTree(
+  cwd: string,
+  env: Record<string, string>,
+  base: string,
+  ours: string,
+  theirs: string,
+): MergeTreeProbe {
+  const result = runCommand(cwd, ["git", "merge-tree", "--write-tree", `--merge-base=${base}`, ours, theirs], env);
+  const tree = result.out.split("\n")[0].trim();
+  if (result.code === 0 && TREE_OID.test(tree)) return { kind: "clean", tree, paths: [] };
+  if (result.code === 1 && TREE_OID.test(tree)) {
+    return { kind: "conflict", tree, paths: mergeTreeConflictPaths(result.out) };
+  }
+  const detail = result.err.split("\n").map((line) => line.trim()).filter(Boolean)[0] ?? `exit ${result.code}`;
+  return { kind: "unavailable", detail };
+}
+
+type IntegrationContent =
+  | { kind: "ok"; tree: string }
+  | { kind: "unavailable"; detail: string };
+
+/** Content Worktrunk would integrate: the index copy plus what `--stage` commits. */
+function integrationContent(
+  cwd: string,
+  sandbox: SandboxedGit,
+  stage: MergeStage,
+  dirty: boolean,
+  sourceTip: string,
+): IntegrationContent {
+  if (!dirty) return { kind: "ok", tree: `${sourceTip}^{tree}` };
+  if (stage !== "none") {
+    // The copy already carries what the user staged; Worktrunk adds untracked files and
+    // unstaged tracked changes for `all`, and tracked changes only for `tracked`.
+    const staged = runCommand(cwd, ["git", "add", stage === "all" ? "-A" : "-u"], sandbox.env);
+    if (staged.code !== 0) {
+      return { kind: "unavailable", detail: `cannot stage the working tree (${staged.err.trim() || `exit ${staged.code}`})` };
+    }
+  }
+  const written = runCommand(cwd, ["git", "write-tree"], sandbox.env);
+  const tree = written.out.trim();
+  if (written.code !== 0 || !TREE_OID.test(tree)) {
+    return { kind: "unavailable", detail: `cannot read the staged tree (${written.err.trim() || `exit ${written.code}`})` };
+  }
+  return { kind: "ok", tree };
+}
+
+interface IntegrationStep {
+  base: string;
+  theirs: string;
+  label: string;
+  clean: string;
+}
+
+type MergePreCheck =
+  | { kind: "clean"; detail: string }
+  | { kind: "conflict"; detail: string }
+  | { kind: "blocked"; detail: string };
+
+function isAncestor(cwd: string, ancestor: string, descendant: string): boolean {
+  return runGit(cwd, ["merge-base", "--is-ancestor", ancestor, descendant]).code === 0;
+}
+
+interface TargetUpstream {
+  label: string;
+  tip: string;
+}
+
+/** The fetched upstream of the target branch, which Worktrunk measures a lagging target against. */
+function resolveTargetUpstream(cwd: string, target: string): TargetUpstream | null {
+  const label = runGit(cwd, ["rev-parse", "--abbrev-ref", `${target}@{upstream}`]);
+  if (label.code !== 0) return null;
+  const labelText = stripLineEnding(label.out);
+  const tip = runGit(cwd, ["rev-parse", "--verify", `${labelText}^{commit}`]);
+  if (tip.code !== 0) return null;
+  return { label: labelText, tip: stripLineEnding(tip.out) };
+}
+
+function checkMergeIntegration(
+  sourcePath: string,
+  sourceBranch: string,
+  target: string,
+  options: MergeOptions,
+  statusLines: string[],
+): MergePreCheck {
+  if (sourceBranch === target) return { kind: "clean", detail: "source branch is the merge target" };
+  const head = runGit(sourcePath, ["rev-parse", "HEAD^{commit}"]);
+  const targetRef = runGit(sourcePath, ["rev-parse", "--verify", `refs/heads/${target}^{commit}`]);
+  if (head.code !== 0 || targetRef.code !== 0) {
+    return { kind: "blocked", detail: "cannot resolve the source and target commits" };
+  }
+  const sourceTip = stripLineEnding(head.out);
+  const targetTip = stripLineEnding(targetRef.out);
+  const dirty = statusLines.length > 0;
+  if (options.noCommit && dirty) return { kind: "blocked", detail: "--no-commit requires a clean working tree" };
+
+  // Worktrunk targets the local branch ref and never fetches. The squash and rebase steps measure
+  // against the fetched upstream when the target lags it and the source is based on it; the commit
+  // and plain merge steps do not. A target that kept its own commits while its upstream gained
+  // others cannot fast-forward, so a source based on that newer upstream tip is refused.
+  const measures = !options.noRebase || (!options.noSquash && !options.noCommit);
+  const upstream = measures ? resolveTargetUpstream(sourcePath, target) : null;
+  const targetBehindUpstream = upstream !== null && isAncestor(sourcePath, targetTip, upstream.tip);
+  const sourceOnUpstream = upstream !== null && isAncestor(sourcePath, upstream.tip, sourceTip);
+  if (upstream && sourceOnUpstream && !targetBehindUpstream && !isAncestor(sourcePath, upstream.tip, targetTip)) {
+    return {
+      kind: "blocked",
+      detail: `${target} has diverged from ${upstream.label} and cannot fast-forward a branch based on it`,
+    };
+  }
+  const measured = upstream !== null && targetBehindUpstream && sourceOnUpstream ? upstream : null;
+  const base = measured ? measured.tip : targetTip;
+  const against = measured ? ` (measured against ${measured.label})` : "";
+  // Without a rebase the target must fast-forward to the source tip, which cannot conflict.
+  if (options.noRebase && !options.noFf) return { kind: "clean", detail: "fast-forward only" };
+  const mergeBaseResult = runGit(sourcePath, ["merge-base", base, sourceTip]);
+  if (mergeBaseResult.code !== 0) {
+    return { kind: "blocked", detail: `no merge base between ${sourceBranch} and ${target}` };
+  }
+  const mergeBase = stripLineEnding(mergeBaseResult.out);
+
+  // Worktrunk reports "Already up to date" — and the final step is a plain fast-forward — only
+  // while the measurement base is an ancestor of the source with no merge commit in between. A
+  // source that merged the target or a side branch still replays its commits.
+  const mergesBetween = runGit(sourcePath, ["rev-list", "--merges", "--count", `${base}..${sourceTip}`]);
+  if (
+    isAncestor(sourcePath, base, sourceTip) &&
+    mergesBetween.code === 0 &&
+    mergesBetween.out.trim() === "0"
+  ) {
+    return { kind: "clean", detail: `nothing to replay (${sourceBranch} already contains ${measured ? measured.label : target})` };
+  }
+
+  const sandbox = createSandboxedGit(sourcePath);
+  if (!sandbox) return { kind: "blocked", detail: "cannot prepare an isolated Git object store" };
+  try {
+    const content = integrationContent(sourcePath, sandbox, options.stage, dirty, sourceTip);
+    if (content.kind === "unavailable") return { kind: "blocked", detail: content.detail };
+
+    const steps: IntegrationStep[] = [];
+    if (options.noRebase) {
+      // Without a rebase the graph from the earlier steps is preserved, so a merge commit simply
+      // merges the source content into the target.
+      steps.push({
+        base: mergeBase,
+        theirs: content.tree,
+        label: " in the merge commit",
+        clean: "the merge commit applies cleanly",
+      });
+    } else if (options.noCommit || options.noSquash) {
+      // Preserved history is replayed commit by commit, like a rebase without merge commits.
+      const replay = runGit(sourcePath, ["log", "--reverse", "--no-merges", "--format=%H%x09%h %s", `${base}..${sourceTip}`]);
+      if (replay.code !== 0) return { kind: "blocked", detail: "cannot list the commits to replay" };
+      for (const line of replay.out.split("\n").filter(Boolean)) {
+        const [commit, subject] = line.split("\t");
+        steps.push({
+          base: `${commit}^`,
+          theirs: `${commit}^{tree}`,
+          label: ` while replaying ${subject ?? commit}`,
+          clean: `${steps.length + 1} commits replay cleanly`,
+        });
+      }
+      if (!options.noCommit && dirty) {
+        steps.push({
+          base: `${sourceTip}^{tree}`,
+          theirs: content.tree,
+          label: " while committing uncommitted changes",
+          clean: `${steps.length + 1} commits replay cleanly`,
+        });
+      }
+    } else {
+      steps.push({
+        base: mergeBase,
+        theirs: content.tree,
+        label: "",
+        clean: "the squashed change applies cleanly",
+      });
+    }
+
+    if (steps.length === 0) return { kind: "clean", detail: "nothing to replay" };
+    let ours = `${base}^{tree}`;
+    for (const step of steps) {
+      const probe = probeMergeTree(sourcePath, sandbox.env, step.base, ours, step.theirs);
+      if (probe.kind === "unavailable") return { kind: "blocked", detail: `${probe.detail} (${MERGE_TREE_REQUIREMENT})` };
+      if (probe.kind === "conflict") {
+        const files = probe.paths.length > 0 ? `: ${probe.paths.slice(0, 3).join(", ")}` : "";
+        return { kind: "conflict", detail: `${sourceBranch} into ${target} would conflict${step.label}${files}${against}` };
+      }
+      ours = probe.tree;
+    }
+    return { kind: "clean", detail: `${steps[steps.length - 1].clean}${against}` };
+  } finally {
+    rmSync(sandbox.directory, { recursive: true, force: true });
+  }
 }
 
 interface WorktrunkMergeResult {
@@ -826,7 +1086,7 @@ export default function (pi: ExtensionAPI) {
         try { ui.notify(text, level); } catch { console.error(text); }
       };
 
-      const prepareMoveHandoff = (destination: string, continuation?: string): boolean => {
+      const prepareMoveHandoff = (destination: string): boolean => {
         const resolvedDestination = canonicalPath(destination);
         const command = buildMoveCommand(resolvedDestination);
         if (!command) {
@@ -843,14 +1103,13 @@ export default function (pi: ExtensionAPI) {
             // The notification below remains a copyable handoff.
           }
         }
-        const lines = [
-          `Worktree ready at ${shortPath(resolvedDestination)}; the move command is ready:`,
-          `  ${command}`,
-        ];
-        if (continuation) {
-          lines.push("After /move succeeds, run:", `  ${continuation}`);
-        }
-        notify(lines.join("\n"), "info");
+        notify(
+          [
+            `Worktree ready at ${shortPath(resolvedDestination)}; the move command is ready:`,
+            `  ${command}`,
+          ].join("\n"),
+          "info",
+        );
         return true;
       };
 
@@ -983,30 +1242,39 @@ export default function (pi: ExtensionAPI) {
         const sourceIsPrimary = primaryPath ? canonicalPath(primaryPath) === sourceCanonical : false;
         const cleanupCanRemoveSource = !options.noRemove && !sourceIsPrimary && source.branch !== target;
         const statusLines = runGit(sourcePath, ["status", "--porcelain"]).out.split("\n").filter(Boolean);
+        const sessionIsSource = currentCanonical === sourceCanonical;
+        // Cleanup deletes the directory this session may live in, so every command after the
+        // pipeline starts — and the /move handoff — uses a landing worktree, never the source.
+        // `git worktree list` reports the main worktree first; that ordering is the fallback
+        // when Worktrunk metadata is missing or points at another repository.
+        const mainWorktree = registered[0];
+        const landingPath = targetWorktree?.path ??
+          (primaryPath && canonicalPath(primaryPath) !== sourceCanonical ? primaryPath : null) ??
+          (mainWorktree &&
+          canonicalPath(mainWorktree.path) !== sourceCanonical &&
+          isLiveWorktree(mainWorktree, currentRepositoryIdentity)
+            ? mainWorktree.path
+            : null);
+        const executionCwd = landingPath ?? currentPath;
 
-        if (
-          cleanupCanRemoveSource &&
-          statusLines.length === 0 &&
-          runGit(currentPath, ["merge-base", "--is-ancestor", sourceBefore, targetBefore]).code === 0
-        ) {
-          notify(
-            `Worktrunk integration is already complete for ${source.branch} -> ${target}, but source cleanup remains. ` +
-            "The merge pipeline was not replayed. Inspect `wt config state logs`, then finish cleanup with native Worktrunk.",
-            "warning",
-          );
-          return;
-        }
-
-        if (cleanupCanRemoveSource && currentCanonical === sourceCanonical) {
-          const safePath = targetWorktree?.path ??
-            (primaryPath && canonicalPath(primaryPath) !== sourceCanonical ? primaryPath : null);
-          if (!safePath) {
-            notify("Cannot find a registered safe landing outside the source worktree; repository unchanged.", "error");
+        // Cleanup deletes the session's own directory, so it only starts once a landing
+        // worktree can be represented as one /move command.
+        if (sessionIsSource && cleanupCanRemoveSource) {
+          if (!landingPath) {
+            notify(
+              "Cannot find a live landing worktree for /move; repository unchanged. " +
+              "Run /wtm merge from another worktree, or keep the source with --no-remove.",
+              "error",
+            );
             return;
           }
-          const continuation = buildMergeContinuation(target, options, sourceCanonical);
-          prepareMoveHandoff(safePath, continuation);
-          return;
+          if (!buildMoveCommand(canonicalPath(landingPath))) {
+            notify(
+              `Landing worktree ${shortPath(landingPath)} contains a line break or NUL and cannot be represented as one /move command; repository unchanged.`,
+              "error",
+            );
+            return;
+          }
         }
 
         const approvalPhases = ["pre-merge", "post-merge"];
@@ -1026,6 +1294,19 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
+        const preCheck = checkMergeIntegration(sourcePath, source.branch, target, options, statusLines);
+        if (preCheck.kind !== "clean") {
+          notify(
+            preCheck.kind === "conflict"
+              ? `Conflict pre-check: ${preCheck.detail}. Worktrunk was not started; refs, index, and worktree are unchanged. ` +
+                `Rebase ${source.branch} onto ${target} or resolve the overlap and retry; \`wt merge ${target}\` runs the pipeline without this pre-check.`
+              : `Conflict pre-check blocked ${source.branch} into ${target}: ${preCheck.detail}. Worktrunk was not started; refs, index, and worktree are unchanged. ` +
+                `Commit or clean the source and retry; \`wt merge ${target}\` runs the pipeline without this pre-check.`,
+            "error",
+          );
+          return;
+        }
+
         const staged = statusLines.filter((line) => line[0] !== " " && line[0] !== "?").length;
         const unstaged = statusLines.filter((line) => line[1] !== " " && line[0] !== "?").length;
         const untracked = statusLines.filter((line) => line.startsWith("??")).length;
@@ -1042,6 +1323,7 @@ export default function (pi: ExtensionAPI) {
             `Rebase: ${options.noRebase ? "disabled" : "enabled"}`,
             `Fast-forward: ${options.noFf ? "merge commit" : "required"}`,
             `Cleanup: ${options.noRemove ? "disabled" : cleanupCanRemoveSource ? "enabled" : "preserved by Worktrunk"}`,
+            `Conflicts: none (${preCheck.detail})`,
             "Message: existing commits, configured Worktrunk generator, or deterministic fallback",
           ].join("\n");
           const confirmed = ctx.hasUI ? await ui.confirm("Merge worktree", summary) : true;
@@ -1059,18 +1341,18 @@ export default function (pi: ExtensionAPI) {
         if (options.noFf) mergeArgs.push("--no-ff");
         mergeArgs.push("--format=json", "-C", sourcePath);
 
-        const result = runWorktrunk(backend, currentPath, mergeArgs);
+        const result = runWorktrunk(backend, executionCwd, mergeArgs);
         const parsed = result.code === 0 ? parseWorktrunkMerge(result.out) : null;
         const compatibleResult = parsed && parsed.branch === source.branch && parsed.target === target
           ? parsed
           : null;
-        const targetAfter = branchOid(currentPath, target);
+        const targetAfter = branchOid(executionCwd, target);
         const targetState = targetAfter === null
           ? "absent or unreadable"
           : targetAfter !== targetBefore ? "updated" : "unchanged";
-        const afterEntries = listPorcelain(currentPath);
+        const afterEntries = listPorcelain(executionCwd);
         const sourceRegistered = afterEntries.some((entry) => canonicalPath(entry.path) === sourceCanonical);
-        const sourceBranchPresent = branchOid(currentPath, source.branch) !== null;
+        const sourceBranchPresent = branchOid(executionCwd, source.branch) !== null;
         const sourcePathPresent = existsSync(sourcePath);
         const cleanup = result.code === 0 && compatibleResult?.removed
           ? "cleanup scheduled"
@@ -1082,11 +1364,21 @@ export default function (pi: ExtensionAPI) {
           `source path ${sourcePathPresent ? "present" : "absent"}`,
           cleanup,
         ].join("; ");
-        const session = primaryPath && canonicalPath(primaryPath) === currentCanonical
-          ? `Session remains at primary safe landing ${shortPath(currentPath)}; primary branch may differ from merge target ${target}.`
-          : current.branch === target
-            ? `Session remains at target worktree ${shortPath(currentPath)}.`
-            : `Session remains at safe worktree ${shortPath(currentPath)}.`;
+        const sourceRemoved = !sourceRegistered && !sourcePathPresent;
+        // A cleanup-enabled merge owns the source worktree and branch; the session only needs
+        // /move once that directory is gone (or Worktrunk reports the removal as scheduled).
+        const strandSession = sessionIsSource && (sourceRemoved || (compatibleResult?.removed === true && cleanupCanRemoveSource));
+        const session = sessionIsSource
+          ? strandSession
+            ? sourceRemoved
+              ? `Source worktree ${shortPath(sourcePath)} was removed with its branch.`
+              : `Worktrunk cleanup is scheduled; source worktree ${shortPath(sourcePath)} may still be removed.`
+            : `Session remains at source worktree ${shortPath(sourcePath)}.`
+          : primaryPath && canonicalPath(primaryPath) === currentCanonical
+            ? `Session remains at primary worktree ${shortPath(currentPath)}; primary branch may differ from merge target ${target}.`
+            : current.branch === target
+              ? `Session remains at target worktree ${shortPath(currentPath)}.`
+              : `Session remains at safe worktree ${shortPath(currentPath)}.`;
 
         if (result.code !== 0) {
           notify(
@@ -1101,6 +1393,13 @@ export default function (pi: ExtensionAPI) {
         } else {
           notify(`Worktrunk merge completed: ${state}. ${session}`, "info");
           reportWorktrunkStderr(notify, result.err);
+        }
+        if (strandSession) {
+          if (landingPath) prepareMoveHandoff(landingPath);
+          else notify(
+            `No live worktree remains for a /move handoff; restart the session from another worktree of this repository.`,
+            "error",
+          );
         }
         return;
       }

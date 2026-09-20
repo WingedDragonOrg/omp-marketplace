@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 
@@ -133,6 +133,29 @@ function initMergeSource(root: string, branch = "feature"): { repo: string; sour
   git(source, ["add", `${branch}.txt`]);
   git(source, ["commit", "-m", `add ${branch}`]);
   return { repo, source };
+}
+
+/** Point refs/remotes/origin/<target> at a commit and make <target> track it, so `@{upstream}` resolves. */
+function trackUpstream(root: string, repo: string, target: string, tip: string): void {
+  git(repo, ["update-ref", `refs/remotes/origin/${target}`, tip]);
+  git(repo, ["config", "remote.origin.url", path.join(root, "origin.git")]);
+  git(repo, ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+  git(repo, ["config", `branch.${target}.remote`, "origin"]);
+  git(repo, ["config", `branch.${target}.merge`, `refs/heads/${target}`]);
+}
+
+/** Count object files so a test can prove a read-only check wrote nothing into the repository. */
+function objectCount(cwd: string): number {
+  const objects = git(cwd, ["rev-parse", "--path-format=absolute", "--git-path", "objects"]);
+  let count = 0;
+  const walk = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (entry.isDirectory()) walk(path.join(directory, entry.name));
+      else count++;
+    }
+  };
+  walk(objects);
+  return count;
 }
 
 function makeHarness(cwd: string): Harness {
@@ -947,7 +970,7 @@ describe("/wtm Worktrunk removal", () => {
   });
 
   test("decodes a JSON string selector for a special-character path", async () => {
-    // Catches splitting a generated continuation command on whitespace or escape characters.
+    // Catches splitting a JSON string token on whitespace or escape characters.
     const root = tempRoot();
     const repo = initRepo(root);
     const target = path.join(root, `topic "quoted" \\ path`);
@@ -1178,36 +1201,49 @@ describe("/wtm Worktrunk approvals and hooks", () => {
 });
 
 describe("/wtm Worktrunk merge", () => {
-  test("prepares a safe landing and stateless merge continuation", async () => {
-    // Catches running approvals, confirmation, or Worktrunk before OMP moves off the removable source.
+  test("merges and cleans up the current linked source in one invocation", async () => {
+    // Catches the retired two-step flow that moved the session off the source before Worktrunk ran.
     const root = tempRoot();
     const { repo, source } = initMergeSource(root);
-    const refsBefore = git(repo, ["show-ref"]);
+    const sourceHead = git(source, ["rev-parse", "HEAD"]);
     const log = installFakeWorktrunk(root, {
       list: worktrunkListFixture("main", [
         { branch: "main", path: repo, main: true, current: false },
         { branch: "feature", path: source, main: false, current: true },
       ]),
+      mergeResult: {
+        branch: "feature",
+        committed: false,
+        rebased: false,
+        removed: true,
+        squashed: false,
+        target: "main",
+      },
+      mergeUpdateTarget: true,
+      mergeRemoveSource: true,
+      mergeDeleteSourceBranch: true,
+      mergePrimary: repo,
+      mergeTarget: "main",
     });
     const harness = makeHarness(source);
 
     await harness.handler("merge main --no-ff --stage tracked -y", harness.ctx);
 
-    expect(git(repo, ["show-ref"])).toBe(refsBefore);
+    const mergeCall = fakeCalls(log).find((args) => args.includes("merge"));
+    expect(mergeCall).toContain("--format=json");
+    expect(mergeCall).toContain("--no-ff");
+    expect(mergeCall).toContain("tracked");
+    expect(git(repo, ["rev-parse", "main"])).toBe(sourceHead);
+    expect(existsSync(source)).toBe(false);
+    expect(runGitBranchExists(repo, "feature")).toBe(false);
+    expect(harness.confirmations).toEqual([]);
+    expect(harness.notices.some(({ text }) => text.includes("Worktrunk merge completed"))).toBe(true);
     expect(harness.editorTexts).toEqual([`/move "${repo}"`]);
     expect(harness.moves).toEqual([]);
     expect(harness.reloads).toBe(0);
-    expect(harness.confirmations).toEqual([]);
-    expect(fakeCalls(log).some((args) => args.includes("approvals") || args.includes("merge"))).toBe(false);
-    const continuation = harness.notices.find(({ text }) => text.includes("/wtm merge"))?.text ?? "";
-    expect(continuation).toContain(`/wtm merge "main"`);
-    expect(continuation).toContain("--no-ff");
-    expect(continuation).toContain("--stage tracked");
-    expect(continuation).toContain(`--source ${JSON.stringify(source)}`);
-    expect(continuation).not.toContain(" -y");
   });
 
-  test("executes an explicit source from the safe worktree with fresh confirmation", async () => {
+  test("executes an explicit source from another worktree with fresh confirmation", async () => {
     // Catches ignoring --source or carrying the preparation-stage confirmation skip into execution.
     const root = tempRoot();
     const { repo, source } = initMergeSource(root);
@@ -1292,8 +1328,8 @@ describe("/wtm Worktrunk merge", () => {
     )).toBe(true);
   });
 
-  test("does not replay integration when target already contains source", async () => {
-    // Catches rerunning commit, rebase, or fast-forward after cleanup alone was left incomplete.
+  test("runs the pipeline when the target already contains the source", async () => {
+    // Catches stopping at "integration is already complete" instead of letting Worktrunk clean up.
     const root = tempRoot();
     const { repo, source } = initMergeSource(root);
     git(repo, ["merge", "--ff-only", "feature"]);
@@ -1302,16 +1338,27 @@ describe("/wtm Worktrunk merge", () => {
         { branch: "main", path: repo, main: true, current: true },
         { branch: "feature", path: source, main: false, current: false },
       ]),
+      mergeResult: {
+        branch: "feature",
+        committed: false,
+        rebased: false,
+        removed: true,
+        squashed: false,
+        target: "main",
+      },
+      mergeRemoveSource: true,
+      mergeDeleteSourceBranch: true,
+      mergePrimary: repo,
+      mergeTarget: "main",
     });
     const harness = makeHarness(repo);
 
-    await harness.handler(`merge --source ${JSON.stringify(source)}`, harness.ctx);
+    await harness.handler(`merge --source ${JSON.stringify(source)} -y`, harness.ctx);
 
-    expect(fakeCalls(log).some((args) => args.includes("approvals") || args.includes("merge"))).toBe(false);
-    expect(harness.notices.some(({ text, level }) =>
-      level === "warning" && text.includes("integration is already complete") && text.includes("wt config state logs")
-    )).toBe(true);
-    expect(existsSync(source)).toBe(true);
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(true);
+    expect(existsSync(source)).toBe(false);
+    expect(runGitBranchExists(repo, "feature")).toBe(false);
+    expect(harness.notices.some(({ level }) => level === "error")).toBe(false);
   });
 
   test("starts a new merge when an integrated source has uncommitted changes", async () => {
@@ -1388,8 +1435,8 @@ describe("/wtm Worktrunk merge", () => {
     )).toBe(true);
   });
 
-  test("reissues a safe handoff when explicit source is still current", async () => {
-    // Catches treating --source as permission to delete the worktree occupied by the session.
+  test("merges when --source names the worktree the session occupies", async () => {
+    // Catches treating --source as permission to defer the merge instead of running it.
     const root = tempRoot();
     const { repo, source } = initMergeSource(root);
     const log = installFakeWorktrunk(root, {
@@ -1397,16 +1444,28 @@ describe("/wtm Worktrunk merge", () => {
         { branch: "main", path: repo, main: true, current: false },
         { branch: "feature", path: source, main: false, current: true },
       ]),
+      mergeResult: {
+        branch: "feature",
+        committed: false,
+        rebased: false,
+        removed: true,
+        squashed: false,
+        target: "main",
+      },
+      mergeUpdateTarget: true,
+      mergeRemoveSource: true,
+      mergeDeleteSourceBranch: true,
+      mergePrimary: repo,
+      mergeTarget: "main",
     });
     const harness = makeHarness(source);
 
     await harness.handler(`merge -y --source ${JSON.stringify(source)}`, harness.ctx);
 
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(true);
+    expect(existsSync(source)).toBe(false);
     expect(harness.editorTexts).toEqual([`/move "${repo}"`]);
-    expect(fakeCalls(log).some((args) => args.includes("approvals") || args.includes("merge"))).toBe(false);
-    const continuation = harness.notices.find(({ text }) => text.includes("/wtm merge"))?.text ?? "";
-    expect(continuation).toContain(`--source ${JSON.stringify(source)}`);
-    expect(continuation).not.toContain(" -y");
+    expect(harness.notices.at(-1)?.text).toContain("move command is ready");
   });
 
   test("runs directly when the primary source is also the target branch", async () => {
@@ -1502,6 +1561,7 @@ describe("/wtm Worktrunk merge", () => {
     expect(summary).toContain("Squash: enabled");
     expect(summary).toContain("Rebase: enabled");
     expect(summary).toContain("Cleanup: disabled");
+    expect(summary).toContain("Conflicts: none");
     expect(summary).toContain("Message:");
   });
 
@@ -1534,31 +1594,41 @@ describe("/wtm Worktrunk merge", () => {
     expect(harness.confirmations[0].message).toContain("Commit: disabled");
     expect(harness.confirmations[0].message).toContain("Squash: disabled");
   });
-  test("prefers a registered target worktree for the move handoff", async () => {
-    // Catches preparing an unrelated primary when the target branch already has a live checkout.
+  test("moves the session to the target worktree after cleanup", async () => {
+    // Catches preparing a handoff before the merge or ignoring the live target checkout.
     const root = tempRoot();
     const { repo, source } = initMergeSource(root);
     const targetPath = path.join(root, "develop");
     git(repo, ["worktree", "add", "-b", "develop", targetPath]);
-    installFakeWorktrunk(root, {
+    const log = installFakeWorktrunk(root, {
       list: worktrunkListFixture("main", [
         { branch: "main", path: repo, main: true, current: false },
         { branch: "feature", path: source, main: false, current: true },
         { branch: "develop", path: targetPath, main: false, current: false },
       ]),
+      mergeResult: {
+        branch: "feature",
+        committed: false,
+        rebased: false,
+        removed: true,
+        squashed: false,
+        target: "develop",
+      },
+      mergeUpdateTarget: true,
+      mergeRemoveSource: true,
+      mergeDeleteSourceBranch: true,
+      mergePrimary: repo,
       mergeTarget: "develop",
     });
     const harness = makeHarness(source);
 
     await harness.handler("merge develop -y", harness.ctx);
 
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(true);
+    expect(existsSync(source)).toBe(false);
     expect(harness.editorTexts).toEqual([`/move "${targetPath}"`]);
     expect(harness.moves).toEqual([]);
     expect(harness.reloads).toBe(0);
-    expect(existsSync(source)).toBe(true);
-    expect(harness.notices.some(({ text }) =>
-      text.includes(`/wtm merge "develop"`) && text.includes(`--source ${JSON.stringify(source)}`)
-    )).toBe(true);
   });
 
   test("reconciles target update after pre-remove failure", async () => {
@@ -1644,27 +1714,37 @@ describe("/wtm Worktrunk merge", () => {
     expect(harness.notices.some(({ text }) => text.includes("Native Git was not retried"))).toBe(true);
   });
 
-  test("uses the primary handoff when the target has no worktree", async () => {
+  test("moves the session to the primary worktree when the target has no checkout", async () => {
     // Catches inventing a target checkout instead of selecting the live primary.
     const root = tempRoot();
     const { repo, source } = initMergeSource(root);
     git(repo, ["branch", "develop", "main"]);
-    installFakeWorktrunk(root, {
+    const log = installFakeWorktrunk(root, {
       list: worktrunkListFixture("main", [
         { branch: "main", path: repo, main: true, current: false },
         { branch: "feature", path: source, main: false, current: true },
       ]),
+      mergeResult: {
+        branch: "feature",
+        committed: false,
+        rebased: false,
+        removed: true,
+        squashed: false,
+        target: "develop",
+      },
+      mergeUpdateTarget: true,
+      mergeRemoveSource: true,
+      mergeDeleteSourceBranch: true,
+      mergePrimary: repo,
       mergeTarget: "develop",
     });
     const harness = makeHarness(source);
 
     await harness.handler("merge develop -y", harness.ctx);
 
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(true);
+    expect(existsSync(source)).toBe(false);
     expect(harness.editorTexts).toEqual([`/move "${repo}"`]);
-    expect(harness.moves).toEqual([]);
-    expect(harness.notices.some(({ text }) =>
-      text.includes(`/wtm merge "develop"`) && text.includes(`--source ${JSON.stringify(source)}`)
-    )).toBe(true);
   });
 
 
@@ -1720,6 +1800,338 @@ describe("/wtm Worktrunk merge", () => {
     expect(harness.moves).toEqual([]);
     expect(harness.reloads).toBe(0);
     expect(harness.notices.some(({ text }) => text.includes("Native Git was not retried"))).toBe(true);
+  });
+
+  test("stops before Worktrunk when the squashed change would conflict", async () => {
+    // Catches starting the pipeline and leaving a conflicted rebase open in the source worktree.
+    const root = tempRoot();
+    const { repo, source } = initMergeSource(root);
+    writeFileSync(path.join(source, "tracked.txt"), "feature content\n");
+    git(source, ["add", "-A"]);
+    git(source, ["commit", "-m", "feature edits tracked"]);
+    writeFileSync(path.join(source, "staged.txt"), "staged\n");
+    git(source, ["add", "staged.txt"]);
+    writeFileSync(path.join(repo, "tracked.txt"), "main content\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-m", "main edits tracked"]);
+    const refsBefore = git(repo, ["show-ref"]);
+    const statusBefore = git(source, ["status", "--porcelain"]);
+    const objectsBefore = objectCount(repo);
+    const indexPath = git(source, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    const indexBefore = readFileSync(indexPath);
+    const log = installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: repo, main: true, current: false },
+        { branch: "feature", path: source, main: false, current: true },
+      ]),
+    });
+    const harness = makeHarness(source);
+
+    await harness.handler("merge main -y", harness.ctx);
+
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(false);
+    expect(git(repo, ["show-ref"])).toBe(refsBefore);
+    expect(git(source, ["status", "--porcelain"])).toBe(statusBefore);
+    expect(readFileSync(indexPath).equals(indexBefore)).toBe(true);
+    expect(objectCount(repo)).toBe(objectsBefore);
+    expect(existsSync(git(source, ["rev-parse", "--path-format=absolute", "--git-path", "rebase-merge"]))).toBe(false);
+    expect(harness.editorTexts).toEqual([]);
+    expect(harness.confirmations).toEqual([]);
+    expect(harness.notices.some(({ text, level }) =>
+      level === "error" && text.includes("would conflict") && text.includes("tracked.txt") && text.includes("unchanged")
+    )).toBe(true);
+  });
+
+  test("keeps staged new files in the --stage tracked pre-check", async () => {
+    // Catches dropping index-only content, which Worktrunk commits as an add/add conflict.
+    const root = tempRoot();
+    const { repo, source } = initMergeSource(root);
+    writeFileSync(path.join(source, "shared.txt"), "feature\n");
+    git(source, ["add", "shared.txt"]);
+    writeFileSync(path.join(repo, "shared.txt"), "main\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-m", "main adds shared"]);
+    const log = installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: repo, main: true, current: false },
+        { branch: "feature", path: source, main: false, current: true },
+      ]),
+    });
+    const harness = makeHarness(source);
+
+    await harness.handler("merge main --stage tracked --no-remove -y", harness.ctx);
+
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(false);
+    expect(harness.notices.some(({ text, level }) =>
+      level === "error" && text.includes("would conflict") && text.includes("shared.txt")
+    )).toBe(true);
+  });
+
+  test("stops when the target diverged from an upstream the source is based on", async () => {
+    // Catches predicting a merge that Worktrunk refuses because the target cannot fast-forward:
+    // the local main kept its own commit while the fetched upstream gained another, and the
+    // source branches from that newer upstream tip.
+    const root = tempRoot();
+    const { repo, source } = initMergeSource(root);
+    writeFileSync(path.join(repo, "upstream.txt"), "upstream\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-m", "upstream work"]);
+    const upstreamTip = git(repo, ["rev-parse", "HEAD"]);
+    writeFileSync(path.join(repo, "local.txt"), "local\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-m", "local main work"]);
+    git(repo, ["checkout", "-q", "-b", "upstream-extra", upstreamTip]);
+    writeFileSync(path.join(repo, "second-upstream.txt"), "second\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-m", "second upstream work"]);
+    const newerUpstream = git(repo, ["rev-parse", "HEAD"]);
+    git(repo, ["checkout", "-q", "main"]);
+    trackUpstream(root, repo, "main", newerUpstream);
+    git(source, ["reset", "--hard", newerUpstream]);
+    writeFileSync(path.join(source, "feature.txt"), "feature\n");
+    git(source, ["add", "-A"]);
+    git(source, ["commit", "-m", "feature work"]);
+    const log = installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: repo, main: true, current: false },
+        { branch: "feature", path: source, main: false, current: true },
+      ]),
+    });
+    const harness = makeHarness(source);
+
+    await harness.handler("merge main -y", harness.ctx);
+
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(false);
+    expect(harness.notices.some(({ text, level }) =>
+      level === "error" && text.includes("diverged") && text.includes("origin/main") && text.includes("unchanged")
+    )).toBe(true);
+  });
+
+  test("replays when a merge commit sits between the target and the source", async () => {
+    // Catches treating a source that merged a side branch as "Already up to date": Worktrunk
+    // still replays the branch's commits, which conflicts here.
+    const root = tempRoot();
+    const { repo, source } = initMergeSource(root);
+    const base = git(repo, ["rev-parse", "main"]);
+    git(source, ["checkout", "-q", "-b", "feature-side"]);
+    writeFileSync(path.join(source, "tracked.txt"), "side content\n");
+    git(source, ["add", "-A"]);
+    git(source, ["commit", "-m", "side edits tracked"]);
+    git(source, ["checkout", "-q", "feature"]);
+    writeFileSync(path.join(source, "tracked.txt"), "feature content\n");
+    git(source, ["add", "-A"]);
+    git(source, ["commit", "-m", "feature edits tracked"]);
+    git(source, ["merge", "--no-ff", "-X", "ours", "-m", "merge side", "feature-side"]);
+    expect(() => git(repo, ["merge-base", "--is-ancestor", base, "feature"])).not.toThrow();
+    const log = installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: repo, main: true, current: false },
+        { branch: "feature", path: source, main: false, current: true },
+      ]),
+    });
+    const harness = makeHarness(source);
+
+    await harness.handler("merge main --no-squash --no-remove", harness.ctx);
+
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(false);
+    expect(harness.notices.some(({ text, level }) =>
+      level === "error" && text.includes("would conflict") && text.includes("while replaying") && text.includes("tracked.txt")
+    )).toBe(true);
+  });
+
+  test("reports scheduled cleanup without claiming the worktree is gone", async () => {
+    // Catches announcing a removal that the reconciliation never confirmed.
+    const root = tempRoot();
+    const { repo, source } = initMergeSource(root);
+    installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: repo, main: true, current: false },
+        { branch: "feature", path: source, main: false, current: true },
+      ]),
+      mergeResult: {
+        branch: "feature",
+        committed: false,
+        rebased: false,
+        removed: true,
+        squashed: false,
+        target: "main",
+      },
+      mergeUpdateTarget: true,
+      mergePrimary: repo,
+      mergeTarget: "main",
+    });
+    const harness = makeHarness(source);
+
+    await harness.handler("merge main -y", harness.ctx);
+
+    expect(existsSync(source)).toBe(true);
+    expect(harness.editorTexts).toEqual([`/move "${repo}"`]);
+    const notice = harness.notices.find(({ text }) => text.includes("Worktrunk merge completed"))?.text ?? "";
+    expect(notice).toContain("cleanup scheduled");
+    expect(notice).toContain("may still be removed");
+    expect(notice).not.toContain("was removed with its branch");
+  });
+
+  test("checks per-commit replay when the source history is preserved", async () => {
+    // Catches a squash-only check that would let a conflicting --no-squash rebase start.
+    const root = tempRoot();
+    const { repo, source } = initMergeSource(root);
+    writeFileSync(path.join(source, "tracked.txt"), "first\n");
+    git(source, ["add", "-A"]);
+    git(source, ["commit", "-m", "feature edits tracked"]);
+    writeFileSync(path.join(source, "tracked.txt"), "initial\n");
+    git(source, ["add", "-A"]);
+    git(source, ["commit", "-m", "feature restores tracked"]);
+    writeFileSync(path.join(repo, "tracked.txt"), "main content\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-m", "main edits tracked"]);
+    const log = installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: repo, main: true, current: false },
+        { branch: "feature", path: source, main: false, current: true },
+      ]),
+      mergeResult: {
+        branch: "feature",
+        committed: false,
+        rebased: false,
+        removed: false,
+        squashed: false,
+        target: "main",
+      },
+      mergePrimary: repo,
+      mergeTarget: "main",
+    });
+    const harness = makeHarness(source);
+
+    await harness.handler("merge main --no-squash --no-remove -y", harness.ctx);
+
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(false);
+    expect(harness.notices.some(({ text, level }) =>
+      level === "error" && text.includes("would conflict") && text.includes("replaying") && text.includes("tracked.txt")
+    )).toBe(true);
+
+    // The same history squashes into a change that applies cleanly.
+    await harness.handler("merge main --no-remove -y", harness.ctx);
+
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(true);
+  });
+
+  test("checks the merge commit when rebase is disabled", async () => {
+    // Catches assuming --no-rebase cannot conflict while --no-ff merges the source tip.
+    const root = tempRoot();
+    const { repo, source } = initMergeSource(root);
+    writeFileSync(path.join(source, "tracked.txt"), "feature content\n");
+    git(source, ["add", "-A"]);
+    git(source, ["commit", "-m", "feature edits tracked"]);
+    writeFileSync(path.join(repo, "tracked.txt"), "main content\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-m", "main edits tracked"]);
+    const log = installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: repo, main: true, current: false },
+        { branch: "feature", path: source, main: false, current: true },
+      ]),
+      mergePrimary: repo,
+      mergeTarget: "main",
+    });
+    const harness = makeHarness(source);
+
+    await harness.handler("merge main --no-rebase --no-ff --no-remove -y", harness.ctx);
+
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(false);
+    expect(harness.notices.some(({ text, level }) =>
+      level === "error" && text.includes("would conflict") && text.includes("tracked.txt")
+    )).toBe(true);
+  });
+
+  test("keeps fast-forward-only merges unblocked by the pre-check", async () => {
+    // Catches applying the replay check to a --no-rebase pipeline that can only fast-forward.
+    const root = tempRoot();
+    const { repo, source } = initMergeSource(root);
+    writeFileSync(path.join(source, "tracked.txt"), "feature content\n");
+    git(source, ["add", "-A"]);
+    git(source, ["commit", "-m", "feature edits tracked"]);
+    writeFileSync(path.join(repo, "tracked.txt"), "main content\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-m", "main edits tracked"]);
+    const log = installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: repo, main: true, current: false },
+        { branch: "feature", path: source, main: false, current: true },
+      ]),
+      mergeResult: {
+        branch: "feature",
+        committed: false,
+        rebased: false,
+        removed: false,
+        squashed: false,
+        target: "main",
+      },
+      mergePrimary: repo,
+      mergeTarget: "main",
+    });
+    const harness = makeHarness(source);
+
+    await harness.handler("merge main --no-rebase --no-remove -y", harness.ctx);
+
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(true);
+  });
+
+  test("stops when --no-commit cannot commit a dirty source", async () => {
+    // Catches sending a pipeline to Worktrunk that refuses the same state.
+    const root = tempRoot();
+    const { repo, source } = initMergeSource(root);
+    writeFileSync(path.join(source, "dirty.txt"), "uncommitted\n");
+    const log = installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: repo, main: true, current: false },
+        { branch: "feature", path: source, main: false, current: true },
+      ]),
+    });
+    const harness = makeHarness(source);
+
+    await harness.handler("merge main --no-commit --no-remove -y", harness.ctx);
+
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(false);
+    expect(harness.notices.some(({ text, level }) =>
+      level === "error" && text.includes("--no-commit") && text.includes("clean working tree")
+    )).toBe(true);
+  });
+
+  test("stops before cleanup when no landing worktree can receive the session", async () => {
+    // Catches deleting the session's directory without a usable /move handoff.
+    const root = tempRoot();
+    const repo = path.join(root, "session-repo");
+    const gitDir = path.join(root, "session-metadata");
+    mkdirSync(repo);
+    git(root, ["init", "--separate-git-dir", gitDir, "-b", "main", repo]);
+    git(repo, ["config", "user.name", "WT Test"]);
+    git(repo, ["config", "user.email", "wt-test@example.invalid"]);
+    writeFileSync(path.join(repo, "tracked.txt"), "initial\n");
+    git(repo, ["add", "tracked.txt"]);
+    git(repo, ["commit", "-m", "initial"]);
+    const source = path.join(root, "session-feature");
+    git(repo, ["worktree", "add", "-b", "feature", source]);
+    writeFileSync(path.join(source, "feature.txt"), "feature\n");
+    git(source, ["add", "feature.txt"]);
+    git(source, ["commit", "-m", "feature"]);
+    rmSync(repo, { recursive: true, force: true });
+    const refsBefore = git(source, ["show-ref"]);
+    const log = installFakeWorktrunk(root, {
+      list: worktrunkListFixture("main", [
+        { branch: "feature", path: source, main: false, current: true },
+      ]),
+    });
+    const harness = makeHarness(source);
+
+    await harness.handler("merge -y", harness.ctx);
+
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(false);
+    expect(git(source, ["show-ref"])).toBe(refsBefore);
+    expect(harness.editorTexts).toEqual([]);
+    expect(harness.notices.some(({ text, level }) =>
+      level === "error" && text.includes("/move") && text.includes("repository unchanged")
+    )).toBe(true);
   });
 });
 
@@ -1903,6 +2315,19 @@ describe("/wtm reviewed reconciliation boundaries", () => {
         { branch: "feature", path: source, main: false, current: true },
         { branch: "develop", path: staleTarget, main: false, current: false },
       ]),
+      mergeResult: {
+        branch: "feature",
+        committed: false,
+        rebased: false,
+        removed: true,
+        squashed: false,
+        target: "develop",
+      },
+      mergeUpdateTarget: true,
+      mergeRemoveSource: true,
+      mergeDeleteSourceBranch: true,
+      mergePrimary: repo,
+      mergeTarget: "develop",
     });
     const harness = makeHarness(source);
 
@@ -1910,8 +2335,8 @@ describe("/wtm reviewed reconciliation boundaries", () => {
 
     expect(harness.editorTexts).toEqual([`/move "${repo}"`]);
     expect(harness.moves).toEqual([]);
+    expect(existsSync(source)).toBe(false);
     expect(harness.reloads).toBe(0);
-    expect(existsSync(source)).toBe(true);
   });
 
   test("uses Worktrunk primary metadata with a separate git directory", async () => {
@@ -1926,24 +2351,39 @@ describe("/wtm reviewed reconciliation boundaries", () => {
     writeFileSync(path.join(repo, "tracked.txt"), "initial\n");
     git(repo, ["add", "tracked.txt"]);
     git(repo, ["commit", "-m", "initial"]);
+    git(repo, ["branch", "develop", "main"]);
     const source = path.join(root, "separate-feature");
     git(repo, ["worktree", "add", "-b", "feature", source]);
     writeFileSync(path.join(source, "feature.txt"), "feature\n");
     git(source, ["add", "feature.txt"]);
     git(source, ["commit", "-m", "feature"]);
     const log = installFakeWorktrunk(root, {
-      list: worktrunkListFixture("main", [
+      list: worktrunkListFixture("develop", [
         { branch: "main", path: repo, main: true, current: false },
         { branch: "feature", path: source, main: false, current: true },
       ]),
+      mergeResult: {
+        branch: "feature",
+        committed: false,
+        rebased: false,
+        removed: true,
+        squashed: false,
+        target: "develop",
+      },
+      mergeUpdateTarget: true,
+      mergeRemoveSource: true,
+      mergeDeleteSourceBranch: true,
+      mergePrimary: repo,
+      mergeTarget: "develop",
     });
     const harness = makeHarness(source);
 
     await harness.handler("merge -y", harness.ctx);
 
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(true);
+    expect(existsSync(source)).toBe(false);
     expect(harness.editorTexts).toEqual([`/move "${repo}"`]);
     expect(harness.moves).toEqual([]);
-    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(false);
   });
 
   test("omits cleanup approvals for no-remove merge", async () => {
@@ -2157,7 +2597,7 @@ describe("/wtm reviewed reconciliation boundaries", () => {
   });
 
   test("rejects primary metadata from a different repository", async () => {
-    // Catches accepting any live Git root as a merge safe landing.
+    // Catches accepting any live Git root as a landing worktree.
     const root = tempRoot();
     const { repo, source } = initMergeSource(root);
     git(repo, ["branch", "develop", "main"]);
@@ -2169,15 +2609,27 @@ describe("/wtm reviewed reconciliation boundaries", () => {
         { branch: "main", path: unrelated, main: true, current: false },
         { branch: "feature", path: source, main: false, current: true },
       ]),
-      mergePrimary: unrelated,
+      mergeResult: {
+        branch: "feature",
+        committed: false,
+        rebased: false,
+        removed: true,
+        squashed: false,
+        target: "develop",
+      },
+      mergeUpdateTarget: true,
+      mergeRemoveSource: true,
+      mergeDeleteSourceBranch: true,
+      mergePrimary: repo,
       mergeTarget: "develop",
     });
     const harness = makeHarness(source);
 
     await harness.handler("merge develop -y", harness.ctx);
 
+    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(true);
+    expect(existsSync(source)).toBe(false);
+    expect(harness.editorTexts).toEqual([`/move "${repo}"`]);
     expect(harness.moves).toEqual([]);
-    expect(fakeCalls(log).some((args) => args.includes("merge"))).toBe(false);
-    expect(harness.notices.at(-1)?.text).toContain("Cannot find a registered safe landing");
   });
 });
