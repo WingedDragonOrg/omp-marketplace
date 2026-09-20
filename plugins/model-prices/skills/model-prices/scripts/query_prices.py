@@ -119,8 +119,8 @@ def search_rank(query: str, *candidates: str | None) -> int | None:
         return 0
     if any(value.startswith(folded_query) for value in values):
         return 1
-    terms = query_terms(query)
-    if terms and any(all(term in set(query_terms(value)) for term in terms) for value in values):
+    terms = set(query_terms(query))
+    if terms and any(terms.issubset(query_terms(value)) for value in values):
         return 2
     if any(folded_query in value for value in values):
         return 3
