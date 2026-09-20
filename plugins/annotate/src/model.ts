@@ -345,12 +345,6 @@ export function parseUnifiedDiff(diff: string): DiffFile[] {
       continue;
     }
     if (!current) continue;
-    if (/^(?:old|new|new file|deleted file) mode 160000$|^index \S+\.\.\S+ 160000$/.test(line)) {
-      current.binary = true;
-      current.gitlink = true;
-      currentHunk = undefined;
-      continue;
-    }
     if (current.gitlink && /^[+-]?Subproject commit /.test(line)) {
       current.binary = true;
       currentHunk = undefined;
@@ -376,6 +370,12 @@ export function parseUnifiedDiff(diff: string): DiffFile[] {
         oldLine += 1;
         continue;
       }
+    }
+    if (/^(?:old|new|new file|deleted file) mode 160000$|^index \S+\.\.\S+ 160000$/.test(line)) {
+      current.binary = true;
+      current.gitlink = true;
+      currentHunk = undefined;
+      continue;
     }
 
     const oldPath = patchPath(line, "--- ");
