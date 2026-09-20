@@ -66,28 +66,34 @@ export class SkillGateRegistry {
 		const blocked = new Set<string>();
 		const known = new Set<string>();
 
-		for (const skill of skills) {
-			known.add(skill.name);
-			const gate = await this.#gateFor(skill.filePath);
-			if (!gate?.block) {
+		// Bound file read-ahead while preserving skill and gate evaluation order.
+		for (let offset = 0; offset < skills.length; offset += 16) {
+			const batch = skills.slice(offset, offset + 16);
+			const gates = await Promise.all(batch.map(skill => this.#gateFor(skill.filePath)));
+			for (let index = 0; index < batch.length; index++) {
+				const skill = batch[index]!;
+				const gate = gates[index];
+				known.add(skill.name);
+				if (!gate?.block) {
+					decisions.push({
+						skill,
+						gated: false,
+						allowed: true,
+						reasons: [],
+						errors: gate?.errors ?? [],
+					});
+					continue;
+				}
+				const result = await evaluateGate(gate.block, ctx);
+				if (!result.ok) blocked.add(skill.name);
 				decisions.push({
 					skill,
-					gated: false,
-					allowed: true,
-					reasons: [],
-					errors: gate?.errors ?? [],
+					gated: true,
+					allowed: result.ok,
+					reasons: result.failures,
+					errors: gate.errors,
 				});
-				continue;
 			}
-			const result = await evaluateGate(gate.block, ctx);
-			if (!result.ok) blocked.add(skill.name);
-			decisions.push({
-				skill,
-				gated: true,
-				allowed: result.ok,
-				reasons: result.failures,
-				errors: gate.errors,
-			});
 		}
 
 		this.#decisions = decisions;
