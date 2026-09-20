@@ -438,8 +438,20 @@ export function createCodeAnchor(
   const selectedText = fullText.slice(startOffset, endOffset);
   if (!selectedText) return null;
 
-  const oldNumbers = selectedLines.flatMap(line => (line.oldLine === undefined ? [] : [line.oldLine]));
-  const newNumbers = selectedLines.flatMap(line => (line.newLine === undefined ? [] : [line.newLine]));
+  let oldStart: number | undefined;
+  let oldEnd = 0;
+  let newStart: number | undefined;
+  let newEnd = 0;
+  for (const line of selectedLines) {
+    if (line.oldLine !== undefined) {
+      oldEnd = oldStart === undefined ? line.oldLine : Math.max(oldEnd, line.oldLine);
+      oldStart = oldStart === undefined ? line.oldLine : Math.min(oldStart, line.oldLine);
+    }
+    if (line.newLine !== undefined) {
+      newEnd = newStart === undefined ? line.newLine : Math.max(newEnd, line.newLine);
+      newStart = newStart === undefined ? line.newLine : Math.min(newStart, line.newLine);
+    }
+  }
   return {
     kind: "code",
     root: snapshot.root,
@@ -448,10 +460,10 @@ export function createCodeAnchor(
     headOid: snapshot.headOid,
     ...(snapshot.commitOid === undefined ? {} : { commitOid: snapshot.commitOid }),
     diffFingerprint: snapshot.diffFingerprint,
-    oldStart: oldNumbers.length > 0 ? Math.min(...oldNumbers) : 0,
-    oldEnd: oldNumbers.length > 0 ? Math.max(...oldNumbers) : 0,
-    newStart: newNumbers.length > 0 ? Math.min(...newNumbers) : 0,
-    newEnd: newNumbers.length > 0 ? Math.max(...newNumbers) : 0,
+    oldStart: oldStart ?? 0,
+    oldEnd,
+    newStart: newStart ?? 0,
+    newEnd,
     selectedText,
     ...(range === undefined ? {} : { startOffset, endOffset }),
   };
