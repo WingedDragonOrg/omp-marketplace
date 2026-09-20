@@ -1127,7 +1127,10 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ---- shared precondition: git repo ----
-      if (runGit(ctx.cwd, ["rev-parse", "--git-dir"]).code !== 0) {
+      const isList = sub === "list" || sub === "ls";
+      const repository = runGit(ctx.cwd, ["rev-parse", isList ? "--show-toplevel" : "--git-dir"]);
+      // Bare repositories have no top-level directory but are still valid list targets.
+      if (repository.code !== 0 && (!isList || runGit(ctx.cwd, ["rev-parse", "--git-dir"]).code !== 0)) {
         notify("Not a git repository — /wtm needs a git checkout.", "error");
         return;
       }
@@ -1405,14 +1408,15 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ---- list ----
-      if (sub === "list" || sub === "ls") {
+      if (isList) {
+        const currentPath = realPath(ctx.cwd) ?? ctx.cwd;
         const backend = resolveWorktrunk(ctx.cwd);
         if (backend.kind === "available") {
           const probe = probeWorktrunkList(backend, ctx.cwd);
           if (probe.kind === "ok") {
             const lines = probe.list.items.map((item) => {
               const ref = item.branch ? `[${item.branch}]` : item.detached ? `(detached ${item.head.slice(0, 7)})` : "(?)";
-              const here = item.current || (realPath(item.path) ?? item.path) === (realPath(ctx.cwd) ?? ctx.cwd) ? "  <- current" : "";
+              const here = item.current || (realPath(item.path) ?? item.path) === currentPath ? "  <- current" : "";
               return `  ${shortPath(item.path).padEnd(46)} ${ref}${here}`;
             });
             notify(`Worktrees (default ${probe.list.defaultBranch}):\n${lines.join("\n")}`, "info");
@@ -1426,10 +1430,10 @@ export default function (pi: ExtensionAPI) {
         const entries = listPorcelain(ctx.cwd);
         const lines = entries.map((entry) => {
           const ref = entry.bare ? "(bare)" : entry.branch ? `[${entry.branch}]` : entry.detached ? `(detached ${entry.head.slice(0, 7)})` : "(?)";
-          const here = (realPath(entry.path) ?? entry.path) === (realPath(ctx.cwd) ?? ctx.cwd) ? "  <- current" : "";
+          const here = (realPath(entry.path) ?? entry.path) === currentPath ? "  <- current" : "";
           return `  ${shortPath(entry.path).padEnd(46)} ${ref}${here}`;
         });
-        notify(`Worktrees of ${shortPath(stripLineEnding(runGit(ctx.cwd, ["rev-parse", "--show-toplevel"]).out))}:\n${lines.join("\n")}`, "info");
+        notify(`Worktrees of ${shortPath(stripLineEnding(repository.out))}:\n${lines.join("\n")}`, "info");
         return;
       }
 
