@@ -104,8 +104,8 @@ export function validateMentionBody(
     const valid =
       id !== undefined &&
       (type === "agent"
-        ? id !== self && (agentIds ??= normalizedIdSet(roster.agentIds)).has(id)
-        : (memberIds ??= normalizedIdSet(roster.memberIds)).has(id));
+        ? id !== self && (roster.agentIds.has(id) || (agentIds ??= normalizedIdSet(roster.agentIds)).has(id))
+        : roster.memberIds.has(id) || (memberIds ??= normalizedIdSet(roster.memberIds)).has(id));
     if (!valid) return { ok: false, reason: "invalid-target" };
     uniqueTargets.add(`${type}:${id}`);
   }
