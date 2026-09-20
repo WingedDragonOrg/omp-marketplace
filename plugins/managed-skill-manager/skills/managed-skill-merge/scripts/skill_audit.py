@@ -54,7 +54,7 @@ def parse_frontmatter(text: str) -> tuple[dict | None, str | None]:
     return out, None
 
 
-def load(root: str) -> list[dict]:
+def load(root: str, *, include_extra_files: bool = True) -> list[dict]:
     skills = []
     for name in sorted(os.listdir(root)):
         d = os.path.join(root, name)
@@ -66,12 +66,13 @@ def load(root: str) -> list[dict]:
             entry["err"] = "missing SKILL.md"
             skills.append(entry)
             continue
-        entry["extra"] = sorted(
-            os.path.relpath(os.path.join(dp, f), d)
-            for dp, _, fs in os.walk(d)
-            for f in fs
-            if os.path.relpath(os.path.join(dp, f), d) != "SKILL.md"
-        )
+        if include_extra_files:
+            entry["extra"] = sorted(
+                os.path.relpath(os.path.join(dp, f), d)
+                for dp, _, fs in os.walk(d)
+                for f in fs
+                if os.path.relpath(os.path.join(dp, f), d) != "SKILL.md"
+            )
         entry["text"] = open(path, encoding="utf-8").read()
         entry["fm"], entry["err"] = parse_frontmatter(entry["text"])
         entry["mtime"] = os.path.getmtime(path)
@@ -113,7 +114,7 @@ def cmd_inventory(args) -> int:
 
 
 def cmd_overlap(args) -> int:
-    skills = [s for s in load(args.dir) if s["fm"]]
+    skills = [s for s in load(args.dir, include_extra_files=False) if s["fm"]]
     toks = {s["name"]: body_tokens(s["text"]) for s in skills}
     descs = {s["name"]: body_tokens(s["fm"].get("description", "")) for s in skills}
     pairs = []
