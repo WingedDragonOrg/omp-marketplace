@@ -1,5 +1,4 @@
-import { initThemeSync, theme, getLanguageFromPath } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { SymbolPreset } from "@oh-my-pi/pi-coding-agent/modes/theme/symbols";
+import { initThemeSync, theme, getLanguageFromPath, type SymbolPreset } from "@oh-my-pi/pi-tui/theme";
 import { visibleWidth } from "@oh-my-pi/pi-tui";
 
 const w = (v: string) => `${JSON.stringify(v)}/${visibleWidth(v)}`;

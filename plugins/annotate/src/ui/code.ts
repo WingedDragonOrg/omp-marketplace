@@ -1,4 +1,4 @@
-import type { DiffDocument } from "@oh-my-pi/pi-coding-agent/cli/git-tui/diff-pane";
+import type { DiffDocument } from "@oh-my-pi/pi-tui/apps/git/diff-pane";
 import type { Theme } from "@oh-my-pi/pi-coding-agent";
 import { replaceTabs, visibleWidth } from "@oh-my-pi/pi-tui";
 import type { CodeAnchor, CodeSnapshot, DiffFile, DiffLine, ReviewItem } from "../model";

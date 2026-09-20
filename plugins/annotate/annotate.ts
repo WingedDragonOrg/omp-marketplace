@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { ensureTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { ensureTheme } from "@oh-my-pi/pi-tui/theme";
 import {
   buildReviewMessage,
   collectAssistantTextEntries,

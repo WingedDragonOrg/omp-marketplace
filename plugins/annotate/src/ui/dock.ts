@@ -1,5 +1,5 @@
 import type { Theme } from "@oh-my-pi/pi-coding-agent";
-import { getEditorTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { getEditorTheme } from "@oh-my-pi/pi-tui/theme";
 import { Editor, ScrollView, truncateToWidth } from "@oh-my-pi/pi-tui";
 import { sidebarPanelAtRow, type AnnotateSidebarGeometry, type AnnotateSidebarPanel } from "./layout";
 import { closeMark, padColumn, panelHeading } from "./presentation";

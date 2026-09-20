@@ -2,7 +2,7 @@ import type { Theme } from "@oh-my-pi/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
 import type { AssistantTextEntry, DiffFile, ReviewItem } from "../model";
 import type { GitCommit } from "../git";
-import { getLanguageFromPath } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { getLanguageFromPath } from "@oh-my-pi/pi-tui/theme";
 import { oneLine, reviewItemLocation, statusColor, statusMark } from "./presentation";
 
 export type SidebarSource =

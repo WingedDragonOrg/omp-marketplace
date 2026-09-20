@@ -1,5 +1,4 @@
-import { initThemeSync } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { SymbolPreset } from "@oh-my-pi/pi-coding-agent/modes/theme/symbols";
+import { initThemeSync, type SymbolPreset } from "@oh-my-pi/pi-tui/theme";
 import { createHarness } from "./src/test-harness";
 
 const show = (title: string, rows: string[]) => {

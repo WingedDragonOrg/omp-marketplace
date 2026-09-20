@@ -1,5 +1,5 @@
 import type { Theme } from "@oh-my-pi/pi-coding-agent";
-import { ensureTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { ensureTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { Component, TUI } from "@oh-my-pi/pi-tui";
 import type { AssistantSelectionRange } from "./assistant-selection";
 import {

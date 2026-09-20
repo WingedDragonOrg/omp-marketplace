@@ -1,5 +1,5 @@
 import type { Theme } from "@oh-my-pi/pi-coding-agent";
-import { DiffPane } from "@oh-my-pi/pi-coding-agent/cli/git-tui/diff-pane";
+import { DiffPane } from "@oh-my-pi/pi-tui/apps/git/diff-pane";
 import { truncateToWidth } from "@oh-my-pi/pi-tui";
 import type { CodeSnapshot, DiffFile, DiffLine, ReviewItem } from "../model";
 import {
