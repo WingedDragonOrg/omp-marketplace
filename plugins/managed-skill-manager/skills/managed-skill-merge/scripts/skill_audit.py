@@ -87,7 +87,8 @@ def body_tokens(text: str) -> set[str]:
 def jaccard(a: set, b: set) -> float:
     if not a or not b:
         return 0.0
-    return len(a & b) / len(a | b)
+    intersection = len(a & b)
+    return intersection / (len(a) + len(b) - intersection)
 
 
 def cmd_inventory(args) -> int:
