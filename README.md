@@ -16,6 +16,7 @@ omp plugin install wtm@winged-dragon-org
 | `wtm` | extension + skill | `/wtm` — manage Git worktrees and Worktrunk merges; `/wtm init` asks the agent to initialize `.config/wt.toml` using the bundled configuration skill |
 | `annotate` | extension | `/annotate` — review Git changes, recent commits, and assistant text, then send durable annotations to the current session agent |
 | `dispatcher` | skill | 已确认 spec 与可拆分跨模块任务的实施调度；subagent 承担主体实现，Main 调度、审查、验证及少量低成本配套修改，默认中文交互 |
+| `autoresearch-helper` | skill | 指导编写 `autoresearch.sh`，将抽象目标转为可验证评测，附 `omp -p` 模型评分示例 |
 | `skill-gate` | extension + skill | `when:` frontmatter gates a skill on env vars, os/arch, cwd, marker files or PATH binaries; `/skill-gate` explains each decision |
 | `spec` | skill | `spec-design` — design interview that converges an idea into an implementable spec in `docs/specs/`, one product-level decision at a time |
 | `multica-mention-guard` | extension | Publishes a Multica task's final message verbatim and gates `session_stop` on valid `mention://` targets, reminding once |
@@ -24,6 +25,24 @@ omp plugin install wtm@winged-dragon-org
 | `octo-developer` | extension + skill | `octo_pr` + `octo-pr` — 监听 Mininglamp-OSS/octo-server PR review，按当前 head 两票门禁完成安全修复并交由有权限人员合并 |
 | `auto-learn-scope` | extension | `learn` / `manage_skill` — auto-learn skill 写入支持显式 `global` 或 `project` scope；memory 始终走 native backend |
 | `delegate` | extension | `/delegate <work>` — 使用原生 `/tan` 后台生命周期，但从纯净对话上下文启动 |
+
+### Autoresearch Helper
+
+```sh
+omp plugin install autoresearch-helper@winged-dragon-org
+```
+
+安装后通过 `/reload-plugins` 刷新 Skill，或新开 OMP 会话：
+
+```text
+/skill:autoresearch-helper 为这个项目编写 autoresearch.sh，目标是改善设置页的 UI/UX，允许在线模型评测
+```
+
+Skill 指导建立评测场景、固定评分标准、采集实际证据，并验证脚本的区分能力与失败语义。
+支持客观测量、模型评分和混合评测；附带使用 `omp -p`、校验结构化评分并输出 `METRIC` 的参考实现。
+模型评测需要可用的 OMP 模型凭据和明确允许的网络访问；调用会产生模型用量。
+显式调用 Skill 可确保先加载指导，自动加载由模型根据任务判断。完成并验证 harness 后，再进入内置 `/autoresearch` 循环。
+若当前运行规则要求 `no live network`，应先协调规则；Skill 本身不改变宿主权限或覆盖该限制。
 
 ### Dispatcher
 

@@ -11,6 +11,18 @@
   },
   "plugins": [
     {
+      "name": "autoresearch-helper",
+      "description": "指导编写 autoresearch.sh：将客观与抽象目标转为可验证评测，支持通过 omp -p 进行模型评分",
+      "source": "./autoresearch-helper",
+      "version": "1.0.0",
+      "category": "development",
+      "keywords": ["autoresearch", "skill", "benchmark", "evaluation", "llm-judge"],
+      "author": {
+        "name": "WingedDragonOrg"
+      },
+      "license": "MIT"
+    },
+    {
       "name": "dispatcher",
       "description": "已确认 spec 与跨模块任务的实施调度 Skill：subagent 承担主体实现，Main 调度、审查、验证及少量低成本配套修改，默认中文交互",
       "source": "./dispatcher",

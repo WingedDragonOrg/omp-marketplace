@@ -1,0 +1,9 @@
+{
+  "name": "autoresearch-helper",
+  "version": "1.0.0",
+  "description": "指导编写 autoresearch.sh：将客观与抽象目标转为可验证评测，支持通过 omp -p 进行模型评分",
+  "author": {
+    "name": "WingedDragonOrg"
+  },
+  "homepage": "https://github.com/WingedDragonOrg/omp-marketplace"
+}
