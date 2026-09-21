@@ -1,0 +1,6 @@
+{
+  "name": "autoresearch-helper",
+  "version": "1.0.0",
+  "description": "指导编写 autoresearch.sh，支持客观评测与 omp -p 模型评分",
+  "private": true
+}
