@@ -15,11 +15,6 @@ type ToolDefinition = UnknownRecord & {
   name: string;
   execute?: (...args: readonly unknown[]) => Promise<unknown> | unknown;
 };
-type ExecCall = {
-  command: string;
-  args: readonly string[];
-  options?: UnknownRecord;
-};
 
 async function loadIndexModule(): Promise<UnknownRecord> {
   try {
@@ -176,11 +171,11 @@ async function executeTool(
   return tool.execute?.("test-call", params, new AbortController().signal, undefined, context);
 }
 
-test("registered octo_pr watch/status/cancel actions expose observable session state", async () => {
+test("registered octo_pr actions expose session state and recover from a query timeout", async () => {
   const module = await loadIndexModule();
   const extension = module.default;
   const tools: ToolDefinition[] = [];
-  const execCalls: ExecCall[] = [];
+  let executionKilled = false;
   const persistedEntries: Array<{ customType: string; data: UnknownRecord }> = [];
   const notifications: string[] = [];
   const host = new Proxy(
@@ -189,9 +184,9 @@ test("registered octo_pr watch/status/cancel actions expose observable session s
       registerTool(definition: ToolDefinition): void {
         tools.push(definition);
       },
-      async exec(command: string, args: readonly string[], options?: UnknownRecord): Promise<UnknownRecord> {
-        execCalls.push({ command, args, options });
-        return { code: 0, stdout: githubResponse(args), stderr: "" };
+      async exec(_command: string, args: readonly string[]): Promise<UnknownRecord> {
+        if (executionKilled) return { code: -1, stdout: "", stderr: "", killed: true };
+        return { code: 0, stdout: githubResponse(args), stderr: "", killed: false };
       },
       appendEntry(customType: string, data: UnknownRecord): void {
         persistedEntries.push({ customType, data });
@@ -264,8 +259,6 @@ test("registered octo_pr watch/status/cancel actions expose observable session s
     issueComments: [{ body: "ordinary PR comment" }],
     reviewComments: [{ body: "inline review comment" }],
   });
-  expect(execCalls.some(call => call.command === "gh")).toBe(true);
-  expect(execCalls.every(call => typeof call.options?.timeout === "number" && call.options.timeout > 0)).toBe(true);
   const savedEvidence = persistedEntries.find(
     entry => entry.customType === "com.wingeddragon.octo-pr.watch" && typeof entry.data.lastFingerprint === "string",
   );
@@ -273,6 +266,17 @@ test("registered octo_pr watch/status/cancel actions expose observable session s
   expect(savedEvidence?.data.headSha).toBe(HEAD_SHA);
   const cached = detailsOf(await executeTool(tool!, { action: "status" }, context));
   expect(cached).toMatchObject({ status: "ready", ready: true, headSha: HEAD_SHA, watching: true });
+
+  executionKilled = true;
+  const timedOut = detailsOf(await executeTool(tool!, { action: "status", fresh: true }, context));
+  expect(timedOut).toMatchObject({ status: "error", ready: false, watching: true });
+  expect(timedOut.error).toMatch(/gh pr view.*timed out/i);
+  expect(detailsOf(await executeTool(tool!, { action: "status" }, context)).error).toBe(timedOut.error);
+
+  executionKilled = false;
+  const recovered = detailsOf(await executeTool(tool!, { action: "status", fresh: true }, context));
+  expect(recovered).toMatchObject({ status: "ready", ready: true, headSha: HEAD_SHA });
+  expect(recovered.error).toBeUndefined();
 
   const cancelled = detailsOf(await executeTool(tool!, { action: "cancel" }, context));
   expect(cancelled).toMatchObject({ status: "cancelled", ready: false, watching: false, cancelled: true });

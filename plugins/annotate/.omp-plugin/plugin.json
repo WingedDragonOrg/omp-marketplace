@@ -1,9 +1,0 @@
-{
-  "name": "annotate",
-  "version": "1.9.1",
-  "description": "Review Git changes, recent commits, and assistant text with durable annotations",
-  "author": {
-    "name": "WingedDragonOrg"
-  },
-  "homepage": "https://github.com/WingedDragonOrg/omp-marketplace"
-}

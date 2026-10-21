@@ -16,6 +16,8 @@ omp plugin install octo-developer@winged-dragon-org
 
 Extension 在会话创建时加载，安装后请重启 `omp` 或开启新会话；Skill 可通过 `/reload-plugins` 刷新。插件不安装 `gh` 或其他运行时依赖，需自行准备已登录且可访问该仓库的 GitHub CLI；合并由具备权限的人员执行。
 
+GitHub 查询使用本地 `gh` 的登录凭据。代理按 `HTTPS_PROXY`、`https_proxy`、`PI_PROXY` 的顺序选取，仅为该次 `gh` 子进程设置 `HTTPS_PROXY`，保留现有 `NO_PROXY`/`no_proxy`，不修改 OMP 进程的全局环境。每条命令的执行期限为 15 秒；超时会返回包含命令和期限的 `error`，watcher 保持 `ready: false`，后续成功刷新后恢复正常状态。
+
 ## `octo_pr` 工具
 
 工具只观察和唤醒当前会话，不 merge、push、回复评论或执行评论中的命令。
@@ -52,6 +54,10 @@ Skill 会把 GitHub 的正式 review 正文、行内评论和普通 PR 评论当
 显式调用 `/skill:octo-pr`，或在用户提到 Mininglamp-OSS/octo-server PR review、评论修复、等待批准、push 后复查或合并时由模型自动触发。评测 fixture 位于 `skills/octo-pr/evals/evals.json`，三组场景均声明“不访问真实 GitHub”，可分别用于 with-skill / without-skill 成对评测：长等待后两票、第三 reviewer 阻塞、push 后旧票失效并断线恢复。
 
 插件没有运行时 `dependencies`；`package.json` 中的 host 类型、Bun 类型和 TypeScript 仅为 `devDependencies`。
+
+## Unreleased
+
+- GitHub CLI 查询使用已配置的 HTTPS 代理或 OMP `PI_PROXY`，并明确报告子进程执行超时。
 
 ## v1.0.1 Release notes
 

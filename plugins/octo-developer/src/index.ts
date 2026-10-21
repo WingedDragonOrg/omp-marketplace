@@ -10,6 +10,7 @@ import {
 } from "./review";
 
 const POLL_INTERVAL_MS = 60_000;
+const GH_TIMEOUT_MS = 15_000;
 const CUSTOM_MESSAGE_TYPE = "octo_pr_update";
 const WATCH_ENTRY_TYPE = "com.wingeddragon.octo-pr.watch";
 
@@ -228,7 +229,15 @@ export default function octoDeveloperExtension(pi: ExtensionAPI): void {
   pi.setLabel("Octo Developer");
   const sessions = new Map<string, SessionRuntime>();
   const runGh: GhExecutor = async (args, cwd) => {
-    const response = await pi.exec("gh", [...args], { cwd, timeout: 15_000 });
+    const proxy = process.env.HTTPS_PROXY ?? process.env.https_proxy ?? process.env.PI_PROXY;
+    const response = await pi.exec(
+      proxy ? "env" : "gh",
+      proxy ? [`HTTPS_PROXY=${proxy}`, "gh", ...args] : [...args],
+      { cwd, timeout: GH_TIMEOUT_MS },
+    );
+    if (response.killed) {
+      throw new Error(`gh ${args[0]} ${args[1]} timed out after ${GH_TIMEOUT_MS / 1_000}s`);
+    }
     return {
       code: response.code,
       stdout: response.stdout,
