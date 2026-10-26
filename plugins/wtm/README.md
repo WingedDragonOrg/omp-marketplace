@@ -20,7 +20,7 @@ omp plugin install wtm@winged-dragon-org
 
 Restart `omp` or start a new session after installation. Extension modules load when the session starts.
 
-For Worktrunk-backed behavior, install a stable Worktrunk v0.76.x release separately and ensure `wt` is on `PATH`. The marketplace plugin does not install or upgrade the binary. Prerelease builds and other Worktrunk versions are rejected for merge and use the native Git fallback for lifecycle commands.
+For Worktrunk-backed behavior, install Worktrunk separately and ensure `wt` is on `PATH`. The marketplace plugin does not install or upgrade the binary. WTM checks command results and structured output to determine whether an operation can proceed.
 
 Manual installation remains available by placing `wtm.ts` in `~/.omp/agent/extensions/`.
 
@@ -100,7 +100,7 @@ The target defaults to Worktrunk's detected default branch. WTM does not fetch b
 
 #### Conflict pre-check
 
-Worktrunk v0.76.x has no dry-run for `wt merge`, and a conflicting rebase stops with the rebase left open in the source worktree. Before Worktrunk starts, WTM replays the conflict-relevant steps with `git merge-tree`:
+Worktrunk has no dry-run for `wt merge`, and a conflicting rebase stops with the rebase left open in the source worktree. Before Worktrunk starts, WTM replays the conflict-relevant steps with `git merge-tree`:
 
 - the squashed change for the default pipeline;
 - every replayed commit for `--no-squash` and `--no-commit`, including uncommitted changes committed by `--stage all|tracked|none`;
@@ -149,6 +149,6 @@ Without `OMP_WORKTREE_DIR`, new worktrees use Worktrunk's configured `worktree-p
 
 Path comparisons are realpath-based. Git porcelain is read with NUL delimiters, preserving spaces, quotes, backslashes, and trailing whitespace in worktree paths.
 
-Worktrunk list calls disable full and summary collection. The absolute Worktrunk executable selected by the v0.76.x version gate remains fixed for the entire command.
+Worktrunk list calls disable full and summary collection. The resolved absolute Worktrunk executable remains fixed for the entire command.
 
-Tested against OMP 18.1.5, Bun 1.3.14, and Worktrunk 0.76.0.
+Tested against OMP 18.1.5, Bun 1.3.14, and Worktrunk 0.76.0. Create, list, merge, remove, and `/move` handoff preparation also smoke-tested with Worktrunk 0.81.0.

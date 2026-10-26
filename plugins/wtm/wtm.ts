@@ -1,6 +1,6 @@
 // /wtm — Git worktree lifecycle and Worktrunk merge integration for Oh My Pi.
 //
-// Stable Worktrunk v0.76.x releases are used for create/reuse, list, remove, hooks,
+// Worktrunk is used for create/reuse, list, remove, hooks,
 // approvals, configured worktree paths, and merge. Existing lifecycle commands
 // retain a native Git fallback; merge requires Worktrunk.
 //
@@ -46,7 +46,7 @@ Conflict pre-check:
   worktree stay unchanged.
 
 Backend:
-  Stable Worktrunk v0.76.x releases provide paths, lifecycle hooks, approvals, and merge.
+  Worktrunk provides paths, lifecycle hooks, approvals, and merge.
   Lifecycle commands fall back to native Git only before mutation. Merge never falls back.
   Unapproved project commands must first be approved with 'wt config approvals add'.
   -y skips only the current OMP confirmation. OMP_WORKTREE_DIR preserves the
@@ -163,9 +163,8 @@ function runGit(cwd: string, args: string[]): CommandResult {
 }
 
 type WorktrunkBackend =
-  | { kind: "available"; executable: string; version: string }
+  | { kind: "available"; executable: string }
   | { kind: "missing" }
-  | { kind: "unsupported"; executable: string; version: string }
   | { kind: "invalid"; executable: string; detail: string };
 
 interface WorktrunkSwitchResult {
@@ -201,11 +200,7 @@ function resolveWorktrunk(cwd: string): WorktrunkBackend {
   if (result.code !== 0) {
     return { kind: "invalid", executable, detail: result.err.trim() || `exit ${result.code}` };
   }
-  const match = /^wt v(0)\.(\d+)\.(\d+)([-+][^\s]+)?$/.exec(result.out.trim());
-  if (!match) return { kind: "invalid", executable, detail: `unexpected version: ${result.out.trim()}` };
-  const version = `${match[1]}.${match[2]}.${match[3]}${match[4] ?? ""}`;
-  if (match[1] === "0" && match[2] === "76" && !match[4]) return { kind: "available", executable, version };
-  return { kind: "unsupported", executable, version };
+  return { kind: "available", executable };
 }
 
 function runWorktrunk(backend: Extract<WorktrunkBackend, { kind: "available" }>, cwd: string, args: string[]): CommandResult {
@@ -650,7 +645,7 @@ function activeGitOperation(cwd: string): string | null {
 
 // ---- merge conflict pre-check ----
 //
-// Worktrunk v0.76.x has no dry-run for `wt merge`, and a conflicting rebase stops with the
+// Worktrunk has no dry-run for `wt merge`, and a conflicting rebase stops with the
 // rebase left open in the source worktree. WTM therefore replays the conflict-relevant parts
 // of the pipeline — commit, squash, rebase, and the --no-ff merge commit — with
 // `git merge-tree` in a sandboxed object store: a conflicting source is reported before
@@ -965,9 +960,6 @@ function stripLineEnding(output: string): string {
 
 
 function worktrunkFallbackWarning(backend: Exclude<WorktrunkBackend, { kind: "available" } | { kind: "missing" }>): string {
-  if (backend.kind === "unsupported") {
-    return `Worktrunk ${backend.version} is outside the supported v0.76.x range; using native Git.`;
-  }
   return `Worktrunk is not usable (${backend.detail}); using native Git.`;
 }
 
@@ -1161,14 +1153,11 @@ export default function (pi: ExtensionAPI) {
         const options = parsedArguments.options;
         const backend = resolveWorktrunk(ctx.cwd);
         if (backend.kind === "missing") {
-          notify("Worktrunk is required for /wtm merge. Install a supported v0.76.x release and retry.", "error");
+          notify("Worktrunk is required for /wtm merge. Install Worktrunk, ensure wt is on PATH, and retry.", "error");
           return;
         }
         if (backend.kind !== "available") {
-          const detail = backend.kind === "unsupported"
-            ? `installed version ${backend.version}`
-            : backend.detail;
-          notify(`Worktrunk v0.76.x is required for /wtm merge (${detail}).`, "error");
+          notify(`Worktrunk is not usable for /wtm merge (${backend.detail}).`, "error");
           return;
         }
 

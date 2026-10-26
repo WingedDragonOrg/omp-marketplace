@@ -9,7 +9,7 @@ description: This skill should be used when initializing, reviewing, or repairin
 
 - `wt` 是单独安装的 Worktrunk CLI；`/wtm` 是 OMP 的 worktree 管理入口。
 - 本文所说的项目级 `wt.toml`，准确路径是 **`.config/wt.toml`**，不是仓库根目录下的 `wt.toml`。
-- WTM 当前只把稳定的 Worktrunk `v0.76.x` 当作增强后端。先用 `wt --version` 确认版本。
+- WTM 使用 `PATH` 中的 Worktrunk 作为增强后端，按实际命令结果和 JSON 输出判断操作是否可继续。
 - WTM 负责 worktree 生命周期和 `/move` handoff；Worktrunk 负责 hooks、路径模板、审批和 merge pipeline（含 source worktree 与 branch 清理）。
 - 没有兼容的 `wt` 时，创建、列表、删除、prune 仍可使用原生 Git；`/wtm merge` 需要 Worktrunk。
 
@@ -356,7 +356,7 @@ WTM 的 `/move` handoff 是 OMP session 迁移的一部分。创建 worktree 成
 - **多个 worktree 端口冲突**：使用 `{{ branch | hash_port }}`，并让 `[list].url` 与启动命令使用同一表达式。
 - **路径中的分支斜杠导致目录异常**：路径模板使用 `{{ branch | sanitize }}`，不要直接把原始 `{{ branch }}` 作为目录名。
 - **`/wtm -y` 仍然要求审批**：这是预期行为；`-y` 只影响 WTM 确认，不是 Worktrunk project approval。
-- **Worktrunk 版本不兼容**：查看 `wt --version`。WTM 的增强后端要求稳定 `v0.76.x`；不兼容时生命周期操作会使用原生 Git fallback，merge 需要安装兼容版本。
+- **Worktrunk 命令失败**：查看报错中的命令和 JSON 输出诊断。变更前的能力检查失败时，生命周期操作可使用原生 Git fallback；merge 会停止并报告错误。
 - **dev server 变成阻塞创建**：把长时间运行的命令放在 `[post-start]`，不要放在 `[pre-start]`。
 
 ## 官方参考

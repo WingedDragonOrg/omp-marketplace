@@ -2136,35 +2136,47 @@ describe("/wtm Worktrunk merge", () => {
 });
 
 describe("/wtm Worktrunk compatibility boundary", () => {
-  test("falls back before mutation for an unsupported Worktrunk version", async () => {
-    // Catches sending mutating argv to a future CLI whose JSON contract was never validated.
+  test.each(["0.75.0", "0.80.0", "1.0.0", "0.81.0-beta.1+build.2"])("uses Worktrunk's configured path with version %s", async (version) => {
+    // Catches version-based fallback bypassing Worktrunk's configured worktree path.
     const root = tempRoot();
     const repo = initRepo(root);
+    const target = path.join(root, "configured", "topic");
     process.env.OMP_WORKTREE_DIR = path.join(root, "native-fallback");
-    const log = installFakeWorktrunk(root, { version: "0.77.0" });
+    installFakeWorktrunk(root, {
+      version,
+      switchResult: { action: "created_branch", branch: "topic", path: target },
+    });
     const harness = makeHarness(repo);
 
-    await harness.handler("future-topic", harness.ctx);
+    await harness.handler("topic", harness.ctx);
 
-    expect(runGitBranchExists(repo, "future-topic")).toBe(true);
-    expect(fakeCalls(log)).toEqual([["--version"]]);
-    expect(harness.notices.some(({ text }) => text.includes("outside the supported v0.76.x range"))).toBe(true);
+    expect(existsSync(target)).toBe(true);
+    expect(git(target, ["branch", "--show-current"])).toBe("topic");
+    expect(harness.editorTexts).toEqual([`/move "${target}"`]);
+    expect(harness.notices.filter(({ level }) => level === "warning" || level === "error")).toEqual([]);
   });
 
-  test("rejects merge for an unsupported Worktrunk version", async () => {
-    // Catches falling through to either native mutation or an unvalidated merge contract.
+  test("merges with Worktrunk 0.80.0", async () => {
+    // Catches version-based rejection preventing integration into the target branch.
     const root = tempRoot();
     const { repo, source } = initMergeSource(root);
-    const targetBefore = git(repo, ["rev-parse", "main"]);
-    const log = installFakeWorktrunk(root, { version: "0.77.0" });
+    const sourceHead = git(source, ["rev-parse", "HEAD"]);
+    installFakeWorktrunk(root, {
+      version: "0.80.0",
+      list: worktrunkListFixture("main", [
+        { branch: "main", path: repo, main: true, current: false },
+        { branch: "feature", path: source, main: false, current: true },
+      ]),
+      mergeUpdateTarget: true,
+      mergePrimary: repo,
+    });
     const harness = makeHarness(source);
 
-    await harness.handler("merge -y", harness.ctx);
+    await harness.handler("merge --no-remove -y", harness.ctx);
 
-    expect(git(repo, ["rev-parse", "main"])).toBe(targetBefore);
-    expect(fakeCalls(log)).toEqual([["--version"]]);
-    expect(harness.moves).toEqual([]);
-    expect(harness.notices.at(-1)?.level).toBe("error");
+    expect(git(repo, ["rev-parse", "main"])).toBe(sourceHead);
+    expect(harness.notices.some(({ text }) => text.includes("Worktrunk merge completed"))).toBe(true);
+    expect(harness.notices.filter(({ level }) => level === "error")).toEqual([]);
   });
 
   test("filters shell navigation hints while preserving hook diagnostics", async () => {
@@ -2198,7 +2210,7 @@ describe("/wtm Worktrunk compatibility boundary", () => {
   });
 
   test("pins the resolved executable for the entire operation", async () => {
-    // Catches a PATH symlink swap selecting a different binary after the version gate.
+    // Catches a PATH symlink swap selecting a different binary after the usability check.
     const root = tempRoot();
     const repo = initRepo(root);
     const bin = path.join(root, "identity-bin");
@@ -2260,20 +2272,6 @@ process.exit(91);
     expect(harness.moves).toEqual([]);
   });
 
-  test("rejects unvalidated prerelease builds inside the supported minor", async () => {
-    // Catches treating a prerelease wire contract as an allowlisted stable patch release.
-    const root = tempRoot();
-    const repo = initRepo(root);
-    process.env.OMP_WORKTREE_DIR = path.join(root, "prerelease-fallback");
-    const log = installFakeWorktrunk(root, { version: "0.76.1-beta.1" });
-    const harness = makeHarness(repo);
-
-    await harness.handler("prerelease-topic", harness.ctx);
-
-    expect(runGitBranchExists(repo, "prerelease-topic")).toBe(true);
-    expect(fakeCalls(log)).toEqual([["--version"]]);
-    expect(harness.notices.some(({ text }) => text.includes("outside the supported v0.76.x range"))).toBe(true);
-  });
 });
 
 describe("/wtm reviewed reconciliation boundaries", () => {
