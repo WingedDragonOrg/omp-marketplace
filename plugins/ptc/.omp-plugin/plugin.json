@@ -1,0 +1,9 @@
+{
+  "name": "ptc",
+  "version": "1.0.0",
+  "description": "Eval-first Programmatic Tool Calling slash command for Oh My Pi",
+  "author": {
+    "name": "WingedDragonOrg"
+  },
+  "homepage": "https://github.com/WingedDragonOrg/omp-marketplace"
+}

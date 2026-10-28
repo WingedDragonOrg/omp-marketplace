@@ -214,6 +214,23 @@
         "name": "WingedDragonOrg"
       },
       "license": "MIT"
+    },
+    {
+      "name": "ptc",
+      "description": "Eval-first Programmatic Tool Calling slash command for Oh My Pi",
+      "source": "./ptc",
+      "version": "1.0.0",
+      "category": "development",
+      "keywords": [
+        "ptc",
+        "eval",
+        "programmatic-tool-calling",
+        "tools"
+      ],
+      "author": {
+        "name": "WingedDragonOrg"
+      },
+      "license": "MIT"
     }
   ]
 }

@@ -25,6 +25,21 @@ omp plugin install wtm@winged-dragon-org
 | `octo-developer` | extension + skill | `octo_pr` + `octo-pr` — 监听 Mininglamp-OSS/octo-server PR review，按当前 head 两票门禁完成安全修复并交由有权限人员合并 |
 | `auto-learn-scope` | extension | `learn` / `manage_skill` — auto-learn skill 写入支持显式 `global` 或 `project` scope；memory 始终走 native backend |
 | `delegate` | extension | `/delegate <work>` — 使用原生 `/tan` 后台生命周期，但从纯净对话上下文启动 |
+| `ptc` | extension | `/ptc <任务>` — 以 eval 优先的 Programmatic Tool Calling 工作流执行任务 |
+
+### PTC
+
+```sh
+omp plugin install ptc@winged-dragon-org
+```
+
+安装后通过 `/reload-plugins` 刷新 command，或新开 OMP 会话：
+
+```text
+/ptc 分析这个仓库的认证链路，并定位 refresh token 的写入点
+```
+
+该 command 要求 agent 优先在 `eval` 中以 `await tool.<name>(args)` 编排工具调用。它是 prompt 工作流约束，不改变模型可见的工具集合或工具审批。
 
 ### Autoresearch Helper
 

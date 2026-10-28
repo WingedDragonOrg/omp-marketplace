@@ -1,0 +1,12 @@
+{
+  "name": "ptc",
+  "version": "1.0.0",
+  "description": "Eval-first Programmatic Tool Calling slash command for Oh My Pi",
+  "private": true,
+  "type": "module",
+  "omp": {
+    "extensions": [
+      "./ptc.mjs"
+    ]
+  }
+}
