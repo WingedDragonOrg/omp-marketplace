@@ -89,8 +89,8 @@ export type ReviewWatcherOptions = {
 };
 
 export type ReviewWatcher = {
-  start(): Promise<void>;
-  refresh(): Promise<void>;
+  start(notify?: boolean): Promise<void>;
+  refresh(notify?: boolean): Promise<void>;
   cancel(): void;
   pause(): void;
   resume(): Promise<void>;
@@ -321,18 +321,18 @@ export function createReviewWatcher(options: ReviewWatcherOptions): ReviewWatche
   let generation = 0;
   let failureCount = 0;
   let lastFingerprint: string | undefined = options.initialFingerprint;
-  let refreshInFlight: { generation: number; promise: Promise<void> } | undefined;
+  let refreshInFlight: { request: { generation: number; notify: boolean }; promise: Promise<void> } | undefined;
 
   const isAlive = (expectedGeneration: number): boolean =>
     active && !paused && !cancelled && expectedGeneration === generation;
 
-  const notifyIfChanged = async (next: ReviewState, expectedGeneration: number): Promise<void> => {
+  const notifyIfChanged = async (next: ReviewState, expectedGeneration: number, notify: boolean): Promise<void> => {
     if (!isAlive(expectedGeneration)) return;
     const fingerprint = reviewStateFingerprint(next);
     state = next;
     if (fingerprint === lastFingerprint) return;
     try {
-      await options.notify(next);
+      if (notify) await options.notify(next);
       if (!isAlive(expectedGeneration)) return;
       if (options.persist) {
         await options.persist(next, fingerprint);
@@ -356,7 +356,8 @@ export function createReviewWatcher(options: ReviewWatcherOptions): ReviewWatche
     }
   };
 
-  const refreshInternal = async (expectedGeneration: number): Promise<void> => {
+  const refreshInternal = async (request: { generation: number; notify: boolean }): Promise<void> => {
+    const expectedGeneration = request.generation;
     if (!isAlive(expectedGeneration)) return;
     try {
       const snapshot = await options.source.fetchSnapshot(options.ref);
@@ -364,7 +365,7 @@ export function createReviewWatcher(options: ReviewWatcherOptions): ReviewWatche
       failureCount = 0;
       const next = applyReviewSnapshot(state, snapshot);
       next.lastCheckedAt = now();
-      await notifyIfChanged(next, expectedGeneration);
+      await notifyIfChanged(next, expectedGeneration, request.notify);
     } catch (error) {
       if (!isAlive(expectedGeneration)) return;
       failureCount = Math.min(failureCount + 1, 8);
@@ -374,7 +375,7 @@ export function createReviewWatcher(options: ReviewWatcherOptions): ReviewWatche
         error: error instanceof Error ? error.message : String(error),
         lastCheckedAt: now(),
       };
-      await notifyIfChanged(next, expectedGeneration);
+      await notifyIfChanged(next, expectedGeneration, request.notify);
     }
   };
 
@@ -393,25 +394,27 @@ export function createReviewWatcher(options: ReviewWatcherOptions): ReviewWatche
     timer = handle;
   };
 
-  const refresh = async (): Promise<void> => {
+  const refresh = async (notify = true): Promise<void> => {
     if (!active || paused || cancelled) return;
-    if (refreshInFlight?.generation === generation) return refreshInFlight.promise;
-    const expectedGeneration = generation;
-    let promise: Promise<void>;
-    promise = refreshInternal(expectedGeneration).finally(() => {
-      if (refreshInFlight?.promise === promise) refreshInFlight = undefined;
+    if (refreshInFlight?.request.generation === generation) {
+      if (!notify) refreshInFlight.request.notify = false;
+      return refreshInFlight.promise;
+    }
+    const request = { generation, notify };
+    const promise = refreshInternal(request).finally(() => {
+      if (refreshInFlight?.request === request) refreshInFlight = undefined;
     });
-    refreshInFlight = { generation: expectedGeneration, promise };
+    refreshInFlight = { request, promise };
     await promise;
   };
 
   return {
-    async start(): Promise<void> {
+    async start(notify = true): Promise<void> {
       if (cancelled || active) return;
       active = true;
       paused = false;
       generation += 1;
-      await refresh();
+      await refresh(notify);
       scheduleNext(generation);
     },
 

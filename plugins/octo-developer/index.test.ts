@@ -176,6 +176,8 @@ test("registered octo_pr actions expose session state and recover from a query t
   const extension = module.default;
   const tools: ToolDefinition[] = [];
   let executionKilled = false;
+  let commentBody = "ordinary PR comment";
+  const updates: UnknownRecord[] = [];
   const persistedEntries: Array<{ customType: string; data: UnknownRecord }> = [];
   const notifications: string[] = [];
   const host = new Proxy(
@@ -186,10 +188,13 @@ test("registered octo_pr actions expose session state and recover from a query t
       },
       async exec(_command: string, args: readonly string[]): Promise<UnknownRecord> {
         if (executionKilled) return { code: -1, stdout: "", stderr: "", killed: true };
-        return { code: 0, stdout: githubResponse(args), stderr: "", killed: false };
+        return { code: 0, stdout: githubResponse(args).replace("ordinary PR comment", commentBody), stderr: "", killed: false };
       },
       appendEntry(customType: string, data: UnknownRecord): void {
         persistedEntries.push({ customType, data });
+      },
+      sendMessage(message: UnknownRecord): void {
+        updates.push(message);
       },
       on(): void {
         // Lifecycle registration is driven by the real host in production.
@@ -277,6 +282,13 @@ test("registered octo_pr actions expose session state and recover from a query t
   const recovered = detailsOf(await executeTool(tool!, { action: "status", fresh: true }, context));
   expect(recovered).toMatchObject({ status: "ready", ready: true, headSha: HEAD_SHA });
   expect(recovered.error).toBeUndefined();
+  expect(updates).toEqual([]);
+
+  commentBody = "new review discussion";
+  const activeTimer = timers.find(timer => timer.active === true);
+  await (activeTimer!.callback as () => Promise<void>)();
+  expect(updates).toHaveLength(1);
+  expect((updates[0]?.details as UnknownRecord).issueComments).toMatchObject([{ body: commentBody }]);
 
   const cancelled = detailsOf(await executeTool(tool!, { action: "cancel" }, context));
   expect(cancelled).toMatchObject({ status: "cancelled", ready: false, watching: false, cancelled: true });

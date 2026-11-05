@@ -1,6 +1,6 @@
 {
   "name": "octo-developer",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "octo-server GitHub PR review watcher and human merge handoff workflow",
   "author": {
     "name": "WingedDragonOrg"

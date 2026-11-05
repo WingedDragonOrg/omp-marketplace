@@ -37,7 +37,9 @@ GitHub 查询使用本地 `gh` 的登录凭据。代理按 `HTTPS_PROXY`、`http
 {"action":"cancel"}
 ```
 
-`watch` 启动约 60 秒一次的后台 GitHub 查询，并且只在状态或评论/审查证据变化时通知。不要让模型自行每 60 秒调用 `status`。每个会话只能存在一个 watcher；会话关闭或切换时暂停，`session_start`/`session_switch` 会自动从当前 session branch 的持久化记录恢复 watcher 并以当前 head 重查。记录包含规范化 PR、head SHA 和最近通知 fingerprint；fingerprint 只有通知与记录成功后才推进，失败或进程中断会在恢复/下一轮重试，因此语义是 at-least-once（允许重复通知，不承诺 exactly-once），不会因去重把变化静默丢掉。不同 session 不共享 watcher、PR、缓存或 fingerprint。`status` 返回 `status`（`ready`/`blocked`/`pending`/`error`/`cancelled`）、`ready` 布尔值、缓存监控状态、当前 `headSha`、批准与 `CHANGES_REQUESTED` 摘要、PR 可合并性和检查状态、`lastCheckedAt`、`watching`/`cancelled`、错误和最新评论/审查证据 URL。错误是实际失败，不应被解释为空评论或成功。
+`watch` 的首次查询和 `status fresh=true` 的查询直接返回完整结果并保存对应 fingerprint，不再另行唤醒当前会话；查询错误仍在工具结果中返回。fresh 查询在后台结果通知前加入同一次在途查询时，同一结果只通过工具调用返回；已经排队的通知不能撤回。后台后续发生的变化和会话恢复时发现的新变化仍会唤醒。
+
+`watch` 启动约 60 秒一次的后台 GitHub 查询，并且只在状态或评论/审查证据变化时通知。不要让模型自行每 60 秒调用 `status`。每个会话只能存在一个 watcher；会话关闭或切换时暂停，`session_start`/`session_switch` 会自动从当前 session branch 的持久化记录恢复 watcher 并以当前 head 重查。记录包含规范化 PR、head SHA 和 fingerprint；后台变化的 fingerprint 在通知与记录成功后推进，失败或进程中断会在恢复/下一轮重试，因此后台通知语义是 at-least-once（允许重复通知，不承诺 exactly-once）。不同 session 不共享 watcher、PR、缓存或 fingerprint。`status` 返回 `status`（`ready`/`blocked`/`pending`/`error`/`cancelled`）、`ready` 布尔值、缓存监控状态、当前 `headSha`、批准与 `CHANGES_REQUESTED` 摘要、PR 可合并性和检查状态、`lastCheckedAt`、`watching`/`cancelled`、错误和最新评论/审查证据 URL。错误是实际失败，不应被解释为空评论或成功。
 
 ## Review 与人工合并交接
 

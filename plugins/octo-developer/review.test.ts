@@ -61,8 +61,8 @@ type ReviewState = ReviewSnapshot & {
   error?: string | null;
 };
 type ReviewWatcher = {
-  start(): Promise<void>;
-  refresh(): Promise<void>;
+  start(notify?: boolean): Promise<void>;
+  refresh(notify?: boolean): Promise<void>;
   cancel(): void;
   pause(): void;
   resume(): Promise<void>;
@@ -706,6 +706,30 @@ async function newWatcher(
 }
 
 describe("review watcher", () => {
+  test("a fresh status joining an in-flight poll returns the new state without a second notification", async () => {
+    const deferred = createDeferred<ReviewSnapshot>();
+    const scheduler = new ManualScheduler();
+    const notifications: ReviewState[] = [];
+    let calls = 0;
+    const createReviewWatcher = (await requiredReviewFunction("createReviewWatcher")) as (
+      options: Record<string, unknown>,
+    ) => ReviewWatcher;
+    const watcher = createReviewWatcher({
+      sessionId: "session-joined",
+      ref: REF,
+      source: { fetchSnapshot: async () => ++calls === 1 ? snapshot() : deferred.promise },
+      schedule: scheduler,
+      notify: (state: ReviewState) => notifications.push(state),
+    });
+    await watcher.start(false);
+    const poll = scheduler.advance(60_000);
+    const fresh = watcher.refresh(false);
+    deferred.resolve(readySnapshot());
+    await Promise.all([poll, fresh]);
+    expect(watcher.getState().ready).toBe(true);
+    expect(notifications).toEqual([]);
+  });
+
   test("polls every 60 seconds, emits complete initial evidence, and deduplicates 30 minutes of unchanged snapshots", async () => {
     const first = snapshot({
       reviews: [review("r1", "alice", "APPROVED"), review("r2", "bob", "APPROVED")],

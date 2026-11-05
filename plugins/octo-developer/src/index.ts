@@ -357,7 +357,7 @@ export default function octoDeveloperExtension(pi: ExtensionAPI): void {
           persistWatch(pi, "watch", pr);
           nextRuntime = createRuntime(ctx, sessionId, pr);
           sessions.set(sessionId, nextRuntime);
-          await nextRuntime.watcher.start();
+          await nextRuntime.watcher.start(false);
           if (currentSessionId(ctx) !== sessionId) {
             nextRuntime.watcher.cancel();
             sessions.delete(sessionId);
@@ -401,7 +401,7 @@ export default function octoDeveloperExtension(pi: ExtensionAPI): void {
       }
 
       if (params.action === "status") {
-        if (params.fresh === true && !runtime.cancelled && !runtime.paused) await runtime.watcher.refresh();
+        if (params.fresh === true && !runtime.cancelled && !runtime.paused) await runtime.watcher.refresh(false);
         return result(runtimeDetails(runtime));
       }
 
