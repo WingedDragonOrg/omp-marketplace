@@ -1,6 +1,6 @@
 {
   "name": "auto-learn-scope",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Manage grouped global and project auto-learn skills with progressive loading",
   "private": true,
   "type": "module",

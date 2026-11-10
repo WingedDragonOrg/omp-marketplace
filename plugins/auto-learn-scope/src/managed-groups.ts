@@ -927,7 +927,8 @@ export function createManagedGroupStore(rootPath: string): ManagedGroupStore {
   if (typeof rootPath !== "string" || rootPath.trim() === "") {
     throw makeError("<invalid>", "scan", "a managed-skills root directory is required.", String(rootPath), String(rootPath), String(rootPath));
   }
-  const root = path.resolve(rootPath);
+  const requestedRoot = path.resolve(rootPath);
+  const root = lstatOrNull(requestedRoot)?.isSymbolicLink() ? realpathSync(requestedRoot) : requestedRoot;
 
   function groupIndex(group: string): string {
     return path.join(root, group, SKILL_FILE_NAME);

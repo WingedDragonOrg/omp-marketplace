@@ -92,6 +92,7 @@ memory 已保存而 Skill 或组索引写入失败时，结果分别报告各部
 
 组与成员名称采用小写字母、数字和连字符；顶层普通 Skill、指向外部的目录链接和共享硬链接
 不会被插件覆盖。组内符号链接可供读取和索引，插件不会通过链接修改其目标。
+managed 根目录可以是指向目录的符号链接；插件在会话启动时解析并固定其目标。
 同名 authored Skill 的优先级高于 managed 分组，创建新组时须避免名称冲突。
 
 project skill 继续使用 OMP 原生 project discovery；写入后通过 `/reload-plugins` 或新会话

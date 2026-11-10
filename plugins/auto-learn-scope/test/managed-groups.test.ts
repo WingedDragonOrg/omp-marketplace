@@ -123,6 +123,29 @@ afterEach(async () => {
 });
 
 describe("managed skill group storage", () => {
+  test("a symlinked managed root supports discovery and grouped writes", async () => {
+    const parent = await makeManagedRoot();
+    const target = await makeOutsideDirectory();
+    const root = join(parent, "managed-skills");
+    await symlink(target, root, "dir");
+    await writeMember(target, "database", "existing", "existing", "Existing database skill.");
+
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    expect(await readFile(groupSkillFile(target, "database"), "utf8")).toContain("Existing database skill.");
+
+    store.mutate({
+      group: "database",
+      action: "create",
+      name: "new-skill",
+      description: "New database skill.",
+      body: "New skill body.",
+    });
+    expect(await readFile(memberSkillFile(target, "database", "new-skill"), "utf8")).toContain("New skill body.");
+    expect(await readFile(groupSkillFile(target, "database"), "utf8")).toContain("New database skill.");
+    expect(await readlink(root)).toBe(target);
+  });
+
   test("startup scan creates an index for a hand-built group without changing a flat skill", async () => {
     const root = await makeManagedRoot();
     const longDescription = `Finds read-only database diagnostics. ${"Use this when reviewing database capacity. ".repeat(8)}`;
