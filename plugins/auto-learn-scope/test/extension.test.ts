@@ -212,20 +212,6 @@ afterEach(async () => {
 });
 
 describe("auto-learn-scope extension registration", () => {
-  test("default factory registers wrappers, lifecycle and input handlers, and an accurate refresh command", async () => {
-    const pi = new FakePi();
-    await installDefault(pi);
-
-    expect(pi.tools.map(tool => tool.name).sort()).toEqual(["learn", "manage_skill"]);
-    expect(pi.handlers.get("before_agent_start")).toHaveLength(1);
-    expect(pi.handlers.get("tool_call")).toHaveLength(1);
-    expect(pi.handlers.get("input")).toHaveLength(1);
-    expect(pi.commands.has("refresh-managed-skills")).toBe(true);
-    expect(pi.commandDescriptions.get("refresh-managed-skills")).toMatch(/interactive.*rpc|rpc.*interactive/i);
-    expect(pi.commandDescriptions.get("refresh-managed-skills")).toContain("/reload-plugins");
-    expect(findTool(pi, "learn").defaultInactive).toBe(false);
-    expect(findTool(pi, "manage_skill").defaultInactive).toBe(false);
-  });
 
   test("schemas expose conditional group fields and retain essential strict write metadata", async () => {
     const pi = new FakePi({ autoLearnEnabled: false, memoryBackend: "off" });

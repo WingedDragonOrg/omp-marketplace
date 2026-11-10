@@ -1,9 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { createServer, type Server } from "node:http";
+import { type AddressInfo } from "node:net";
+import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, watch, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog";
+import { Settings, withActiveSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { createManagedGroupStore } from "../src/managed-groups";
 import type * as ExtensionExports from "../src/index";
 
 type UnknownRecord = Record<string, unknown>;
@@ -27,6 +33,22 @@ type NativeInvoker = (
   params: Record<string, unknown>,
   options?: Record<string, unknown>,
 ) => Promise<unknown>;
+type CapturedModelRequest = { path: string; body: string; authorization?: string };
+type SummaryServerReply = (
+  | { text: string }
+  | { judgeProbability: number }
+  | { error: string }
+) & { release?: Promise<void> };
+type SummaryTestRuntime = {
+  model?: unknown;
+  currentModel?: unknown;
+  registryModels: unknown[];
+  resolvedRoles: string[];
+  credentialSessions: string[];
+  notifications: string[];
+  notificationWaiters: Array<{ text: string; resolve: (message: string) => void }>;
+  apiKey: string;
+};
 
 type ExtensionModule = typeof ExtensionExports;
 type ExtensionHost = Parameters<ExtensionModule["installAutoLearnScope"]>[0];
@@ -77,7 +99,9 @@ class FakePi {
   readonly tools: ToolDefinition[] = [];
   readonly handlers = new Map<string, ToolHandler[]>();
   readonly commands = new Map<string, CommandHandler>();
+  readonly messages: Array<{ customType: string; content: string; display: true; triggerTurn?: boolean }> = [];
   readonly registry = new AgentRegistry();
+  sessionSettings: Settings = Settings.isolated();
   activeSkills: unknown[] = [];
   sessionId = "test-session";
   agentDir = "";
@@ -87,7 +111,11 @@ class FakePi {
       id: "auto-learn-scope-test",
       displayName: "auto-learn-scope-test",
       kind: "main",
-      session: { get skills() { return pi.activeSkills; }, sessionManager: { getSessionId: () => pi.sessionId } } as never,
+      session: {
+        get skills() { return pi.activeSkills; },
+        get settings() { return pi.sessionSettings; },
+        sessionManager: { getSessionId: () => pi.sessionId },
+      } as never,
     });
   }
 
@@ -113,6 +141,12 @@ class FakePi {
 
   registerCommand(name: string, definition: { handler?: CommandHandler }): void {
     if (typeof definition.handler === "function") this.commands.set(name, definition.handler);
+  }
+  sendMessage(
+    message: { customType: string; content: string; display: true },
+    options?: { triggerTurn?: boolean },
+  ): void {
+    this.messages.push({ ...message, ...(options?.triggerTurn === undefined ? {} : { triggerTurn: options.triggerTurn }) });
   }
 }
 
@@ -176,22 +210,52 @@ function makeContext(
   cwd: string,
   invokeTool?: NativeInvoker,
   sessionFile: string | undefined = "/tmp/omp-session.jsonl",
+  summaryRuntime?: SummaryTestRuntime,
 ): UnknownRecord {
   const context: UnknownRecord = {
     agent: { id: "auto-learn-scope-test", kind: "main", name: "main", depth: 0 },
     cwd,
     mode: "print",
-    hasUI: false,
-    ui: {},
+    hasUI: Boolean(summaryRuntime),
+    ui: summaryRuntime
+      ? {
+          notify(message: string, type = "info") {
+            const notification = `${type}: ${message}`;
+            summaryRuntime.notifications.push(notification);
+            const pending = summaryRuntime.notificationWaiters.filter(waiter => notification.includes(waiter.text));
+            summaryRuntime.notificationWaiters = summaryRuntime.notificationWaiters.filter(
+              waiter => !pending.includes(waiter),
+            );
+            for (const waiter of pending) waiter.resolve(notification);
+          },
+        }
+      : {},
     getContextUsage: () => undefined,
     getAsyncJobSnapshot: () => null,
     compact: async () => undefined,
     sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "test-session" },
-    modelRegistry: {},
+    modelRegistry: summaryRuntime
+      ? {
+          getAvailable: () => summaryRuntime.registryModels,
+          getApiKey: async (_model: unknown, sessionId: string) => {
+            summaryRuntime.credentialSessions.push(sessionId);
+            return summaryRuntime.apiKey;
+          },
+          resolver: (_model: unknown, sessionId: string) => {
+            summaryRuntime.credentialSessions.push(sessionId);
+            return async () => summaryRuntime.apiKey;
+          },
+          resolveModelHeaders: async () => undefined,
+        }
+      : {},
     models: {
-      list: () => [],
-      current: () => undefined,
-      resolve: () => undefined,
+      list: () => summaryRuntime?.registryModels ?? [],
+      current: () => summaryRuntime?.currentModel,
+      resolve: (spec: string) => {
+        if (!summaryRuntime) return undefined;
+        summaryRuntime.resolvedRoles.push(spec);
+        return spec === "@smol" ? summaryRuntime.model : undefined;
+      },
       family: () => "",
     },
     isIdle: () => true,
@@ -204,6 +268,204 @@ function makeContext(
   if (invokeTool) context.invokeTool = invokeTool;
   return context;
 }
+
+function summaryRuntime(
+  model?: unknown,
+  currentModel?: unknown,
+  registryModels: unknown[] = model ? [model] : [],
+): SummaryTestRuntime {
+  return {
+    model,
+    currentModel,
+    registryModels,
+    resolvedRoles: [],
+    credentialSessions: [],
+    notifications: [],
+    notificationWaiters: [],
+    apiKey: "fixture-model-api-key",
+  };
+}
+
+function waitForNotification(runtime: SummaryTestRuntime, text: string): Promise<string> {
+  const existing = runtime.notifications.find(notification => notification.includes(text));
+  if (existing) return Promise.resolve(existing);
+  const deferred = Promise.withResolvers<string>();
+  const waiter = { text, resolve: deferred.resolve };
+  runtime.notificationWaiters.push(waiter);
+  const signal = AbortSignal.timeout(10_000);
+  const onAbort = () => deferred.reject(new Error(`Timed out waiting for notification containing ${JSON.stringify(text)}.`));
+  signal.addEventListener("abort", onAbort, { once: true });
+  return deferred.promise.finally(() => {
+    signal.removeEventListener("abort", onAbort);
+    runtime.notificationWaiters = runtime.notificationWaiters.filter(candidate => candidate !== waiter);
+  });
+}
+
+function makeSummaryModel(baseUrl: string): UnknownRecord {
+  const catalogModel = getBundledModel("openai", "gpt-4o-mini");
+  return buildModel({
+    ...catalogModel,
+    id: "auto-learn-summary-fixture",
+    name: "Auto-learn Summary Fixture",
+    api: "openai-completions",
+    baseUrl,
+    reasoning: false,
+  }) as unknown as UnknownRecord;
+}
+
+function makeJudgeModel(baseUrl: string): UnknownRecord {
+  return buildModel({
+    ...getBundledModel("typesafe", "jev-1.14.0"),
+    baseUrl,
+  }) as unknown as UnknownRecord;
+}
+
+function configureJudgeRole(pi: FakePi): Settings {
+  const settings = Settings.isolated({ modelRoles: { judge: "typesafe/jev-1.14.0" } });
+  const settingsWithPluginValues = settings as unknown as { rawValue: (setting: unknown) => unknown };
+  const originalRawValue = settingsWithPluginValues.rawValue.bind(settings);
+  settingsWithPluginValues.rawValue = (setting: unknown) => {
+    const segments = setting && typeof setting === "object" ? (setting as UnknownRecord).segments : undefined;
+    const path = Array.isArray(segments) ? segments.join(".") : "";
+    if (path === "autolearn.enabled") return true;
+    if (path === "memory.backend") return "local";
+    return originalRawValue(setting);
+  };
+  const piNamespace = pi.pi as unknown as { settings: unknown };
+  piNamespace.settings = settings;
+  pi.sessionSettings = settings;
+  return settings;
+}
+
+async function startSummaryServer(replies: readonly SummaryServerReply[]): Promise<{
+  rootUrl: string;
+  baseUrl: string;
+  requests: CapturedModelRequest[];
+  untilRequests: (count: number) => Promise<void>;
+  close: () => Promise<void>;
+}> {
+  const requests: CapturedModelRequest[] = [];
+  const requestSignals: Array<{ count: number; resolve: () => void }> = [];
+  const notifyRequests = (): void => {
+    for (const signal of requestSignals) {
+      if (requests.length >= signal.count) signal.resolve();
+    }
+  };
+  let replyIndex = 0;
+  const server: Server = createServer((request, response) => {
+    void (async () => {
+      let body = "";
+      for await (const chunk of request) body += chunk.toString();
+      requests.push({
+        path: request.url ?? "",
+        body,
+        ...(typeof request.headers.authorization === "string"
+          ? { authorization: request.headers.authorization }
+          : {}),
+      });
+      notifyRequests();
+      const reply = replies[Math.min(replyIndex, replies.length - 1)];
+      replyIndex += 1;
+      if (!reply) throw new Error("summary server requires at least one reply fixture");
+      if (reply.release) await reply.release;
+      if ("error" in reply) {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          error: { message: reply.error, type: "invalid_request_error", code: "fixture_failure" },
+        }));
+        return;
+      }
+      if ("judgeProbability" in reply) {
+        const payload = JSON.parse(body) as UnknownRecord;
+        const questions = payload.questions;
+        const questionName =
+          questions !== null && typeof questions === "object" && !Array.isArray(questions)
+            ? Object.keys(questions)[0] ?? "covered"
+            : "covered";
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          model: "jev-1.14.0",
+          answers: { [questionName]: { type: "noul", noul: reply.judgeProbability } },
+          usage: { input_tokens: 12, output_tokens: 1 },
+        }));
+        return;
+      }
+      const chunk = (content: string, finishReason: string | null) => ({
+        id: "chatcmpl-auto-learn-summary",
+        object: "chat.completion.chunk",
+        created: 0,
+        model: "auto-learn-summary-fixture",
+        choices: [{ index: 0, delta: content ? { content } : {}, finish_reason: finishReason }],
+      });
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+      });
+      response.end(
+        [
+          `data: ${JSON.stringify(chunk(reply.text, null))}`,
+          "",
+          `data: ${JSON.stringify(chunk("", "stop"))}`,
+          "",
+          "data: [DONE]",
+          "",
+          "",
+        ].join("\n"),
+      );
+    })().catch(error => {
+      response.destroy(error instanceof Error ? error : new Error(String(error)));
+    });
+  });
+  const listening = Promise.withResolvers<void>();
+  server.once("error", listening.reject);
+  server.listen(0, "127.0.0.1", listening.resolve);
+  await listening.promise;
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("summary fixture server did not bind a TCP port");
+  const rootUrl = `http://127.0.0.1:${(address as AddressInfo).port}`;
+  return {
+    rootUrl,
+    baseUrl: `${rootUrl}/v1`,
+    requests,
+    untilRequests(count: number): Promise<void> {
+      if (requests.length >= count) return Promise.resolve();
+      const pending = Promise.withResolvers<void>();
+      requestSignals.push({ count, resolve: pending.resolve });
+      if (requests.length >= count) pending.resolve();
+      return pending.promise;
+    },
+    close: async () => {
+      const closed = Promise.withResolvers<void>();
+      server.close(error => error ? closed.reject(error) : closed.resolve());
+      server.closeAllConnections();
+      await closed.promise;
+    },
+  };
+}
+
+async function waitForFileText(path: string, expected: string): Promise<string> {
+  const readCurrent = async () => {
+    try {
+      return await readFile(path, "utf8");
+    } catch {
+      return undefined;
+    }
+  };
+  const initial = await readCurrent();
+  if (initial?.includes(expected)) return initial;
+  const timeoutSignal = AbortSignal.timeout(10_000);
+  try {
+    for await (const _change of watch(dirname(path), { signal: timeoutSignal })) {
+      const current = await readCurrent();
+      if (current?.includes(expected)) return current;
+    }
+  } catch (error) {
+    if (!timeoutSignal.aborted) throw error;
+  }
+  throw new Error(`Timed out waiting for ${path} to contain ${JSON.stringify(expected)}.`);
+}
+
 
 function projectSkillFile(root: string, name: string): string {
   return join(root, ".omp", "skills", name, "SKILL.md");
@@ -740,92 +1002,48 @@ describe("managed skill group extension behavior", () => {
     );
   });
 
-  test("interactive refresh input scans group indexes before routing to OMP plugin reload", async () => {
+  test("interactive refresh runs the command without forwarding a plugin reload", async () => {
     const managedRoot = await makeRoot("auto-learn-scope-group-");
-    const pi = new FakePi();
-    await install(pi, managedRoot);
     await mkdir(join(managedRoot, "runtime-group", "member-skill"), { recursive: true });
     await writeFile(
       childSkillFile(managedRoot, "runtime-group", "member-skill"),
-      skillDocument("member-skill", "Created after session start.", "Member body stays untouched."),
+      skillDocument("member-skill", "Created after session start.", "PRIVATE_MEMBER_BODY."),
       "utf8",
     );
-    const handler = pi.handlers.get("input")?.[0];
-    if (!handler) throw new Error("extension must register an input handler for managed skill refresh");
+    const pi = new FakePi();
+    const server = await startSummaryServer([{ text: "A generated runtime group summary." }]);
+    const runtime = summaryRuntime(makeSummaryModel(server.baseUrl));
+    const ctx = makeContext(process.cwd(), undefined, undefined, runtime);
+    await install(pi, managedRoot);
+    try {
+      const inputHandler = pi.handlers.get("input")?.[0];
+      const inputResult = inputHandler
+        ? await inputHandler({ type: "input", text: "/refresh-managed-skills" }, ctx)
+        : undefined;
+      expect(inputResult).toBeUndefined();
 
-    for (const text of ["/refresh-managed-skills", "/refresh-managed-skills refresh"]) {
-      const result = await handler({ type: "input", text }, makeContext(process.cwd()));
-      expect(result).toEqual({ text: "/reload-plugins" });
-      const indexText = await readFile(groupIndexFile(managedRoot, "runtime-group"), "utf8");
+      const command = pi.commands.get("refresh-managed-skills");
+      if (!command) throw new Error("extension must register /refresh-managed-skills");
+      await command("--force", ctx);
+
+      const indexText = await waitForFileText(groupIndexFile(managedRoot, "runtime-group"), "A generated runtime group summary.");
       expect(frontmatter(indexText).name).toBe("runtime-group");
-      expect(indexText).toContain("Created after session start.");
       expect(indexText).toContain("skill://runtime-group/member-skill/SKILL.md");
+      expect(runtime.notifications.join("\n")).toContain("runtime-group");
+      expect(JSON.stringify(inputResult ?? "")).not.toContain("/reload-plugins");
+      expect(server.requests).toHaveLength(1);
+      expect(server.requests[0]?.path).toBe("/v1/chat/completions");
+      expect(server.requests[0]?.body).not.toContain("PRIVATE_MEMBER_BODY.");
+      expect(await readFile(childSkillFile(managedRoot, "runtime-group", "member-skill"), "utf8")).toContain(
+        "PRIVATE_MEMBER_BODY.",
+      );
+    } finally {
+      await server.close();
     }
-    expect(await readFile(childSkillFile(managedRoot, "runtime-group", "member-skill"), "utf8")).toContain(
-      "Member body stays untouched.",
-    );
   });
 
-  test("input handler leaves unrelated text and extra refresh arguments to normal command handling", async () => {
-    const managedRoot = await makeRoot("auto-learn-scope-group-");
-    const pi = new FakePi();
-    await install(pi, managedRoot);
-    await mkdir(join(managedRoot, "runtime-group", "member-skill"), { recursive: true });
-    await writeFile(
-      childSkillFile(managedRoot, "runtime-group", "member-skill"),
-      skillDocument("member-skill", "Created after session start.", "Body."),
-      "utf8",
-    );
-    const handler = pi.handlers.get("input")?.[0];
-    if (!handler) throw new Error("extension must register an input handler");
 
-    expect(await handler({ type: "input", text: "ordinary user prompt" }, makeContext(process.cwd()))).toBeUndefined();
-    expect(
-      await handler(
-        { type: "input", text: "/refresh-managed-skills refresh now" },
-        makeContext(process.cwd()),
-      ),
-    ).toBeUndefined();
-    expect(await pathExists(groupIndexFile(managedRoot, "runtime-group"))).toBe(false);
-  });
 
-  test("input refresh errors do not route to OMP plugin reload", async () => {
-    const managedRoot = await makeRoot("auto-learn-scope-group-");
-    const outsideRoot = await makeRoot("auto-learn-scope-outside-");
-    const pi = new FakePi();
-    await install(pi, managedRoot);
-    await rm(managedRoot, { recursive: true });
-    await symlink(outsideRoot, managedRoot);
-    const handler = pi.handlers.get("input")?.[0];
-    if (!handler) throw new Error("extension must register an input handler");
-
-    expect(() =>
-      handler({ type: "input", text: "/refresh-managed-skills" }, makeContext(process.cwd())),
-    ).toThrow(/managed-skills root.*safe directory/i);
-  });
-
-  test("direct print-mode command scans groups but explains that skill discovery was not refreshed", async () => {
-    const managedRoot = await makeRoot("auto-learn-scope-group-");
-    const pi = new FakePi();
-    await install(pi, managedRoot);
-    await mkdir(join(managedRoot, "runtime-group", "member-skill"), { recursive: true });
-    await writeFile(
-      childSkillFile(managedRoot, "runtime-group", "member-skill"),
-      skillDocument("member-skill", "Created after session start.", "Member body stays untouched."),
-      "utf8",
-    );
-    const command = [...pi.commands.values()].find(candidate => candidate.length >= 2);
-    if (!command) throw new Error("extension must register a refresh command");
-
-    expect(() => command("refresh", makeContext(process.cwd()))).toThrow(/new session/i);
-
-    expect(await readFile(groupIndexFile(managedRoot, "runtime-group"), "utf8")).toContain(
-      "Created after session start.",
-    );
-    expect(await readFile(childSkillFile(managedRoot, "runtime-group", "member-skill"), "utf8")).toContain(
-      "Member body stays untouched.",
-    );
-  });
 
 
   test("a read tool_call for a grouped skill refreshes the group index before the read proceeds", async () => {
@@ -1474,6 +1692,698 @@ describe("managed skill group extension behavior", () => {
 
     expect(directNamespaceRead).toBeUndefined();
     expect(await readFile(namespaceSkillPath, "utf8")).toBe(namespaceSkillText);
+  });
+
+
+  test("automatic summaries follow description changes but not body-only updates or deletion", async () => {
+    const managedRoot = await makeRoot("auto-learn-scope-group-");
+    const pi = new FakePi();
+    const server = await startSummaryServer([
+      { text: "Create-trigger summary: incident response, ownership, and escalation." },
+      { text: "Updated summary: database recovery and operational escalation." },
+    ]);
+    const runtime = summaryRuntime(makeSummaryModel(server.baseUrl));
+    const ctx = makeContext(process.cwd(), undefined, undefined, runtime);
+    await install(pi, managedRoot);
+    try {
+      const createResult = await executeTool(findTool(pi, "manage_skill"), {
+        scope: "global",
+        group: "operations",
+        action: "create",
+        name: "incident-triage",
+        description: "CREATE_TRIGGER_DESCRIPTION",
+        body: "PRIVATE_CREATE_MEMBER_BODY.",
+      }, ctx);
+      const indexPath = groupIndexFile(managedRoot, "operations");
+      const generatedIndex = await waitForFileText(
+        indexPath,
+        "Create-trigger summary: incident response, ownership, and escalation.",
+      );
+      expect(frontmatter(generatedIndex).description).toBe(
+        "Create-trigger summary: incident response, ownership, and escalation.",
+      );
+      expect(outcomeText(createResult)).toMatch(/summary|queued|pending/i);
+      expect(server.requests[0]?.path).toBe("/v1/chat/completions");
+      expect(server.requests[0]?.body).toContain("CREATE_TRIGGER_DESCRIPTION");
+      expect(server.requests[0]?.body).not.toContain("PRIVATE_CREATE_MEMBER_BODY.");
+
+      const requestCountAfterCreate = server.requests.length;
+      const roleCountAfterCreate = runtime.resolvedRoles.length;
+      await executeTool(findTool(pi, "manage_skill"), {
+        group: "operations",
+        action: "update",
+        name: "incident-triage",
+        description: "CREATE_TRIGGER_DESCRIPTION",
+        body: "PRIVATE_UPDATED_MEMBER_BODY.",
+      }, ctx);
+      expect(server.requests).toHaveLength(requestCountAfterCreate);
+      expect(runtime.resolvedRoles).toHaveLength(roleCountAfterCreate);
+      await executeTool(findTool(pi, "manage_skill"), {
+        group: "operations",
+        action: "update",
+        name: "incident-triage",
+        description: "UPDATED_TRIGGER_DESCRIPTION",
+        body: "PRIVATE_UPDATED_MEMBER_BODY.",
+      }, ctx);
+      const updatedIndex = await waitForFileText(
+        indexPath,
+        "Updated summary: database recovery and operational escalation.",
+      );
+      expect(frontmatter(updatedIndex).description).toBe(
+        "Updated summary: database recovery and operational escalation.",
+      );
+      const requestCountAfterUpdate = server.requests.length;
+      await executeTool(findTool(pi, "manage_skill"), {
+        group: "operations",
+        action: "delete",
+        name: "incident-triage",
+      }, ctx);
+
+      expect(server.requests).toHaveLength(requestCountAfterUpdate);
+      expect(server.requests.every(request => !request.body.includes("PRIVATE_UPDATED_MEMBER_BODY."))).toBe(true);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("a same-session create during an in-flight summary is generated without another session", async () => {
+    const managedRoot = await makeRoot("auto-learn-scope-group-");
+    const pi = new FakePi();
+    const releaseFirst = Promise.withResolvers<void>();
+    const server = await startSummaryServer([
+      {
+        text: "First summary: incident ownership, escalation, and recovery.",
+        release: releaseFirst.promise,
+      },
+      { text: "Second summary: change review, rollout safety, and rollback." },
+    ]);
+    const runtime = summaryRuntime(makeSummaryModel(server.baseUrl));
+    const ctx = makeContext(process.cwd(), undefined, undefined, runtime);
+    await install(pi, managedRoot);
+    try {
+      const firstCreate = executeTool(findTool(pi, "manage_skill"), {
+        scope: "global",
+        group: "operations",
+        action: "create",
+        name: "incident-triage",
+        description: "FIRST_CONCURRENT_DESCRIPTION",
+        body: "PRIVATE_FIRST_CONCURRENT_BODY.",
+      }, ctx);
+      await server.untilRequests(1);
+      const secondCreate = await executeTool(findTool(pi, "manage_skill"), {
+        scope: "global",
+        group: "operations",
+        action: "create",
+        name: "change-review",
+        description: "SECOND_CONCURRENT_DESCRIPTION",
+        body: "PRIVATE_SECOND_CONCURRENT_BODY.",
+      }, ctx);
+      releaseFirst.resolve();
+      await firstCreate;
+
+      const indexText = await waitForFileText(
+        groupIndexFile(managedRoot, "operations"),
+        "Second summary: change review, rollout safety, and rollback.",
+      );
+      expect(frontmatter(indexText).description).toBe(
+        "Second summary: change review, rollout safety, and rollback.",
+      );
+      expect(outcomeText(secondCreate)).toMatch(/summary|queued|pending/i);
+      expect(server.requests.map(request => request.path)).toEqual([
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+      ]);
+      expect(server.requests[0]?.body).toContain("FIRST_CONCURRENT_DESCRIPTION");
+      expect(server.requests[1]?.body).toContain("SECOND_CONCURRENT_DESCRIPTION");
+      expect(server.requests.every(request => !request.body.includes("PRIVATE_FIRST_CONCURRENT_BODY."))).toBe(true);
+      expect(server.requests.every(request => !request.body.includes("PRIVATE_SECOND_CONCURRENT_BODY."))).toBe(true);
+    } finally {
+      releaseFirst.resolve();
+      await server.close();
+    }
+  });
+
+  test("manual refresh judges and regenerates every nested group bottom-up without reloading plugins", async () => {
+    const managedRoot = await makeRoot("auto-learn-scope-group-");
+    const fixtures = [
+      {
+        group: "company",
+        skill: "overview",
+        description: "COMPANY_TRIGGER_DESCRIPTION",
+        body: "PRIVATE_COMPANY_MEMBER_BODY.",
+        seed: "Seed company summary: system ownership, customer workflows, and priorities.",
+        summary: "Company summary: system ownership, customer workflows, and operational priorities.",
+      },
+      {
+        group: "company/platform",
+        skill: "runtime",
+        description: "PLATFORM_TRIGGER_DESCRIPTION",
+        body: "PRIVATE_PLATFORM_MEMBER_BODY.",
+        seed: "Seed platform summary: deployments, runtime configuration, and database integration.",
+        summary: "Platform summary: deployments, runtime configuration, and database integration.",
+      },
+      {
+        group: "company/platform/database",
+        skill: "schema-safety",
+        description: "DATABASE_TRIGGER_DESCRIPTION",
+        body: "PRIVATE_DATABASE_MEMBER_BODY.",
+        seed: "Seed database summary: migrations, index safety, and rollback behavior.",
+        summary: "Database summary: schema migrations, index safety, and rollback behavior.",
+      },
+    ] as const;
+    for (const fixture of fixtures) {
+      await mkdir(join(managedRoot, fixture.group, fixture.skill), { recursive: true });
+      await writeFile(
+        childSkillFile(managedRoot, fixture.group, fixture.skill),
+        skillDocument(fixture.skill, fixture.description, fixture.body),
+        "utf8",
+      );
+    }
+    const pi = new FakePi();
+    const server = await startSummaryServer([
+      { text: fixtures[2].seed },
+      { text: fixtures[1].seed },
+      { text: fixtures[0].seed },
+      { judgeProbability: 0.5 },
+      { text: fixtures[2].summary },
+      { judgeProbability: 0.5 },
+      { text: fixtures[1].summary },
+      { judgeProbability: 0.5 },
+      { text: fixtures[0].summary },
+    ]);
+    const summaryModel = makeSummaryModel(server.baseUrl);
+    const judgeModel = makeJudgeModel(server.rootUrl);
+    const runtime = summaryRuntime(summaryModel, undefined, [judgeModel, summaryModel]);
+    const judgeSettings = configureJudgeRole(pi);
+    const ctx = makeContext(process.cwd(), undefined, undefined, runtime);
+    await install(pi, managedRoot);
+    try {
+      const inputHandler = pi.handlers.get("input")?.[0];
+      const inputResult = inputHandler
+        ? await inputHandler({ type: "input", text: "/refresh-managed-skills" }, ctx)
+        : undefined;
+      expect(inputResult).toBeUndefined();
+
+      const command = pi.commands.get("refresh-managed-skills");
+      if (!command) throw new Error("extension must register /refresh-managed-skills");
+      await command("--force", ctx);
+      for (const fixture of fixtures) {
+        const seedIndex = await waitForFileText(groupIndexFile(managedRoot, fixture.group), fixture.seed);
+        expect(frontmatter(seedIndex).description).toBe(fixture.seed);
+      }
+      expect(server.requests.map(request => request.path)).toEqual([
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+      ]);
+
+      const messageStart = pi.messages.length;
+      await withActiveSettings(judgeSettings, () => command("", ctx));
+      const visibleResults = runtime.notifications.join("\n");
+      const visibleMessages = pi.messages.slice(messageStart);
+      for (const fixture of fixtures) {
+        const indexText = await waitForFileText(groupIndexFile(managedRoot, fixture.group), fixture.summary);
+        expect(frontmatter(indexText).description).toBe(fixture.summary);
+        expect(fixture.summary.length).toBeLessThanOrEqual(200);
+        const groupResult = visibleResults.split(/\r?\n/).find(line => line.includes(fixture.group));
+        expect(groupResult).toBeDefined();
+        expect(groupResult).toMatch(/generated|success|written|complete/i);
+        const messageResult = visibleMessages.find(message => message.content.includes(fixture.group));
+        expect(messageResult?.content).toMatch(/summary generated/i);
+        expect(messageResult).toMatchObject({
+          customType: "auto-learn-scope:managed-skill-summary",
+          display: true,
+          triggerTurn: false,
+        });
+      }
+      expect(inputResult).toBeUndefined();
+      expect(JSON.stringify(inputResult ?? "")).not.toContain("/reload-plugins");
+      expect(server.requests.map(request => request.path)).toEqual([
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+        "/v1/systemone",
+        "/v1/chat/completions",
+        "/v1/systemone",
+        "/v1/chat/completions",
+        "/v1/systemone",
+        "/v1/chat/completions",
+      ]);
+      expect(server.requests[0]?.body).toContain("DATABASE_TRIGGER_DESCRIPTION");
+      expect(server.requests[4]?.body).toContain("DATABASE_TRIGGER_DESCRIPTION");
+      expect(server.requests[6]?.body).toContain("PLATFORM_TRIGGER_DESCRIPTION");
+      expect(server.requests[6]?.body).toContain(fixtures[2].summary);
+      expect(server.requests[8]?.body).toContain("COMPANY_TRIGGER_DESCRIPTION");
+      expect(server.requests[8]?.body).toContain(fixtures[1].summary);
+      expect(server.requests.flatMap(request => request.body).join("\n")).not.toMatch(
+        /PRIVATE_(?:COMPANY|PLATFORM|DATABASE)_MEMBER_BODY\./,
+      );
+      expect(runtime.resolvedRoles).toEqual(["@smol", "@smol", "@smol", "@smol", "@smol", "@smol"]);
+      expect(runtime.credentialSessions).toContain("test-session");
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("manual refresh and invalid arguments report visible results without a UI", async () => {
+    const managedRoot = await makeRoot("auto-learn-scope-group-");
+    await mkdir(join(managedRoot, "release-engineering", "rollback-guide"), { recursive: true });
+    await writeFile(
+      childSkillFile(managedRoot, "release-engineering", "rollback-guide"),
+      skillDocument("rollback-guide", "ROLLBACK_TRIGGER_DESCRIPTION", "PRIVATE_ROLLBACK_MEMBER_BODY."),
+      "utf8",
+    );
+    const pi = new FakePi();
+    const server = await startSummaryServer([
+      { text: "Rollback summary: deployment verification, safe reversions, and recovery ownership." },
+    ]);
+    const runtime = summaryRuntime(makeSummaryModel(server.baseUrl));
+    const ctx = makeContext(process.cwd(), undefined, undefined, runtime);
+    ctx.hasUI = false;
+    ctx.ui = {};
+    await install(pi, managedRoot);
+    const command = pi.commands.get("refresh-managed-skills");
+    if (!command) throw new Error("extension must register /refresh-managed-skills");
+    try {
+      const invalidResult = await command("unexpected", ctx);
+      expect(invalidResult).toBeUndefined();
+      expect(pi.messages.map(message => message.content).join("\n")).toContain(
+        "Usage: /refresh-managed-skills [--force]",
+      );
+
+      const refreshResult = await command("--force", ctx);
+      const indexText = await waitForFileText(
+        groupIndexFile(managedRoot, "release-engineering"),
+        "Rollback summary: deployment verification, safe reversions, and recovery ownership.",
+      );
+      expect(refreshResult).toBeUndefined();
+      expect(frontmatter(indexText).description).toBe(
+        "Rollback summary: deployment verification, safe reversions, and recovery ownership.",
+      );
+      const summaryMessage = pi.messages.find(message => message.content.includes("release-engineering"));
+      expect(summaryMessage?.content).toMatch(/summary generated/i);
+      expect(summaryMessage).toMatchObject({
+        customType: "auto-learn-scope:managed-skill-summary",
+        display: true,
+        triggerTurn: false,
+      });
+      expect(runtime.notifications).toHaveLength(0);
+      expect(server.requests).toHaveLength(1);
+      expect(server.requests[0]?.body).not.toContain("PRIVATE_ROLLBACK_MEMBER_BODY.");
+    } finally {
+      await server.close();
+    }
+  });
+
+
+  test("manual generation failure keeps the last summary and reports the failing group", async () => {
+    const managedRoot = await makeRoot("auto-learn-scope-group-");
+    await mkdir(join(managedRoot, "reliability", "recovery"), { recursive: true });
+    await writeFile(
+      childSkillFile(managedRoot, "reliability", "recovery"),
+      skillDocument("recovery", "RECOVERY_TRIGGER_DESCRIPTION", "PRIVATE_RECOVERY_MEMBER_BODY."),
+      "utf8",
+    );
+    const pi = new FakePi();
+    const server = await startSummaryServer([
+      { text: "Stable recovery summary: restoration, verification, and service continuity." },
+      { error: "fixture generation provider unavailable" },
+    ]);
+    const runtime = summaryRuntime(makeSummaryModel(server.baseUrl));
+    const ctx = makeContext(process.cwd(), undefined, undefined, runtime);
+    await install(pi, managedRoot);
+    try {
+      const command = pi.commands.get("refresh-managed-skills");
+      if (!command) throw new Error("extension must register /refresh-managed-skills");
+      await command("--force", ctx);
+      const indexPath = groupIndexFile(managedRoot, "reliability");
+      await waitForFileText(indexPath, "Stable recovery summary: restoration, verification, and service continuity.");
+
+      await command("--force", ctx);
+      const visibleResults = runtime.notifications.join("\n");
+      const currentIndex = await readFile(indexPath, "utf8");
+      expect(frontmatter(currentIndex).description).toBe(
+        "Stable recovery summary: restoration, verification, and service continuity.",
+      );
+      expect(visibleResults).toMatch(/reliability/i);
+      expect(visibleResults).toMatch(/failed|unavailable|error/i);
+      expect(visibleResults).toContain("fixture generation provider unavailable");
+      expect(server.requests.map(request => request.path)).toEqual([
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+      ]);
+      expect(server.requests.every(request => !request.body.includes("PRIVATE_RECOVERY_MEMBER_BODY."))).toBe(true);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("judge skips only high-confidence coverage and force bypasses the host judge", async () => {
+    const managedRoot = await makeRoot("auto-learn-scope-group-");
+    await mkdir(join(managedRoot, "judge-group", "connection-guide"), { recursive: true });
+    await writeFile(
+      childSkillFile(managedRoot, "judge-group", "connection-guide"),
+      skillDocument("connection-guide", "JUDGE_INPUT_DESCRIPTION", "PRIVATE_JUDGE_MEMBER_BODY."),
+      "utf8",
+    );
+    const pi = new FakePi();
+    const server = await startSummaryServer([
+      { text: "Seed summary: migrations, connection recovery, and rollback checks." },
+      { judgeProbability: 0.97 },
+      { text: "Forced summary: throughput, migration safety, and connection recovery." },
+    ]);
+    const summaryModel = makeSummaryModel(server.baseUrl);
+    const judgeModel = makeJudgeModel(server.rootUrl);
+    const runtime = summaryRuntime(summaryModel, undefined, [judgeModel, summaryModel]);
+    const judgeSettings = configureJudgeRole(pi);
+    const ctx = makeContext(process.cwd(), undefined, undefined, runtime);
+    await install(pi, managedRoot);
+    try {
+      const command = pi.commands.get("refresh-managed-skills");
+      if (!command) throw new Error("extension must register /refresh-managed-skills");
+      await command("--force", ctx);
+      const indexPath = groupIndexFile(managedRoot, "judge-group");
+      await waitForFileText(indexPath, "Seed summary: migrations, connection recovery, and rollback checks.");
+
+      await withActiveSettings(judgeSettings, () => command("", ctx));
+      const afterJudge = await readFile(indexPath, "utf8");
+      const visibleSkip = runtime.notifications.join("\n");
+      expect(frontmatter(afterJudge).description).toBe(
+        "Seed summary: migrations, connection recovery, and rollback checks.",
+      );
+      expect(visibleSkip).toMatch(/judge-group/i);
+      expect(visibleSkip).toMatch(/skip|covered|覆盖/i);
+      expect(visibleSkip).toContain("typesafe");
+      expect(visibleSkip).toContain("jev-1.14.0");
+      expect(visibleSkip).toContain("0.970");
+      expect(server.requests.map(request => request.path)).toEqual([
+        "/v1/chat/completions",
+        "/v1/systemone",
+      ]);
+      const judgeRequest = server.requests[1];
+      if (!judgeRequest) throw new Error("manual non-force refresh must call the host judge");
+      expect(judgeRequest.authorization).toBe("Bearer fixture-model-api-key");
+      expect(judgeRequest.body).toContain("judge-group");
+      expect(judgeRequest.body).toContain("Seed summary: migrations, connection recovery, and rollback checks.");
+      expect(judgeRequest.body).toContain("connection-guide");
+      expect(judgeRequest.body).toContain("JUDGE_INPUT_DESCRIPTION");
+      expect(judgeRequest.body).not.toContain("PRIVATE_JUDGE_MEMBER_BODY.");
+
+      await command("--force", ctx);
+      const afterForce = await waitForFileText(indexPath, "Forced summary: throughput, migration safety, and connection recovery.");
+      expect(frontmatter(afterForce).description).toBe(
+        "Forced summary: throughput, migration safety, and connection recovery.",
+      );
+      expect(server.requests.map(request => request.path)).toEqual([
+        "/v1/chat/completions",
+        "/v1/systemone",
+        "/v1/chat/completions",
+      ]);
+      expect(runtime.resolvedRoles).toEqual(["@smol", "@smol"]);
+      expect(runtime.credentialSessions).toContain("test-session");
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("online judge yes is not calibrated coverage and active session settings select the judge", async () => {
+    const managedRoot = await makeRoot("auto-learn-scope-group-");
+    await mkdir(join(managedRoot, "operations", "incident-guide"), { recursive: true });
+    await writeFile(
+      childSkillFile(managedRoot, "operations", "incident-guide"),
+      skillDocument("incident-guide", "INCIDENT_TRIGGER_DESCRIPTION", "PRIVATE_INCIDENT_MEMBER_BODY."),
+      "utf8",
+    );
+    const pi = new FakePi();
+    const server = await startSummaryServer([
+      { text: "Seed summary: incident escalation, ownership, and containment." },
+      { text: "yes" },
+      { text: "Refreshed summary: incident escalation, ownership, and service recovery." },
+    ]);
+    const summaryModel = makeSummaryModel(server.baseUrl);
+    const judgeModel = makeJudgeModel(server.rootUrl);
+    const runtime = summaryRuntime(summaryModel, undefined, [judgeModel, summaryModel]);
+    const staleSettings = configureJudgeRole(pi);
+    const ctx = makeContext(process.cwd(), undefined, undefined, runtime);
+    await install(pi, managedRoot);
+    try {
+      const command = pi.commands.get("refresh-managed-skills");
+      if (!command) throw new Error("extension must register /refresh-managed-skills");
+      await command("--force", ctx);
+      const indexPath = groupIndexFile(managedRoot, "operations");
+      await waitForFileText(indexPath, "Seed summary: incident escalation, ownership, and containment.");
+
+      const notificationStart = runtime.notifications.length;
+      const sessionSettings = Settings.isolated({
+        modelRoles: { judge: "openai/auto-learn-summary-fixture" },
+      });
+      pi.sessionSettings = sessionSettings;
+      await withActiveSettings(staleSettings, () => command("", ctx));
+
+      const refreshed = await waitForFileText(
+        indexPath,
+        "Refreshed summary: incident escalation, ownership, and service recovery.",
+      );
+      expect(frontmatter(refreshed).description).toBe(
+        "Refreshed summary: incident escalation, ownership, and service recovery.",
+      );
+      expect(server.requests.map(request => request.path)).toEqual([
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+      ]);
+      const report = runtime.notifications.slice(notificationStart).join("\n");
+      expect(report).toContain("openai/auto-learn-summary-fixture");
+      expect(report).toContain("noul=1.000");
+      expect(report).toMatch(/non-native|binary verdict|not a calibrated probability/i);
+      expect(report).toMatch(/generating|generated/i);
+      expect(server.requests[1]?.body).toContain("INCIDENT_TRIGGER_DESCRIPTION");
+      expect(server.requests[1]?.body).not.toContain("PRIVATE_INCIDENT_MEMBER_BODY.");
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("a bounded judge request timeout reports the failure and continues generation", async () => {
+    const managedRoot = await makeRoot("auto-learn-scope-group-");
+    await mkdir(join(managedRoot, "reliability", "timeout-guide"), { recursive: true });
+    await writeFile(
+      childSkillFile(managedRoot, "reliability", "timeout-guide"),
+      skillDocument("timeout-guide", "TIMEOUT_TRIGGER_DESCRIPTION", "PRIVATE_TIMEOUT_MEMBER_BODY."),
+      "utf8",
+    );
+    const releaseJudge = Promise.withResolvers<void>();
+    const delayedRelease = setTimeout(() => releaseJudge.resolve(), 1_000);
+    const pi = new FakePi();
+    const server = await startSummaryServer([
+      { text: "Seed summary: recovery verification, service restoration, and ownership." },
+      { text: "yes", release: releaseJudge.promise },
+      { text: "Recovered summary: recovery verification, restoration, and escalation ownership." },
+    ]);
+    const summaryModel = makeSummaryModel(server.baseUrl);
+    const judgeModel = makeJudgeModel(server.rootUrl);
+    const runtime = summaryRuntime(summaryModel, undefined, [judgeModel, summaryModel]);
+    configureJudgeRole(pi);
+    const ctx = makeContext(process.cwd(), undefined, undefined, runtime);
+    await install(pi, managedRoot);
+    try {
+      const command = pi.commands.get("refresh-managed-skills");
+      if (!command) throw new Error("extension must register /refresh-managed-skills");
+      await command("--force", ctx);
+      const indexPath = groupIndexFile(managedRoot, "reliability");
+      await waitForFileText(indexPath, "Seed summary: recovery verification, service restoration, and ownership.");
+
+      const notificationStart = runtime.notifications.length;
+      const sessionSettings = Settings.isolated({
+        modelRoles: { judge: "openai/auto-learn-summary-fixture" },
+        "judgment.attemptTimeoutMs": 300,
+      });
+      pi.sessionSettings = sessionSettings;
+      await command("", ctx);
+      releaseJudge.resolve();
+
+      const refreshed = await waitForFileText(
+        indexPath,
+        "Recovered summary: recovery verification, restoration, and escalation ownership.",
+      );
+      expect(frontmatter(refreshed).description).toBe(
+        "Recovered summary: recovery verification, restoration, and escalation ownership.",
+      );
+      const report = runtime.notifications.slice(notificationStart).join("\n");
+      expect(report).toMatch(/judge unavailable or failed/i);
+      expect(server.requests.map(request => request.path)).toEqual([
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+      ]);
+      expect(server.requests.every(request => !request.body.includes("PRIVATE_TIMEOUT_MEMBER_BODY."))).toBe(true);
+    } finally {
+      clearTimeout(delayedRelease);
+      releaseJudge.resolve();
+      await server.close();
+    }
+  });
+
+  test("low-confidence and failed judge results report and continue with generation", async () => {
+    const managedRoot = await makeRoot("auto-learn-scope-group-");
+    await mkdir(join(managedRoot, "coverage-group", "retention"), { recursive: true });
+    await writeFile(
+      childSkillFile(managedRoot, "coverage-group", "retention"),
+      skillDocument("retention", "JUDGE_FALLBACK_DESCRIPTION", "PRIVATE_JUDGE_FALLBACK_BODY."),
+      "utf8",
+    );
+    const pi = new FakePi();
+    const server = await startSummaryServer([
+      { text: "Seed coverage summary: archival policy and recovery windows." },
+      { judgeProbability: 0.94 },
+      { text: "Low-confidence refresh: archival policy, deletion holds, and restoration windows." },
+      { error: "fixture judge provider unavailable" },
+      { text: "Judge-failure refresh: archival policy, deletion holds, and recovery." },
+    ]);
+    const summaryModel = makeSummaryModel(server.baseUrl);
+    const judgeModel = makeJudgeModel(server.rootUrl);
+    const runtime = summaryRuntime(summaryModel, undefined, [judgeModel, summaryModel]);
+    const judgeSettings = configureJudgeRole(pi);
+    const ctx = makeContext(process.cwd(), undefined, undefined, runtime);
+    await install(pi, managedRoot);
+    try {
+      const command = pi.commands.get("refresh-managed-skills");
+      if (!command) throw new Error("extension must register /refresh-managed-skills");
+      await command("--force", ctx);
+      const indexPath = groupIndexFile(managedRoot, "coverage-group");
+      await waitForFileText(indexPath, "Seed coverage summary: archival policy and recovery windows.");
+
+      await withActiveSettings(judgeSettings, () => command("", ctx));
+      const afterLowConfidence = await waitForFileText(
+        indexPath,
+        "Low-confidence refresh: archival policy, deletion holds, and restoration windows.",
+      );
+      expect(frontmatter(afterLowConfidence).description).toBe(
+        "Low-confidence refresh: archival policy, deletion holds, and restoration windows.",
+      );
+      const visibleLowConfidence = runtime.notifications.join("\n");
+      expect(visibleLowConfidence).toMatch(/0\.94|confidence|uncertain/i);
+
+      const judgeFailureStart = runtime.notifications.length;
+      await withActiveSettings(judgeSettings, () => command("", ctx));
+      const afterJudgeFailure = await waitForFileText(
+        indexPath,
+        "Judge-failure refresh: archival policy, deletion holds, and recovery.",
+      );
+      expect(frontmatter(afterJudgeFailure).description).toBe(
+        "Judge-failure refresh: archival policy, deletion holds, and recovery.",
+      );
+      const visibleJudgeFailure = runtime.notifications.slice(judgeFailureStart).join("\n");
+      expect(visibleJudgeFailure).toContain("fixture judge provider unavailable");
+      expect(visibleJudgeFailure).toMatch(/judge|failed|unavailable/i);
+      expect(server.requests.map(request => request.path)).toEqual([
+        "/v1/chat/completions",
+        "/v1/systemone",
+        "/v1/chat/completions",
+        "/v1/systemone",
+        "/v1/chat/completions",
+      ]);
+      expect(server.requests.every(request => !request.body.includes("PRIVATE_JUDGE_FALLBACK_BODY."))).toBe(true);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("failed automatic summary work is recovered on the next session start", async () => {
+    const managedRoot = await makeRoot("auto-learn-scope-group-");
+    const firstPi = new FakePi();
+    const server = await startSummaryServer([
+      { error: "fixture automatic summary failure" },
+      { text: "Recovered summary: escalation ownership, diagnostics, and remediation." },
+    ]);
+    const model = makeSummaryModel(server.baseUrl);
+    const runtime = summaryRuntime(model);
+    await install(firstPi, managedRoot);
+    try {
+      const createResult = await executeTool(findTool(firstPi, "manage_skill"), {
+        scope: "global",
+        group: "service-operations",
+        action: "create",
+        name: "diagnostics",
+        description: "RECOVERY_TRIGGER_DESCRIPTION",
+        body: "PRIVATE_RECOVERY_PENDING_BODY.",
+      }, makeContext(process.cwd(), undefined, undefined, runtime));
+      const failureNotice = await waitForNotification(runtime, "fixture automatic summary failure");
+      expect(failureNotice).toContain("service-operations");
+      expect(outcomeText(createResult)).toMatch(/summary|queued|pending/i);
+
+      const nextPi = new FakePi();
+      await install(nextPi, managedRoot);
+      const sessionStart = nextPi.handlers.get("session_start")?.[0];
+      if (!sessionStart) throw new Error("extension must recover durable automatic summary work at session_start");
+      await sessionStart(
+        { type: "session_start" },
+        makeContext(process.cwd(), undefined, undefined, runtime),
+      );
+
+      const recoveredIndex = await waitForFileText(
+        groupIndexFile(managedRoot, "service-operations"),
+        "Recovered summary: escalation ownership, diagnostics, and remediation.",
+      );
+      expect(frontmatter(recoveredIndex).description).toBe(
+        "Recovered summary: escalation ownership, diagnostics, and remediation.",
+      );
+      expect(server.requests.map(request => request.path)).toEqual([
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+      ]);
+      expect(server.requests.every(request => !request.body.includes("PRIVATE_RECOVERY_PENDING_BODY."))).toBe(true);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("a session switch recovers failed manual work in the same extension instance", async () => {
+    const managedRoot = await makeRoot("auto-learn-scope-session-switch-");
+    const store = createManagedGroupStore(managedRoot);
+    store.mutate({
+      group: "session-recovery",
+      action: "create",
+      name: "diagnostics",
+      description: "SESSION_RECOVERY_TRIGGER_DESCRIPTION",
+      body: "PRIVATE_SESSION_RECOVERY_BODY.",
+    });
+
+    const pi = new FakePi();
+    const server = await startSummaryServer([
+      { error: "fixture manual summary failure" },
+      { text: "Recovered summary: operational diagnostics, escalation ownership, and remediation." },
+    ]);
+    const runtime = summaryRuntime(makeSummaryModel(server.baseUrl));
+    await install(pi, managedRoot);
+    try {
+      const command = pi.commands.get("refresh-managed-skills");
+      if (!command) throw new Error("extension must register /refresh-managed-skills");
+      await command("--force", makeContext(process.cwd(), undefined, undefined, runtime));
+      expect(pi.messages.some(message => message.content.includes("fixture manual summary failure"))).toBe(true);
+
+      const sessionSwitch = pi.handlers.get("session_switch")?.[0];
+      if (!sessionSwitch) throw new Error("extension must recover failed manual work after session_switch");
+      await sessionSwitch(
+        { type: "session_switch", reason: "new", previousSessionFile: "/tmp/previous-session.jsonl" },
+        makeContext(process.cwd(), undefined, undefined, runtime),
+      );
+
+      const recoveredIndex = await waitForFileText(
+        groupIndexFile(managedRoot, "session-recovery"),
+        "Recovered summary: operational diagnostics, escalation ownership, and remediation.",
+      );
+      expect(frontmatter(recoveredIndex).description).toBe(
+        "Recovered summary: operational diagnostics, escalation ownership, and remediation.",
+      );
+      expect(server.requests.map(request => request.path)).toEqual([
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+      ]);
+      expect(server.requests.every(request => !request.body.includes("PRIVATE_SESSION_RECOVERY_BODY."))).toBe(true);
+    } finally {
+      await server.close();
+    }
   });
 
 });

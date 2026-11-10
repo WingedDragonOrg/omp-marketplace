@@ -36,16 +36,50 @@ type ManagedGroupFailure = Error & {
   skillPath?: string;
   indexes?: IndexWriteResult[];
 };
+type ManagedGroupSummaryWork = {
+  group: string;
+  operationId: string;
+  generation: number;
+  trigger: "automatic" | "manual";
+};
+type ManagedGroupSummarySnapshot = {
+  group: string;
+  revision: string;
+  generation: number;
+  summary: string;
+  hasGeneratedSummary: boolean;
+  status: "uninitialized" | "pending" | "current" | "stale" | "failed" | "skipped";
+  entries: Array<{ kind: "skill" | "group"; name: string; description: string }>;
+  dependencies: Array<{
+    group: string;
+    revision: string;
+    generation: number;
+    status: "uninitialized" | "pending" | "current" | "stale" | "failed" | "skipped";
+  }>;
+  contentFingerprint: string;
+};
 type ManagedGroupStore = {
+  beginSession(): void;
   scan(): void;
   refresh(group: string): void;
   mutate(input: ManagedGroupInput): ManagedGroupMutation;
   isGroup(group: string): boolean;
+  pendingSummaryWork(): ManagedGroupSummaryWork[];
+  summarySnapshot(work: ManagedGroupSummaryWork): ManagedGroupSummarySnapshot | null;
+  commitSummary(
+    snapshot: ManagedGroupSummarySnapshot,
+    description: string,
+  ): { status: "committed" | "stale" };
+  skipSummary(snapshot: ManagedGroupSummarySnapshot): { status: "skipped" | "stale" };
+  failSummary(
+    snapshot: ManagedGroupSummarySnapshot,
+    reason: string,
+  ): { status: "failed" | "stale" };
+  queueManualSummaryWork(): ManagedGroupSummaryWork[];
 };
 type ManagedGroupsModule = {
   createManagedGroupStore?: (root: string) => ManagedGroupStore;
 };
-
 const GROUP_INDEX_MARKER = "<!-- auto-learn-scope managed skill group index -->";
 
 const modulePromise: Promise<ManagedGroupsModule> = import("../src/managed-groups")
@@ -92,6 +126,20 @@ function memberSkillFile(root: string, group: string, directory: string): string
 
 function skillText(name: string, description: string, body: string): string {
   return `---\nname: ${name}\ndescription: ${description}\n---\n\n${body.trim()}\n`;
+}
+
+function groupIndexMetadata(index: string): {
+  description: string;
+  revision?: string;
+  summaryState?: { status: string };
+} {
+  const frontmatter = index.match(/^---\n([\s\S]*?)\n---/);
+  if (!frontmatter) throw new Error("group index is missing frontmatter");
+  return Bun.YAML.parse(frontmatter[1]) as {
+    description: string;
+    revision?: string;
+    summaryState?: { status: string };
+  };
 }
 
 async function writeMember(
@@ -156,6 +204,113 @@ function runChildMutation(root: string, group: string, name: string): Promise<vo
       reject(new Error(`managed group child failed (${signal ?? code}): ${stderr}`));
     }
   });
+  return promise;
+}
+
+function runInterruptedChildCreate(root: string, group: string, name: string): Promise<{ code: number | null; stderr: string }> {
+  // Register the filesystem interruption before importing the storage module in the child.
+  const moduleUrl = new URL("../src/managed-groups.ts", import.meta.url).href;
+  const memberPath = memberSkillFile(root, group, name);
+  const source = `
+    import { mock } from "bun:test";
+    import * as fs from "node:fs";
+    const originalLinkSync = fs.linkSync;
+    mock.module("node:fs", () => ({
+      ...fs,
+      linkSync(source, destination) {
+        originalLinkSync(source, destination);
+        if (String(destination) === ${JSON.stringify(memberPath)}) process.exit(86);
+      },
+    }));
+    const { createManagedGroupStore } = await import(${JSON.stringify(moduleUrl)});
+    createManagedGroupStore(${JSON.stringify(root)}).mutate({
+      group: ${JSON.stringify(group)},
+      action: "create",
+      name: ${JSON.stringify(name)},
+      description: ${JSON.stringify(`Description for ${name}.`)},
+      body: ${JSON.stringify(`Body for ${name}.`)},
+    });
+  `;
+  const { promise, resolve, reject } = Promise.withResolvers<{ code: number | null; stderr: string }>();
+  const child = spawn(process.execPath, ["-e", source], {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let stderr = "";
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", chunk => {
+    stderr += String(chunk);
+  });
+  child.once("error", reject);
+  child.once("close", code => resolve({ code, stderr }));
+  return promise;
+}
+
+function runInterruptedDescriptionUpdate(root: string, group: string, directory: string, before: boolean): Promise<number | null> {
+  const moduleUrl = new URL("../src/managed-groups.ts", import.meta.url).href;
+  const memberPath = memberSkillFile(root, group, directory);
+  const source = `
+    import { mock } from "bun:test";
+    import * as fs from "node:fs";
+    const rename = fs.renameSync;
+    mock.module("node:fs", () => ({
+      ...fs,
+      renameSync(from, to) {
+        if (String(to) === ${JSON.stringify(memberPath)} && ${JSON.stringify(before)}) process.exit(86);
+        rename(from, to);
+        if (String(to) === ${JSON.stringify(memberPath)}) process.exit(87);
+      },
+    }));
+    const { createManagedGroupStore } = await import(${JSON.stringify(moduleUrl)});
+    createManagedGroupStore(${JSON.stringify(root)}).mutate({
+      group: ${JSON.stringify(group)}, action: "update", name: "member",
+      description: "Updated description.", body: "Updated body.",
+    });
+  `;
+  const { promise, resolve, reject } = Promise.withResolvers<number | null>();
+  const child = spawn(process.execPath, ["-e", source], { stdio: "ignore" });
+  child.once("error", reject);
+  child.once("close", resolve);
+  return promise;
+}
+
+function runInterruptedChildCreateAfterIndex(
+  root: string,
+  group: string,
+  name: string,
+): Promise<{ code: number | null; stderr: string }> {
+  const moduleUrl = new URL("../src/managed-groups.ts", import.meta.url).href;
+  const indexPath = groupSkillFile(root, group);
+  const source = `
+    import { mock } from "bun:test";
+    import * as fs from "node:fs";
+    const originalRenameSync = fs.renameSync;
+    mock.module("node:fs", () => ({
+      ...fs,
+      renameSync(from, to) {
+        originalRenameSync(from, to);
+        if (String(to) === ${JSON.stringify(indexPath)}) process.exit(87);
+      },
+    }));
+    const { createManagedGroupStore } = await import(${JSON.stringify(moduleUrl)});
+    createManagedGroupStore(${JSON.stringify(root)}).mutate({
+      group: ${JSON.stringify(group)},
+      action: "create",
+      name: ${JSON.stringify(name)},
+      description: ${JSON.stringify(`Description for ${name}.`)},
+      body: ${JSON.stringify(`Body for ${name}.`)},
+    });
+  `;
+  const { promise, resolve, reject } = Promise.withResolvers<{ code: number | null; stderr: string }>();
+  const child = spawn(process.execPath, ["-e", source], {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let stderr = "";
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", chunk => {
+    stderr += String(chunk);
+  });
+  child.once("error", reject);
+  child.once("close", code => resolve({ code, stderr }));
   return promise;
 }
 
@@ -1223,5 +1378,564 @@ describe("managed skill group storage", () => {
     }
     expect(failure).toBeInstanceOf(Error);
     expect((failure as ManagedGroupFailure).skillPath).toBe(memberSkillFile(root, "engineering/database", "space-audit"));
+  });
+  test("updating a member keeps the existing group description", async () => {
+    const root = await makeManagedRoot();
+    await writeMember(root, "kept-group", "reader", "reader", "Original description.");
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    const index = groupSkillFile(root, "kept-group");
+    await writeFile(index, `---\nname: kept-group\ndescription: "Previously generated summary."\n---\n\n${GROUP_INDEX_MARKER}\n\n# kept-group\n`);
+    store.mutate({ group: "kept-group", action: "update", name: "reader", description: "New description.", body: "Updated body." });
+    expect(groupIndexMetadata(await readFile(index, "utf8")).description).toBe("Previously generated summary.");
+  });
+
+  test("scanning a historical marked group without a revision preserves its summary", async () => {
+    const root = await makeManagedRoot();
+    await writeMember(root, "legacy-summary", "reader", "reader", "Member description.");
+    const indexPath = groupSkillFile(root, "legacy-summary");
+    await writeFile(
+      indexPath,
+      `---\nname: legacy-summary\ndescription: "Historical summary."\n---\n\n${GROUP_INDEX_MARKER}\n\n# legacy-summary\n`,
+    );
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+
+    const index = await readFile(indexPath, "utf8");
+    expect(groupIndexMetadata(index).description).toBe("Historical summary.");
+    expect(groupIndexMetadata(index).revision).toBeDefined();
+    expect(store.pendingSummaryWork()).toEqual([]);
+    const [work] = store.queueManualSummaryWork();
+    const snapshot = store.summarySnapshot(work!)!;
+    expect(snapshot.summary).toBe("Historical summary.");
+    expect(snapshot.hasGeneratedSummary).toBe(false);
+  });
+  test("a member update preserves the generated summary and advances the index revision", async () => {
+    const root = await makeManagedRoot();
+    await writeMember(root, "summary-preserved", "reader-folder", "read-runbook", "Before update.", "Old body.");
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    const [work] = store.queueManualSummaryWork();
+    expect(work?.group).toBe("summary-preserved");
+    expect(work?.trigger).toBe("manual");
+    const snapshot = store.summarySnapshot(work!);
+    expect(snapshot).not.toBeNull();
+    expect(store.commitSummary(snapshot!, "Guides safe incident recovery.").status).toBe("committed");
+
+    const indexPath = groupSkillFile(root, "summary-preserved");
+    const before = groupIndexMetadata(await readFile(indexPath, "utf8"));
+    expect(before.description).toBe("Guides safe incident recovery.");
+    expect(before.revision).toBeDefined();
+
+    store.mutate({
+      group: "summary-preserved",
+      action: "update",
+      name: "read-runbook",
+      description: "Updated runbook description.",
+      body: "Updated body.",
+    });
+
+    const index = await readFile(indexPath, "utf8");
+    const after = groupIndexMetadata(index);
+    expect(after.description).toBe("Guides safe incident recovery.");
+    expect(after.revision).toBeDefined();
+    expect(after.revision).not.toBe(before.revision);
+    expect(index).toContain("Updated runbook description.");
+    expect(await readFile(memberSkillFile(root, "summary-preserved", "reader-folder"), "utf8"))
+      .toBe(skillText("read-runbook", "Updated runbook description.", "Updated body."));
+  });
+
+  test("new members and description changes queue durable automatic summary work", async () => {
+    const root = await makeManagedRoot();
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    store.mutate({
+      group: "automatic-work",
+      action: "create",
+      name: "first-skill",
+      description: "First member.",
+      body: "First body.",
+    });
+    const [firstWork] = store.pendingSummaryWork();
+    expect(firstWork?.group).toBe("automatic-work");
+    expect(firstWork?.trigger).toBe("automatic");
+    expect(firstWork?.generation).toBeGreaterThan(0);
+
+    const restarted = createStore(root);
+    expect(restarted.pendingSummaryWork()).toEqual([firstWork]);
+    const firstSnapshot = restarted.summarySnapshot(firstWork!);
+    expect(firstSnapshot).not.toBeNull();
+    restarted.mutate({
+      group: "automatic-work",
+      action: "update",
+      name: "first-skill",
+      description: "Updated member.",
+      body: "Updated body.",
+    });
+    const [updatedWork] = restarted.pendingSummaryWork();
+    expect(updatedWork?.generation).toBeGreaterThan(firstWork!.generation);
+    expect(createStore(root).pendingSummaryWork()).toContainEqual(updatedWork!);
+    expect(restarted.commitSummary(firstSnapshot!, "Obsolete first summary.").status).toBe("stale");
+
+    restarted.mutate({ group: "automatic-work", action: "delete", name: "first-skill" });
+    expect(restarted.pendingSummaryWork()).toEqual([]);
+
+    restarted.mutate({
+      group: "automatic-work",
+      action: "create",
+      name: "second-skill",
+      description: "Second member.",
+      body: "Second body.",
+    });
+    const secondWork = restarted.pendingSummaryWork().find(work => work.generation > firstWork!.generation);
+    expect(secondWork?.group).toBe("automatic-work");
+    expect(secondWork?.trigger).toBe("automatic");
+    expect(secondWork?.operationId).not.toBe(firstWork?.operationId);
+    expect(secondWork?.generation).toBeGreaterThan(firstWork!.generation);
+  });
+
+  test("a snapshot cannot overwrite a member update made while summary generation is running", async () => {
+    const root = await makeManagedRoot();
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    store.mutate({
+      group: "stale-after-update",
+      action: "create",
+      name: "member",
+      description: "Original description.",
+      body: "Original body.",
+    });
+    const [work] = store.pendingSummaryWork();
+    const snapshot = store.summarySnapshot(work!)!;
+
+    const indexPath = groupSkillFile(root, "stale-after-update");
+    const previousDescription = groupIndexMetadata(await readFile(indexPath, "utf8")).description;
+    store.mutate({
+      group: "stale-after-update",
+      action: "update",
+      name: "member",
+      description: "Original description.",
+      body: "Current body.",
+    });
+
+    expect(store.commitSummary(snapshot, "Obsolete summary.").status).toBe("stale");
+    expect(store.skipSummary(snapshot).status).toBe("stale");
+    const index = await readFile(indexPath, "utf8");
+    const member = await readFile(memberSkillFile(root, "stale-after-update", "member"), "utf8");
+    expect(groupIndexMetadata(index).description).toBe(previousDescription);
+    expect(member).toContain("Current body.");
+    expect(index).not.toContain("Obsolete summary.");
+    expect(store.pendingSummaryWork()).toEqual([]);
+
+  });
+
+  test("a second addition leaves its newer generation pending after an old snapshot is submitted", async () => {
+    const root = await makeManagedRoot();
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    store.mutate({
+      group: "stale-after-add",
+      action: "create",
+      name: "first",
+      description: "First member.",
+      body: "First body.",
+    });
+    const [firstWork] = store.pendingSummaryWork();
+    const oldSnapshot = store.summarySnapshot(firstWork!)!;
+
+    store.mutate({
+      group: "stale-after-add",
+      action: "create",
+      name: "second",
+      description: "Second member.",
+      body: "Second body.",
+    });
+
+    expect(store.commitSummary(oldSnapshot, "Obsolete first-generation summary.").status).toBe("stale");
+    expect(store.skipSummary(oldSnapshot).status).toBe("stale");
+    const currentWork = store.pendingSummaryWork().find(work => work.generation > firstWork!.generation);
+    expect(currentWork?.group).toBe("stale-after-add");
+    expect(currentWork?.trigger).toBe("automatic");
+    const currentSnapshot = store.summarySnapshot(currentWork!)!;
+    expect(currentSnapshot.entries).toContainEqual({
+      kind: "skill",
+      name: "first",
+      description: "First member.",
+    });
+    expect(currentSnapshot.entries).toContainEqual({
+      kind: "skill",
+      name: "second",
+      description: "Second member.",
+    });
+    expect(await readFile(groupSkillFile(root, "stale-after-add"), "utf8"))
+      .not.toContain("Obsolete first-generation summary.");
+  });
+
+  test("only the first summary snapshot based on the same revision can commit", async () => {
+    const root = await makeManagedRoot();
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    store.mutate({
+      group: "cas",
+      action: "create",
+      name: "member",
+      description: "Member description.",
+      body: "Member body.",
+    });
+    const [work] = store.pendingSummaryWork();
+    const firstSnapshot = store.summarySnapshot(work!)!;
+    const secondSnapshot = store.summarySnapshot(work!)!;
+
+    expect(store.commitSummary(firstSnapshot, "First committed summary.").status).toBe("committed");
+    const committedIndex = await readFile(groupSkillFile(root, "cas"), "utf8");
+    const committedRevision = groupIndexMetadata(committedIndex).revision;
+    expect(store.commitSummary(secondSnapshot, "Late competing summary.").status).toBe("stale");
+
+    const finalIndex = await readFile(groupSkillFile(root, "cas"), "utf8");
+    expect(groupIndexMetadata(finalIndex).description).toBe("First committed summary.");
+    expect(groupIndexMetadata(finalIndex).revision).toBe(committedRevision);
+    expect(finalIndex).not.toContain("Late competing summary.");
+  });
+
+  test("a body-only external edit invalidates a snapshot during CAS validation", async () => {
+    const root = await makeManagedRoot();
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    store.mutate({
+      group: "fingerprint",
+      action: "create",
+      name: "member",
+      description: "Unchanged metadata.",
+      body: "Original body marker.",
+    });
+    const [work] = store.pendingSummaryWork();
+    const snapshot = store.summarySnapshot(work!)!;
+    const indexPath = groupSkillFile(root, "fingerprint");
+    const revisionBefore = groupIndexMetadata(await readFile(indexPath, "utf8")).revision;
+    const memberPath = memberSkillFile(root, "fingerprint", "member");
+    const member = await readFile(memberPath, "utf8");
+    await writeFile(memberPath, member.replace("Original body marker.", "External body edit."));
+    expect(store.commitSummary(snapshot, "Summary based on the old body.").status).toBe("stale");
+    expect(store.skipSummary(snapshot).status).toBe("stale");
+    const revisionAfter = groupIndexMetadata(await readFile(indexPath, "utf8")).revision;
+    expect(revisionAfter).not.toBe(revisionBefore);
+    expect(await readFile(indexPath, "utf8")).not.toContain("Summary based on the old body.");
+  });
+
+  test("a completed summary becomes stale when a member body changes outside the store", async () => {
+    const root = await makeManagedRoot();
+    await writeMember(root, "fingerprint-current", "member-folder", "member", "Member description.", "Before.");
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    const [work] = store.queueManualSummaryWork();
+    const snapshot = store.summarySnapshot(work!)!;
+    expect(store.commitSummary(snapshot, "Previously generated summary.").status).toBe("committed");
+
+    const indexPath = groupSkillFile(root, "fingerprint-current");
+    const revisionBefore = groupIndexMetadata(await readFile(indexPath, "utf8")).revision;
+    const memberPath = memberSkillFile(root, "fingerprint-current", "member-folder");
+    const member = await readFile(memberPath, "utf8");
+    await writeFile(memberPath, member.replace("Before.", "After."));
+    expect(store.pendingSummaryWork()).toEqual([]);
+
+    const metadata = groupIndexMetadata(await readFile(indexPath, "utf8"));
+    expect(metadata.summaryState?.status).toBe("stale");
+    expect(metadata.revision).not.toBe(revisionBefore);
+    expect(metadata.description).toBe("Previously generated summary.");
+  });
+
+  test("manual refresh schedules every group bottom-up and does not resume as automatic work", async () => {
+    const root = await makeManagedRoot();
+    await writeMember(root, "refresh/alpha", "alpha-folder", "alpha-skill", "Alpha member.");
+    await writeMember(root, "refresh/beta", "beta-folder", "beta-skill", "Temporary beta member.");
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    store.mutate({ group: "refresh/beta", action: "delete", name: "beta-skill" });
+    expect(store.pendingSummaryWork()).toEqual([]);
+
+    const firstManualWork = store.queueManualSummaryWork();
+    expect(firstManualWork.slice(0, -1).map(work => work.group).sort()).toEqual(["refresh/alpha", "refresh/beta"]);
+    expect(firstManualWork.at(-1)?.group).toBe("refresh");
+    expect(firstManualWork.every(work => work.trigger === "manual")).toBe(true);
+    store.beginSession();
+    expect(store.pendingSummaryWork()).toEqual([]);
+    const manualWork = store.queueManualSummaryWork();
+    expect(manualWork.slice(0, -1).map(work => work.group).sort()).toEqual(["refresh/alpha", "refresh/beta"]);
+    expect(manualWork.at(-1)?.group).toBe("refresh");
+
+    let betaBaseline: ManagedGroupSummarySnapshot["dependencies"][number] | undefined;
+    for (const work of manualWork) {
+      const snapshot = store.summarySnapshot(work);
+      expect(snapshot).not.toBeNull();
+      if (work.group === "refresh") {
+        betaBaseline = snapshot!.dependencies.find(dependency => dependency.group === "refresh/beta");
+      }
+      expect(store.commitSummary(snapshot!, `Summary for ${work.group}.`).status).toBe("committed");
+    }
+    expect(store.pendingSummaryWork()).toEqual([]);
+    expect(await readFile(groupSkillFile(root, "refresh/beta"), "utf8")).toContain("Summary for refresh/beta.");
+    expect(betaBaseline?.status).toBe("current");
+    const unaffectedBeta = betaBaseline!;
+
+    store.mutate({
+      group: "refresh/alpha",
+      action: "create",
+      name: "new-alpha-skill",
+      description: "New alpha member.",
+      body: "New alpha body.",
+    });
+    const automaticWork = store.pendingSummaryWork();
+    expect(automaticWork.map(work => work.group)).toContain("refresh/alpha");
+    expect(automaticWork.map(work => work.group)).toContain("refresh");
+    expect(automaticWork.map(work => work.group)).not.toContain("refresh/beta");
+    const automaticParentWork = automaticWork.find(work => work.group === "refresh")!;
+    const blockedParentSnapshot = store.summarySnapshot(automaticParentWork)!;
+    const alphaPending = blockedParentSnapshot.dependencies.find(dependency => dependency.group === "refresh/alpha")!;
+    const betaUnchanged = blockedParentSnapshot.dependencies.find(dependency => dependency.group === "refresh/beta")!;
+    expect(alphaPending.status).toBe("pending");
+    expect(betaUnchanged).toMatchObject({
+      revision: unaffectedBeta.revision,
+      generation: unaffectedBeta.generation,
+      status: "current",
+    });
+
+    const automaticAlphaWork = automaticWork.find(work => work.group === "refresh/alpha")!;
+    const alphaSnapshot = store.summarySnapshot(automaticAlphaWork)!;
+    expect(store.skipSummary(alphaSnapshot).status).toBe("skipped");
+    expect(await readFile(groupSkillFile(root, "refresh/alpha"), "utf8"))
+      .toContain("Summary for refresh/alpha.");
+    expect(store.commitSummary(blockedParentSnapshot, "Stale parent summary.").status).toBe("stale");
+
+    const currentParentSnapshot = store.summarySnapshot(automaticParentWork)!;
+    expect(currentParentSnapshot.dependencies.find(dependency => dependency.group === "refresh/alpha")?.status)
+      .toBe("skipped");
+    expect(currentParentSnapshot.dependencies.find(dependency => dependency.group === "refresh/beta"))
+      .toMatchObject({
+        revision: unaffectedBeta.revision,
+        generation: unaffectedBeta.generation,
+        status: "current",
+      });
+    expect(store.commitSummary(currentParentSnapshot, "Combined updated summary.").status).toBe("committed");
+    expect(await readFile(groupSkillFile(root, "refresh"), "utf8")).toContain("Combined updated summary.");
+  });
+
+  test("an uninitialized unaffected child keeps its description in an automatic parent snapshot", async () => {
+    const root = await makeManagedRoot();
+    await writeMember(root, "summary/changed", "first-folder", "first-skill", "Changed member.");
+    await writeMember(root, "summary/untouched", "first-folder", "untouched-skill", "Untouched member.");
+    await writeFile(
+      groupSkillFile(root, "summary/untouched"),
+      `---\nname: untouched\ndescription: Existing untouched description.\n---\n\n${GROUP_INDEX_MARKER}\n`,
+      "utf8",
+    );
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    store.mutate({
+      group: "summary/changed",
+      action: "create",
+      name: "second-skill",
+      description: "New changed member.",
+      body: "New body.",
+    });
+
+    const changedWork = store.pendingSummaryWork().find(work => work.group === "summary/changed")!;
+    const changedSnapshot = store.summarySnapshot(changedWork)!;
+    expect(store.commitSummary(changedSnapshot, "Updated changed child summary.").status).toBe("committed");
+    const parentWork = store.pendingSummaryWork().find(work => work.group === "summary")!;
+    const snapshot = store.summarySnapshot(parentWork);
+    expect(snapshot).not.toBeNull();
+    expect(snapshot!.dependencies.find(dependency => dependency.group === "summary/untouched")?.status)
+      .toBe("uninitialized");
+    expect(snapshot!.entries.find(entry => entry.kind === "group" && entry.name === "untouched")?.description)
+      .toBe("Existing untouched description.");
+    expect(store.commitSummary(snapshot!, "Parent summary using existing child metadata.").status).toBe("committed");
+  });
+
+  test("a new process recovers a committed member before completing the next addition", async () => {
+    const root = await makeManagedRoot();
+    const interrupted = await runInterruptedChildCreate(root, "ordered-recovery", "first");
+    expect(interrupted.code).toBe(86);
+    expect(interrupted.stderr).toBe("");
+    expect(await readFile(memberSkillFile(root, "ordered-recovery", "first"), "utf8"))
+      .toBe(skillText("first", "Description for first.", "Body for first."));
+
+    const createStore = await createStoreFactory();
+    const recoveredStore = createStore(root);
+    const firstWork = recoveredStore.pendingSummaryWork().find(work => work.group === "ordered-recovery")!;
+    expect(firstWork.trigger).toBe("automatic");
+    expect(firstWork.generation).toBeGreaterThan(0);
+
+    await runChildMutation(root, "ordered-recovery", "second");
+    const afterSecondAdd = createStore(root);
+    const secondWork = afterSecondAdd.pendingSummaryWork()
+      .find(work => work.group === "ordered-recovery" && work.generation > firstWork.generation)!;
+    expect(secondWork.trigger).toBe("automatic");
+    expect(secondWork.generation).toBe(firstWork.generation + 1);
+    expect(secondWork.operationId).not.toBe(firstWork.operationId);
+
+    const index = await readFile(groupSkillFile(root, "ordered-recovery"), "utf8");
+    expect(index).toContain("skill://ordered-recovery/first/SKILL.md");
+    expect(index).toContain("skill://ordered-recovery/second/SKILL.md");
+    const thirdStore = createStore(root);
+    expect(thirdStore.pendingSummaryWork()).toContainEqual(secondWork);
+  });
+
+  test("description update recovery distinguishes commits before and after atomic replacement", async () => {
+    const createStore = await createStoreFactory();
+    for (const before of [true, false]) {
+      const root = await makeManagedRoot();
+      await writeMember(root, "recovery", "member-folder", "member", "Original description.");
+      const store = createStore(root);
+      store.scan();
+      expect(await runInterruptedDescriptionUpdate(root, "recovery", "member-folder", before)).toBe(before ? 86 : 87);
+      const restarted = createStore(root);
+      const pending = restarted.pendingSummaryWork();
+      const index = await readFile(groupSkillFile(root, "recovery"), "utf8");
+      if (before) {
+        expect(pending).toEqual([]);
+        expect(index).toContain("Original description.");
+      } else {
+        expect(pending.map(work => work.group)).toEqual(["recovery"]);
+        expect(index).toContain("Updated description.");
+      }
+    }
+  });
+
+  test("recovery rejects a symlinked intermediate group without cleaning other files", async () => {
+    const root = await makeManagedRoot();
+    const interrupted = await runInterruptedChildCreate(root, "nested/a/b", "first");
+    expect(interrupted.code).toBe(86);
+
+    const outside = await makeOutsideDirectory();
+    const outsideMemberDirectory = join(outside, "b", "first");
+    await mkdir(outsideMemberDirectory, { recursive: true });
+    const unrelatedTemporary = join(outsideMemberDirectory, ".managed-skill.tmp-unrelated");
+    await writeFile(unrelatedTemporary, "leave this file untouched.", "utf8");
+    await rm(join(root, "nested", "a"), { recursive: true, force: true });
+    await symlink(outside, join(root, "nested", "a"), "dir");
+
+    const store = (await createStoreFactory())(root);
+    expect(() => store.pendingSummaryWork()).toThrow();
+    expect(await readFile(unrelatedTemporary, "utf8")).toBe("leave this file untouched.");
+  });
+
+  test("recovering an interrupted add does not refresh an obsolete work fingerprint", async () => {
+    const root = await makeManagedRoot();
+    const group = "fingerprint-recovery";
+    await writeMember(root, group, "first-folder", "first-skill", "First member.");
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    const [initialWork] = store.queueManualSummaryWork();
+    expect(store.commitSummary(store.summarySnapshot(initialWork!)!, "Previous summary.").status).toBe("committed");
+
+    const interrupted = await runInterruptedChildCreateAfterIndex(root, group, "second-skill");
+    expect(interrupted.code).toBe(87);
+    expect(interrupted.stderr).toBe("");
+    const existingMember = memberSkillFile(root, group, "first-folder");
+    const content = await readFile(existingMember, "utf8");
+    await writeFile(existingMember, content.replace("Body for first-skill.", "Externally changed after the crash."), "utf8");
+
+    const restarted = createStore(root);
+    expect(restarted.pendingSummaryWork().some(work => work.group === group)).toBe(false);
+    const index = await readFile(groupSkillFile(root, group), "utf8");
+    expect(groupIndexMetadata(index).description).toBe("Previous summary.");
+    expect(index).toContain(`skill://${group}/second-skill/SKILL.md`);
+  });
+  test("a judge skip keeps the prior summary while CAS-advancing its revision", async () => {
+    const root = await makeManagedRoot();
+    await writeMember(root, "skip-summary", "first-folder", "first-skill", "First member.");
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    const [manualWork] = store.queueManualSummaryWork();
+    const initialSnapshot = store.summarySnapshot(manualWork!)!;
+    expect(store.commitSummary(initialSnapshot, "A useful existing summary.").status).toBe("committed");
+    const indexPath = groupSkillFile(root, "skip-summary");
+    const before = groupIndexMetadata(await readFile(indexPath, "utf8"));
+
+    store.mutate({
+      group: "skip-summary",
+      action: "create",
+      name: "second-skill",
+      description: "Second member.",
+      body: "Second body.",
+    });
+    const automaticWork = store.pendingSummaryWork().find(work => work.group === "skip-summary")!;
+    const skipSnapshot = store.summarySnapshot(automaticWork)!;
+    const concurrentGeneration = store.summarySnapshot(automaticWork)!;
+
+    expect(store.skipSummary(skipSnapshot).status).toBe("skipped");
+    const skippedIndex = await readFile(indexPath, "utf8");
+    const after = groupIndexMetadata(skippedIndex);
+    expect(after.description).toBe("A useful existing summary.");
+    expect(after.revision).not.toBe(before.revision);
+    expect(skippedIndex).toContain("skill://skip-summary/second-skill/SKILL.md");
+    expect(store.pendingSummaryWork()).toEqual([]);
+    expect(store.commitSummary(concurrentGeneration, "Late generated result.").status).toBe("stale");
+    const finalIndex = await readFile(indexPath, "utf8");
+    expect(groupIndexMetadata(finalIndex).description).toBe("A useful existing summary.");
+    expect(groupIndexMetadata(finalIndex).revision).toBe(after.revision);
+    expect(finalIndex).not.toContain("Late generated result.");
+  });
+
+  test("summary generation failure preserves the previous summary and remains resumable", async () => {
+    const root = await makeManagedRoot();
+    await writeMember(root, "failed-summary", "first-folder", "first-skill", "First member.");
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    const [manualWork] = store.queueManualSummaryWork();
+    const initialSnapshot = store.summarySnapshot(manualWork!)!;
+    expect(store.commitSummary(initialSnapshot, "Previously generated summary.").status).toBe("committed");
+    const indexPath = groupSkillFile(root, "failed-summary");
+    const before = groupIndexMetadata(await readFile(indexPath, "utf8"));
+
+    store.mutate({
+      group: "failed-summary",
+      action: "create",
+      name: "second-skill",
+      description: "New member.",
+      body: "New body.",
+    });
+    const automaticWork = store.pendingSummaryWork().find(work => work.group === "failed-summary")!;
+    const snapshot = store.summarySnapshot(automaticWork)!;
+
+    expect(store.failSummary(snapshot, "provider unavailable").status).toBe("failed");
+    const failedIndex = await readFile(indexPath, "utf8");
+    const after = groupIndexMetadata(failedIndex);
+    expect(after.description).toBe("Previously generated summary.");
+    expect(after.revision).not.toBe(before.revision);
+    expect(store.commitSummary(snapshot, "Late result after failure.").status).toBe("stale");
+    expect(await readFile(indexPath, "utf8")).not.toContain("Late result after failure.");
+
+    const restarted = createStore(root);
+    expect(restarted.pendingSummaryWork()).toContainEqual(automaticWork);
+  });
+  test("a failed manual refresh immediately restores prior automatic work", async () => {
+    const root = await makeManagedRoot();
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    store.mutate({
+      group: "manual-fallback",
+      action: "create",
+      name: "member",
+      description: "Member description.",
+      body: "Member body.",
+    });
+    const automaticWork = store.pendingSummaryWork().find(work => work.group === "manual-fallback")!;
+
+    const manualWork = store.queueManualSummaryWork().find(work => work.group === "manual-fallback")!;
+    const manualSnapshot = store.summarySnapshot(manualWork)!;
+    expect(manualWork.trigger).toBe("manual");
+    expect(store.failSummary(manualSnapshot, "manual generation failed").status).toBe("failed");
+
+    const resumedAutomaticWork = store.pendingSummaryWork().find(work => work.group === "manual-fallback");
+    expect(resumedAutomaticWork?.trigger).toBe("automatic");
+    expect(resumedAutomaticWork?.generation).toBeGreaterThan(manualWork.generation);
+    expect(resumedAutomaticWork?.operationId).not.toBe(manualWork.operationId);
+    const resumedSnapshot = store.summarySnapshot(resumedAutomaticWork!);
+    expect(resumedSnapshot?.status).toBe("failed");
+    expect(resumedAutomaticWork?.operationId).not.toBe(automaticWork.operationId);
+
+    const restarted = createStore(root);
+    expect(restarted.pendingSummaryWork()).toContainEqual(resumedAutomaticWork!);
   });
 });

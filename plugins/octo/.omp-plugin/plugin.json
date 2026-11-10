@@ -1,0 +1,9 @@
+{
+  "name": "octo",
+  "version": "1.0.0",
+  "description": "Read and edit Octo documents using native Oh My Pi tools",
+  "author": {
+    "name": "WingedDragonOrg"
+  },
+  "homepage": "https://github.com/WingedDragonOrg/omp-marketplace"
+}

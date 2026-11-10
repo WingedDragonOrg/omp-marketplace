@@ -231,6 +231,18 @@
         "name": "WingedDragonOrg"
       },
       "license": "MIT"
+    },
+    {
+      "name": "octo",
+      "description": "Read and edit Octo documents using native Oh My Pi tools",
+      "source": "./octo",
+      "version": "1.0.0",
+      "category": "development",
+      "keywords": ["octo", "documents", "read", "edit"],
+      "author": {
+        "name": "WingedDragonOrg"
+      },
+      "license": "MIT"
     }
   ]
 }

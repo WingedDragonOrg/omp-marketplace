@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -19,6 +19,7 @@ import {
   type Stats,
 } from "node:fs";
 import * as path from "node:path";
+import { YAML } from "bun";
 import { parseFrontmatter as parseOmpFrontmatter, withFileLockSync } from "@oh-my-pi/pi-utils";
 import {
   MAX_PROJECT_SKILL_BYTES,
@@ -52,13 +53,67 @@ export interface ManagedGroupIndexResult {
 export interface ManagedGroupMutation {
   path: string;
   indexes: ManagedGroupIndexResult[];
+  summaryQueued: boolean;
+}
+
+export type ManagedGroupSummaryStatus =
+  | "uninitialized"
+  | "pending"
+  | "current"
+  | "stale"
+  | "failed"
+  | "skipped";
+
+export type ManagedGroupSummaryWork = {
+  group: string;
+  operationId: string;
+  generation: number;
+  trigger: "automatic" | "manual";
+};
+
+export interface ManagedGroupSummaryEntry {
+  kind: "skill" | "group";
+  name: string;
+  description: string;
+}
+
+export interface ManagedGroupSummaryDependency {
+  group: string;
+  revision: string;
+  generation: number;
+  status: ManagedGroupSummaryStatus;
+}
+
+export interface ManagedGroupSummarySnapshot {
+  group: string;
+  revision: string;
+  generation: number;
+  summary: string;
+  hasGeneratedSummary: boolean;
+  status: ManagedGroupSummaryStatus;
+  entries: ManagedGroupSummaryEntry[];
+  dependencies: ManagedGroupSummaryDependency[];
+  contentFingerprint: string;
 }
 
 export interface ManagedGroupStore {
+  beginSession(): void;
   scan(): void;
   refresh(group: string): void;
   mutate(input: ManagedGroupInput): ManagedGroupMutation;
   isGroup(group: string): boolean;
+  pendingSummaryWork(): ManagedGroupSummaryWork[];
+  summarySnapshot(work: ManagedGroupSummaryWork): ManagedGroupSummarySnapshot | null;
+  commitSummary(
+    snapshot: ManagedGroupSummarySnapshot,
+    description: string,
+  ): { status: "committed" | "stale" };
+  skipSummary(snapshot: ManagedGroupSummarySnapshot): { status: "skipped" | "stale" };
+  failSummary(
+    snapshot: ManagedGroupSummarySnapshot,
+    reason: string,
+  ): { status: "failed" | "stale" };
+  queueManualSummaryWork(): ManagedGroupSummaryWork[];
 }
 
 export type ManagedGroupError = Error & {
@@ -103,6 +158,40 @@ type GroupSnapshot = {
   indexContents: string | null;
   members: GroupMember[];
   childGroups: GroupEntry[];
+};
+type GroupSummaryState = {
+  status: ManagedGroupSummaryStatus;
+  hasGenerated: boolean;
+  generation: number;
+  trigger?: "automatic" | "manual";
+  operationId?: string;
+  summaryFingerprint?: string;
+  workFingerprint?: string;
+  dependencyFingerprint?: string;
+  affectedChildren: string[];
+  resumable: boolean;
+  preserveExistingDescription?: boolean;
+  resumeAutomatic?: { affectedChildren: string[] };
+  failureReason?: string;
+  sessionId?: string;
+};
+
+type ManagedGroupIntent = {
+  operationId: string;
+  sequence: number;
+  group: string;
+  name: string;
+  temporaryName: string;
+  contentHash: string;
+  directory?: string;
+  previousHash?: string;
+  status: "pending" | "completed" | "cancelled" | "unknown";
+};
+
+type ManagedGroupJournal = {
+  version: 1;
+  nextSequence: number;
+  intents: ManagedGroupIntent[];
 };
 
 let temporaryFileCounter = 0;
@@ -512,7 +601,7 @@ function groupIndexEntry(root: string, child: GroupTree, action: string): GroupE
     if (!snapshot) {
       throw makeError(child.group, action, `group index ${index} could not be generated safely.`, index, index, index);
     }
-    source = buildGroupIndex(snapshot);
+    source = buildGroupIndex(snapshot, action);
   } else if (stat.isSymbolicLink() || !stat.isFile() || !hasGroupMarker(contents ?? "")) {
     throw makeError(child.group, action, `group index ${index} is not a valid marked index.`, index, index, index);
   }
@@ -544,6 +633,10 @@ function validateGroupIndex(snapshot: GroupSnapshot, action: string): void {
   if (typeof frontmatter.description !== "string") {
     throw makeError(snapshot.name, action, `group index ${snapshot.index} must have a description.`, snapshot.index, snapshot.index, snapshot.index);
   }
+  if (frontmatter.revision !== undefined && (typeof frontmatter.revision !== "string" || !frontmatter.revision)) {
+    throw makeError(snapshot.name, action, `group index ${snapshot.index} has an invalid revision.`, snapshot.index, snapshot.index, snapshot.index);
+  }
+  parseGroupSummaryState(frontmatter.summaryState, snapshot.name, snapshot.index, action);
 }
 
 function inspectGroup(
@@ -627,7 +720,196 @@ function encodeSkillUriSegment(segment: string): string {
   );
 }
 
-function buildGroupIndex(snapshot: GroupSnapshot): string {
+function initialGroupSummaryState(): GroupSummaryState {
+  return {
+    status: "uninitialized",
+    hasGenerated: false,
+    generation: 0,
+    affectedChildren: [],
+    resumable: false,
+  };
+}
+
+function parseGroupSummaryState(
+  value: unknown,
+  group: string,
+  index: string,
+  action: string,
+): GroupSummaryState {
+  if (value === undefined) return initialGroupSummaryState();
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw makeError(group, action, `group index ${index} has invalid summary state.`, index, index, index);
+  }
+  const raw = value as Record<string, unknown>;
+  const statuses: ManagedGroupSummaryStatus[] = ["uninitialized", "pending", "current", "stale", "failed", "skipped"];
+  if (!statuses.includes(raw.status as ManagedGroupSummaryStatus)) {
+    throw makeError(group, action, `group index ${index} has an unsupported summary state.`, index, index, index);
+  }
+  if (typeof raw.hasGenerated !== "boolean" || !Number.isSafeInteger(raw.generation) || (raw.generation as number) < 0) {
+    throw makeError(group, action, `group index ${index} has invalid summary generation metadata.`, index, index, index);
+  }
+  if (
+    raw.trigger !== undefined &&
+    raw.trigger !== "automatic" &&
+    raw.trigger !== "manual"
+  ) {
+    throw makeError(group, action, `group index ${index} has an invalid summary trigger.`, index, index, index);
+  }
+  if (raw.operationId !== undefined && typeof raw.operationId !== "string") {
+    throw makeError(group, action, `group index ${index} has an invalid summary operation id.`, index, index, index);
+  }
+  if (raw.workFingerprint !== undefined && typeof raw.workFingerprint !== "string") {
+    throw makeError(group, action, `group index ${index} has an invalid summary fingerprint.`, index, index, index);
+  }
+  if (raw.summaryFingerprint !== undefined && (
+    typeof raw.summaryFingerprint !== "string" ||
+    !/^[0-9a-f]{64}$/.test(raw.summaryFingerprint)
+  )) {
+    throw makeError(group, action, `group index ${index} has an invalid completed-summary fingerprint.`, index, index, index);
+  }
+  if (raw.dependencyFingerprint !== undefined && (
+    typeof raw.dependencyFingerprint !== "string" ||
+    !/^[0-9a-f]{64}$/.test(raw.dependencyFingerprint)
+  )) {
+    throw makeError(group, action, `group index ${index} has an invalid dependency fingerprint.`, index, index, index);
+  }
+  if (!Array.isArray(raw.affectedChildren) || raw.affectedChildren.some(child => typeof child !== "string")) {
+    throw makeError(group, action, `group index ${index} has invalid summary dependencies.`, index, index, index);
+  }
+  if (typeof raw.resumable !== "boolean") {
+    throw makeError(group, action, `group index ${index} has invalid summary recovery metadata.`, index, index, index);
+  }
+  if (raw.preserveExistingDescription !== undefined && typeof raw.preserveExistingDescription !== "boolean") {
+    throw makeError(group, action, `group index ${index} has invalid legacy-summary metadata.`, index, index, index);
+  }
+  let resumeAutomatic: { affectedChildren: string[] } | undefined;
+  if (raw.resumeAutomatic !== undefined) {
+    if (
+      !raw.resumeAutomatic ||
+      typeof raw.resumeAutomatic !== "object" ||
+      Array.isArray(raw.resumeAutomatic) ||
+      !("affectedChildren" in raw.resumeAutomatic) ||
+      !Array.isArray(raw.resumeAutomatic.affectedChildren)
+    ) {
+      throw makeError(group, action, `group index ${index} has invalid automatic recovery metadata.`, index, index, index);
+    }
+    const affectedChildren: string[] = [];
+    for (const child of raw.resumeAutomatic.affectedChildren) {
+      if (typeof child !== "string") {
+        throw makeError(group, action, `group index ${index} has invalid automatic recovery metadata.`, index, index, index);
+      }
+      affectedChildren.push(child);
+    }
+    resumeAutomatic = { affectedChildren };
+  }
+  if (raw.failureReason !== undefined && typeof raw.failureReason !== "string") {
+    throw makeError(group, action, `group index ${index} has an invalid summary failure reason.`, index, index, index);
+  }
+  if (raw.sessionId !== undefined && typeof raw.sessionId !== "string") {
+    throw makeError(group, action, `group index ${index} has an invalid summary session id.`, index, index, index);
+  }
+  return {
+    status: raw.status as ManagedGroupSummaryStatus,
+    hasGenerated: raw.hasGenerated,
+    generation: raw.generation as number,
+    affectedChildren: raw.affectedChildren as string[],
+    resumable: raw.resumable,
+    ...(raw.trigger === undefined ? {} : { trigger: raw.trigger as "automatic" | "manual" }),
+    ...(raw.operationId === undefined ? {} : { operationId: raw.operationId }),
+    ...(raw.summaryFingerprint === undefined ? {} : { summaryFingerprint: raw.summaryFingerprint }),
+    ...(raw.dependencyFingerprint === undefined ? {} : { dependencyFingerprint: raw.dependencyFingerprint }),
+    ...(raw.workFingerprint === undefined ? {} : { workFingerprint: raw.workFingerprint }),
+    ...(raw.preserveExistingDescription === undefined ? {} : { preserveExistingDescription: raw.preserveExistingDescription }),
+    ...(resumeAutomatic === undefined ? {} : { resumeAutomatic }),
+    ...(raw.failureReason === undefined ? {} : { failureReason: raw.failureReason }),
+    ...(raw.sessionId === undefined ? {} : { sessionId: raw.sessionId }),
+  };
+}
+
+function groupIndexFrontmatter(snapshot: GroupSnapshot, action: string): Record<string, unknown> {
+  if (!snapshot.indexContents) return { name: snapshot.displayName, description: "" };
+  return parseFrontmatter(snapshot.indexContents, snapshot.name, snapshot.index, action, snapshot.index, snapshot.index);
+}
+
+function groupSummaryState(snapshot: GroupSnapshot, action: string): GroupSummaryState {
+  const frontmatter = groupIndexFrontmatter(snapshot, action);
+  const state = parseGroupSummaryState(frontmatter.summaryState, snapshot.name, snapshot.index, action);
+  if (
+    frontmatter.revision === undefined &&
+    !state.hasGenerated &&
+    typeof frontmatter.description === "string" &&
+    frontmatter.description.length > 0
+  ) {
+    return { ...state, preserveExistingDescription: true };
+  }
+  return state;
+}
+
+function groupContentFingerprint(snapshot: GroupSnapshot, action: string): string {
+  const hash = createHash("sha256");
+  const members = [...snapshot.members].sort((left, right) => left.directory.localeCompare(right.directory));
+  for (const member of members) {
+    const current = lstatOrNull(member.file);
+    if (!current || !sameFileIdentity(member.fileStat, current)) {
+      throw makeError(snapshot.name, action, `member SKILL.md ${member.file} changed while its summary snapshot was being read.`, member.file, member.file, snapshot.index);
+    }
+    try {
+      hash.update(member.directory).update("\0").update(readFileSync(member.file)).update("\0");
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw makeError(snapshot.name, action, `member SKILL.md ${member.file} could not be fingerprinted: ${reason}`, member.file, member.file, snapshot.index);
+    }
+  }
+  return hash.digest("hex");
+}
+
+function managedGroupDependencyFingerprint(dependencies: ManagedGroupSummaryDependency[]): string {
+  const sorted = [...dependencies].sort((left, right) =>
+    left.group < right.group ? -1 : left.group > right.group ? 1 : 0,
+  );
+  return createHash("sha256").update(JSON.stringify(sorted)).digest("hex");
+}
+
+function groupDependencyFingerprint(root: string, snapshot: GroupSnapshot, action: string): string {
+  const dependencies = snapshot.childGroups.map(child => {
+    const group = path.join(snapshot.name, child.name);
+    const childSnapshot = inspectGroup(root, group, action, false);
+    if (!childSnapshot) {
+      throw makeError(snapshot.name, action, `child group "${group}" disappeared while dependencies were fingerprinted.`, snapshot.index, snapshot.index, snapshot.index);
+    }
+    const frontmatter = groupIndexFrontmatter(childSnapshot, action);
+    if (typeof frontmatter.revision !== "string" || !frontmatter.revision) {
+      throw makeError(group, action, `group index ${childSnapshot.index} has no CAS revision.`, childSnapshot.index, childSnapshot.index, childSnapshot.index);
+    }
+    const state = groupSummaryState(childSnapshot, action);
+    return {
+      group,
+      revision: frontmatter.revision,
+      generation: state.generation,
+      status: state.status,
+    };
+  });
+  return managedGroupDependencyFingerprint(dependencies);
+}
+
+function groupIndexFallbackDescription(snapshot: GroupSnapshot, entries: GroupEntry[]): string {
+  const source = entries.length === 0
+    ? `${snapshot.displayName} managed skills.`
+    : `${snapshot.displayName}: ${entries.map(entry => entry.description).join(" ")}`;
+  return Array.from(sanitizeManagedDescription(source)).slice(0, 200).join("");
+}
+
+function newGroupRevision(): string {
+  return randomBytes(16).toString("hex");
+}
+
+function buildGroupIndex(
+  snapshot: GroupSnapshot,
+  action: string,
+  summaryStateOverride?: GroupSummaryState,
+  summaryDescriptionOverride?: string,
+  revisionOverride?: string,
+): string {
   const entries: GroupEntry[] = [
     ...snapshot.childGroups,
     ...snapshot.members.map(member => ({
@@ -638,17 +920,51 @@ function buildGroupIndex(snapshot: GroupSnapshot): string {
     })),
   ];
   entries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : left.kind < right.kind ? -1 : left.kind > right.kind ? 1 : 0);
-  const summarySource = entries.length === 0
-    ? `${snapshot.displayName} managed skills.`
-    : `${snapshot.displayName}: ${entries.map(entry => entry.description).join(" ")}`;
-  const description = Array.from(sanitizeManagedDescription(summarySource)).slice(0, 200).join("");
+  const previousFrontmatter = groupIndexFrontmatter(snapshot, action);
+  const previousState = groupSummaryState(snapshot, action);
+  const summaryState = summaryStateOverride ?? previousState;
+  const previousDescription = typeof previousFrontmatter.description === "string"
+    ? previousFrontmatter.description
+    : "";
+  const description = sanitizeManagedDescription(
+    summaryDescriptionOverride ??
+    (summaryState.hasGenerated || summaryState.preserveExistingDescription
+      ? previousDescription
+      : groupIndexFallbackDescription(snapshot, entries)),
+  );
+  const persistedSummaryState = Object.fromEntries(
+    Object.entries(summaryState).filter(([, value]) => value !== undefined),
+  ) as unknown as GroupSummaryState;
+  const revision = revisionOverride ??
+    (typeof previousFrontmatter.revision === "string" && previousFrontmatter.revision
+      ? previousFrontmatter.revision
+      : newGroupRevision());
+  const frontmatter = {
+    ...previousFrontmatter,
+    name: snapshot.displayName,
+    description,
+    revision,
+    summaryState: persistedSummaryState,
+  };
+  const yaml = YAML.stringify(frontmatter, null, 2).trimEnd();
   const sections = entries.length === 0
     ? "No direct groups or skills are currently in this group."
     : entries.map(entry => `- ${entry.kind === "group" ? "Group" : "Skill"}: ${entry.name} — ${entry.description}\n  Read: ${entry.uri}`).join("\n");
-  return `${toSkillFrontmatter(snapshot.displayName, description)}\n${GROUP_MARKER}\n\n# ${snapshot.displayName}\n\n${sections}\n`;
+  return `---\n${yaml}\n---\n\n${GROUP_MARKER}\n\n# ${snapshot.displayName}\n\n${sections}\n`;
 }
 
-function openTemporaryFile(directory: string, mode = 0o666): { file: string; descriptor: number } {
+function openTemporaryFile(
+  directory: string,
+  mode = 0o666,
+  name?: string,
+): { file: string; descriptor: number } {
+  if (name !== undefined) {
+    if (path.basename(name) !== name || !name.startsWith(TEMP_FILE_PREFIX)) {
+      throw new Error("unsafe temporary managed-skill filename");
+    }
+    const file = path.join(directory, name);
+    return { file, descriptor: openSync(file, "wx", mode) };
+  }
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const suffix = `${process.pid}-${temporaryFileCounter++}-${randomBytes(12).toString("hex")}`;
     const file = path.join(directory, `${TEMP_FILE_PREFIX}${suffix}`);
@@ -677,6 +993,153 @@ function writeTemporaryFile(file: string, descriptor: number, content: string, m
   fsyncSync(descriptor);
 }
 
+function managedGroupJournalPath(root: string, top: string): string {
+  const key = createHash("sha256").update(top).digest("hex").slice(0, 24);
+  return path.join(root, `.auto-learn-scope-managed-state-${key}.json`);
+}
+
+function emptyManagedGroupJournal(): ManagedGroupJournal {
+  return { version: 1, nextSequence: 1, intents: [] };
+}
+
+function readManagedGroupJournal(root: string, top: string, action: string): ManagedGroupJournal {
+  const file = managedGroupJournalPath(root, top);
+  const stat = lstatOrNull(file);
+  if (!stat) return emptyManagedGroupJournal();
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1) {
+    throw makeError(top, action, `managed group journal ${file} is not a private regular file.`, file, file, file);
+  }
+  assertCanonicalWithin(root, file, top, action, file, file);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(file, "utf8"));
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw makeError(top, action, `managed group journal ${file} is unreadable: ${reason}`, file, file, file);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw makeError(top, action, `managed group journal ${file} has invalid data.`, file, file, file);
+  }
+  const raw = parsed as Record<string, unknown>;
+  if (raw.version !== 1 || !Number.isSafeInteger(raw.nextSequence) || (raw.nextSequence as number) < 1 || !Array.isArray(raw.intents)) {
+    throw makeError(top, action, `managed group journal ${file} has an unsupported format.`, file, file, file);
+  }
+  const intents: ManagedGroupIntent[] = [];
+  for (const item of raw.intents) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw makeError(top, action, `managed group journal ${file} contains an invalid intent.`, file, file, file);
+    }
+    const intent = item as Record<string, unknown>;
+    let group: string;
+    let name: string;
+    try {
+      group = sanitizeGroupName(intent.group, root);
+      name = sanitizeSkillName(intent.name);
+    } catch {
+      throw makeError(top, action, `managed group journal ${file} contains an unsafe intent path.`, file, file, file);
+    }
+    if (
+      group.split("/")[0] !== top ||
+      typeof intent.operationId !== "string" ||
+      !/^[0-9a-f]{32}$/.test(intent.operationId) ||
+      typeof intent.temporaryName !== "string" ||
+      intent.temporaryName !== `${TEMP_FILE_PREFIX}${intent.operationId}` ||
+      !Number.isSafeInteger(intent.sequence) ||
+      (intent.sequence as number) < 1 ||
+      typeof intent.contentHash !== "string" ||
+      !/^[0-9a-f]{64}$/.test(intent.contentHash) ||
+      (intent.directory !== undefined && (typeof intent.directory !== "string" || intent.directory === "." || intent.directory === ".." || intent.directory.includes("/") || intent.directory.includes("\\"))) ||
+      (intent.previousHash !== undefined && (typeof intent.previousHash !== "string" || !/^[0-9a-f]{64}$/.test(intent.previousHash))) ||
+      !["pending", "completed", "cancelled", "unknown"].includes(String(intent.status))
+    ) {
+      throw makeError(top, action, `managed group journal ${file} contains an invalid intent record.`, file, file, file);
+    }
+    intents.push({
+      operationId: intent.operationId,
+      sequence: intent.sequence as number,
+      group,
+      name,
+      temporaryName: intent.temporaryName,
+      contentHash: intent.contentHash,
+      ...(typeof intent.directory === "string" ? { directory: intent.directory } : {}),
+      ...(typeof intent.previousHash === "string" ? { previousHash: intent.previousHash } : {}),
+      status: intent.status as ManagedGroupIntent["status"],
+    });
+  }
+  intents.sort((left, right) => left.sequence - right.sequence);
+  return { version: 1, nextSequence: raw.nextSequence as number, intents };
+}
+
+function writeManagedGroupJournal(
+  root: string,
+  top: string,
+  action: string,
+  journal: ManagedGroupJournal,
+): void {
+  const file = managedGroupJournalPath(root, top);
+  assertCanonicalWithin(root, root, top, action, file, file);
+  const current = lstatOrNull(file);
+  if (current && (current.isSymbolicLink() || !current.isFile() || current.nlink !== 1)) {
+    throw makeError(top, action, `managed group journal ${file} is not a private regular file.`, file, file, file);
+  }
+  const opened = openTemporaryFile(root, 0o600);
+  let temporaryFile: string | undefined = opened.file;
+  let descriptor: number | undefined = opened.descriptor;
+  let committed = false;
+  let expectedStat: Stats | null = null;
+  try {
+    writeTemporaryFile(temporaryFile, descriptor, JSON.stringify(journal), 0o600);
+    closeSync(descriptor);
+    descriptor = undefined;
+    expectedStat = lstatSync(temporaryFile);
+    if (!expectedStat.isFile() || expectedStat.nlink !== 1) {
+      throw makeError(top, action, "the temporary managed group journal is not a private regular file.", temporaryFile, file, file);
+    }
+    const beforeCommit = lstatOrNull(file);
+    if (current) {
+      if (
+        !beforeCommit ||
+        beforeCommit.isSymbolicLink() ||
+        !beforeCommit.isFile() ||
+        beforeCommit.nlink !== 1 ||
+        !sameFileIdentity(current, beforeCommit)
+      ) {
+        throw makeError(top, action, `managed group journal ${file} changed before atomic replacement.`, file, file, file);
+      }
+      renameSync(temporaryFile, file);
+      temporaryFile = undefined;
+      committed = true;
+    } else {
+      if (beforeCommit) {
+        throw makeError(top, action, `managed group journal ${file} appeared before creation.`, file, file, file);
+      }
+      linkSync(temporaryFile, file);
+      committed = true;
+      unlinkSync(temporaryFile);
+      temporaryFile = undefined;
+    }
+    const written = lstatOrNull(file);
+    if (!written || written.isSymbolicLink() || !written.isFile() || written.nlink !== 1 || !sameFileIdentity(expectedStat, written)) {
+      throw makeError(top, action, `managed group journal ${file} could not be verified after writing.`, file, file, file);
+    }
+  } finally {
+    if (descriptor !== undefined) {
+      try {
+        closeSync(descriptor);
+      } catch {
+        // Preserve the originating journal write failure.
+      }
+    }
+    removeTemporaryFile(temporaryFile);
+    if (!committed && !temporaryFile) {
+      const after = lstatOrNull(file);
+      if (after && after.isFile() && expectedStat && sameFileIdentity(after, expectedStat)) {
+        // The atomic replacement landed even though its verification failed.
+      }
+    }
+  }
+}
+
 function assertSameDirectory(
   snapshot: GroupSnapshot,
   root: string,
@@ -696,9 +1159,22 @@ function writeGroupIndex(
   action: string,
   skillStatus: WriteStatus,
   skillPath: string = snapshot.index,
+  summaryStateOverride?: GroupSummaryState,
+  summaryDescriptionOverride?: string,
 ): void {
-  const content = buildGroupIndex(snapshot);
+  const previousFrontmatter = groupIndexFrontmatter(snapshot, action);
+  const previousRevision = typeof previousFrontmatter.revision === "string" ? previousFrontmatter.revision : undefined;
+  let content = buildGroupIndex(
+    snapshot,
+    action,
+    summaryStateOverride,
+    summaryDescriptionOverride,
+    previousRevision,
+  );
   if (snapshot.indexContents === content) return;
+  if (previousRevision) {
+    content = buildGroupIndex(snapshot, action, summaryStateOverride, summaryDescriptionOverride, newGroupRevision());
+  }
 
   let temporaryFile: string | undefined;
   let descriptor: number | undefined;
@@ -854,6 +1330,8 @@ function refreshGroupsLocked(
   action: string,
   skillStatus: WriteStatus,
   skillPath: string,
+  summaryStates: Map<string, GroupSummaryState> = new Map(),
+  summaryDescriptions: Map<string, string> = new Map(),
 ): ManagedGroupIndexResult[] {
   const completed = new Set<string>();
   const results: ManagedGroupIndexResult[] = [];
@@ -863,7 +1341,7 @@ function refreshGroupsLocked(
       if (!snapshot) {
         throw makeError(group, action, `group "${group}" could not be scanned for index rebuilding.`, path.join(root, group, SKILL_FILE_NAME), skillPath, path.join(root, group, SKILL_FILE_NAME));
       }
-      writeGroupIndex(root, snapshot, action, skillStatus, skillPath);
+      writeGroupIndex(root, snapshot, action, skillStatus, skillPath, summaryStates.get(group), summaryDescriptions.get(group));
       completed.add(group);
       results.push({ group, path: snapshot.index, status: "written", needsRebuild: false });
     } catch (error) {
@@ -980,6 +1458,7 @@ function createMemberFile(
   directory: { path: string; stat: Stats },
   content: string,
   action: string,
+  temporaryName: string,
 ): string {
   const file = path.join(directory.path, SKILL_FILE_NAME);
   let temporaryFile: string | undefined;
@@ -993,7 +1472,7 @@ function createMemberFile(
     if (existing) {
       throw makeError(snapshot.name, action, `member SKILL.md ${file} already exists; refusing to overwrite it.`, file, file, snapshot.index);
     }
-    const opened = openTemporaryFile(directory.path);
+    const opened = openTemporaryFile(directory.path, 0o666, temporaryName);
     temporaryFile = opened.file;
     descriptor = opened.descriptor;
     writeTemporaryFile(temporaryFile, descriptor, content);
@@ -1065,6 +1544,7 @@ function updateMemberFile(
   member: GroupMember,
   content: string,
   action: string,
+  temporaryName?: string,
 ): void {
   const original = assertWritableMember(snapshot, member, root, action);
   let temporaryFile: string | undefined;
@@ -1072,7 +1552,7 @@ function updateMemberFile(
   let committed = false;
   let expectedStat: Stats | null = null;
   try {
-    const opened = openTemporaryFile(member.directoryPath);
+    const opened = openTemporaryFile(member.directoryPath, 0o666, temporaryName);
     temporaryFile = opened.file;
     descriptor = opened.descriptor;
     writeTemporaryFile(temporaryFile, descriptor, content, original.mode);
@@ -1165,6 +1645,7 @@ export function createManagedGroupStore(rootPath: string): ManagedGroupStore {
   }
   const root = resolveManagedRoot(rootPath);
   const knownGroups = new Set<string>();
+  let sessionId = randomBytes(16).toString("hex");
 
   function groupIndex(group: string): string {
     return path.join(root, group, SKILL_FILE_NAME);
@@ -1310,6 +1791,523 @@ export function createManagedGroupStore(rootPath: string): ManagedGroupStore {
     }
   }
 
+  function groupNamesInTree(tree: GroupTree): string[] {
+    const groups: string[] = [];
+    collectPostOrder(tree, groups);
+    return groups;
+  }
+
+  function stateForWork(
+    group: string,
+    operationId: string,
+    trigger: "automatic" | "manual",
+    affectedChildren: string[],
+    action: string,
+  ): GroupSummaryState {
+    const snapshot = inspectGroup(root, group, action, true);
+    if (!snapshot) {
+      throw makeError(group, action, `group "${group}" disappeared before summary work was queued.`, groupIndex(group), groupIndex(group), groupIndex(group));
+    }
+    const previous = groupSummaryState(snapshot, action);
+    const resumeAutomatic = trigger === "manual"
+      ? previous.resumeAutomatic ??
+        (previous.trigger === "automatic" &&
+          (previous.status === "pending" || (previous.status === "failed" && previous.resumable))
+          ? { affectedChildren: [...previous.affectedChildren] }
+          : undefined)
+      : undefined;
+    return {
+      ...previous,
+      status: "pending",
+      generation: previous.generation + 1,
+      trigger,
+      operationId,
+      workFingerprint: groupContentFingerprint(snapshot, action),
+      affectedChildren,
+      resumable: trigger === "automatic",
+      resumeAutomatic,
+      failureReason: undefined,
+      sessionId: trigger === "manual" ? sessionId : undefined,
+    };
+  }
+
+  function workStatesForPath(
+    groups: string[],
+    operationId: string,
+    trigger: "automatic" | "manual",
+    action: string,
+  ): Map<string, GroupSummaryState> {
+    const states = new Map<string, GroupSummaryState>();
+    for (let index = 0; index < groups.length; index += 1) {
+      const group = groups[index];
+      const snapshot = inspectGroup(root, group, action, true);
+      if (!snapshot) {
+        throw makeError(group, action, `group "${group}" disappeared before summary work was queued.`, groupIndex(group), groupIndex(group), groupIndex(group));
+      }
+      const affectedChildren = trigger === "manual" || index === 0
+        ? snapshot.childGroups.map(child => path.join(group, child.name))
+        : [groups[index - 1]];
+      states.set(group, stateForWork(group, operationId, trigger, affectedChildren, action));
+    }
+    return states;
+  }
+
+  function staleStatesForPath(groups: string[], action: string): Map<string, GroupSummaryState> {
+    const states = new Map<string, GroupSummaryState>();
+    for (const group of groups) {
+      const snapshot = inspectGroup(root, group, action, true);
+      if (!snapshot) continue;
+      const state = groupSummaryState(snapshot, action);
+      states.set(group, {
+        ...state,
+        status: state.hasGenerated ? "stale" : "uninitialized",
+        trigger: undefined,
+        operationId: undefined,
+        workFingerprint: undefined,
+        affectedChildren: [],
+        resumable: false,
+        resumeAutomatic: undefined,
+        failureReason: undefined,
+        sessionId: undefined,
+      });
+    }
+    return states;
+  }
+
+  function workFromState(group: string, state: GroupSummaryState): ManagedGroupSummaryWork | null {
+    if (!state.operationId || !state.trigger) return null;
+    if (state.status !== "pending" && !(state.status === "failed" && state.resumable)) return null;
+    return {
+      group,
+      operationId: state.operationId,
+      generation: state.generation,
+      trigger: state.trigger,
+    };
+  }
+
+  function summarySnapshotForWork(
+    work: ManagedGroupSummaryWork,
+    action: string,
+  ): ManagedGroupSummarySnapshot | null {
+    const group = sanitizeGroupName(work.group, root);
+    const snapshot = inspectGroup(root, group, action, false);
+    if (!snapshot) return null;
+    const state = groupSummaryState(snapshot, action);
+    if (
+      state.operationId !== work.operationId ||
+      state.generation !== work.generation ||
+      state.trigger !== work.trigger ||
+      (state.status !== "pending" && state.status !== "failed") ||
+      (state.trigger === "manual" && state.sessionId !== sessionId)
+    ) {
+      return null;
+    }
+    const fingerprint = groupContentFingerprint(snapshot, action);
+    if (state.workFingerprint !== fingerprint) {
+      invalidateOperationLocked(group.split("/")[0], work.operationId, action);
+      return null;
+    }
+    const frontmatter = groupIndexFrontmatter(snapshot, action);
+    if (typeof frontmatter.revision !== "string" || !frontmatter.revision) {
+      throw makeError(group, action, `group index ${snapshot.index} has no CAS revision.`, snapshot.index, snapshot.index, snapshot.index);
+    }
+    const entries: ManagedGroupSummaryEntry[] = [
+      ...snapshot.childGroups.map(child => ({
+        kind: "group" as const,
+        name: child.name,
+        description: child.description,
+      })),
+      ...snapshot.members.map(member => ({
+        kind: "skill" as const,
+        name: member.name,
+        description: member.description,
+      })),
+    ].sort((left, right) => left.name.localeCompare(right.name) || left.kind.localeCompare(right.kind));
+    const dependencies: ManagedGroupSummaryDependency[] = snapshot.childGroups.map(child => {
+      const childGroup = path.join(group, child.name);
+      const childSnapshot = inspectGroup(root, childGroup, action, false);
+      if (!childSnapshot) {
+        throw makeError(group, action, `child group "${childGroup}" disappeared while reading summary dependencies.`, groupIndex(group), groupIndex(group), groupIndex(group));
+      }
+      const childFrontmatter = groupIndexFrontmatter(childSnapshot, action);
+      if (typeof childFrontmatter.revision !== "string" || !childFrontmatter.revision) {
+        throw makeError(childGroup, action, `group index ${childSnapshot.index} has no CAS revision.`, childSnapshot.index, childSnapshot.index, childSnapshot.index);
+      }
+      return {
+        group: childGroup,
+        revision: childFrontmatter.revision,
+        generation: groupSummaryState(childSnapshot, action).generation,
+        status: groupSummaryState(childSnapshot, action).status,
+      };
+    });
+    return {
+      group,
+      revision: frontmatter.revision,
+      generation: state.generation,
+      summary: typeof frontmatter.description === "string" ? frontmatter.description : "",
+      hasGeneratedSummary: state.hasGenerated,
+      status: state.status,
+      entries,
+      dependencies,
+      contentFingerprint: fingerprint,
+    };
+  }
+
+  function updateIntentStatus(
+    top: string,
+    operationId: string,
+    status: ManagedGroupIntent["status"],
+    action: string,
+  ): void {
+    const journal = readManagedGroupJournal(root, top, action);
+    const intent = journal.intents.find(candidate => candidate.operationId === operationId);
+    if (!intent) {
+      throw makeError(top, action, `managed group intent "${operationId}" disappeared from its journal.`, managedGroupJournalPath(root, top), groupIndex(top), groupIndex(top));
+    }
+    if (status === "completed" || status === "cancelled") {
+      journal.intents = journal.intents.filter(candidate => candidate.operationId !== operationId);
+    } else {
+      intent.status = status;
+    }
+    writeManagedGroupJournal(root, top, action, journal);
+  }
+
+  function appendIntent(group: string, name: string, content: string, action: string, member?: GroupMember): ManagedGroupIntent {
+    const top = group.split("/")[0];
+    const journal = readManagedGroupJournal(root, top, action);
+    const operationId = randomBytes(16).toString("hex");
+    const intent: ManagedGroupIntent = {
+      operationId,
+      sequence: journal.nextSequence,
+      group,
+      name,
+      temporaryName: `${TEMP_FILE_PREFIX}${operationId}`,
+      contentHash: createHash("sha256").update(content).digest("hex"),
+      status: "pending",
+      ...(member ? {
+        directory: member.directory,
+        previousHash: createHash("sha256").update(readFileSync(member.file)).digest("hex"),
+      } : {}),
+    };
+    journal.nextSequence += 1;
+    journal.intents.push(intent);
+    writeManagedGroupJournal(root, top, action, journal);
+    return intent;
+  }
+
+  function invalidateOperationLocked(top: string, operationId: string, action: string): void {
+    const tree = discoverGroupTree(root, top, action);
+    if (!tree) return;
+    const groups = groupNamesInTree(tree);
+    const states = new Map<string, GroupSummaryState>();
+    for (const group of groups) {
+      const snapshot = inspectGroup(root, group, action, false);
+      if (!snapshot) continue;
+      const state = groupSummaryState(snapshot, action);
+      if (state.operationId !== operationId) continue;
+      const fingerprint = groupContentFingerprint(snapshot, action);
+      const restoreAutomatic =
+        state.trigger === "manual" &&
+        state.resumeAutomatic !== undefined &&
+        state.workFingerprint === fingerprint;
+      states.set(group, {
+        ...state,
+        status: restoreAutomatic ? "pending" : state.hasGenerated ? "stale" : "uninitialized",
+        generation: state.generation,
+        trigger: restoreAutomatic ? "automatic" : undefined,
+        operationId: restoreAutomatic ? randomBytes(16).toString("hex") : undefined,
+        workFingerprint: restoreAutomatic ? fingerprint : undefined,
+        affectedChildren: restoreAutomatic ? state.resumeAutomatic!.affectedChildren : [],
+        resumable: restoreAutomatic,
+        resumeAutomatic: undefined,
+        failureReason: state.failureReason,
+        sessionId: undefined,
+      });
+    }
+    if (states.size > 0) {
+      refreshGroupsLocked(root, groups, action, "not-written", groupIndex(top), states);
+    }
+  }
+
+  function cleanupInterruptedMemberLink(memberFile: string, committed: Stats, temporaryName: string): void {
+    const temporary = path.join(path.dirname(memberFile), temporaryName);
+    const stat = lstatOrNull(temporary);
+    if (!stat || stat.isSymbolicLink() || !stat.isFile() || !sameFileIdentity(committed, stat)) return;
+    try {
+      unlinkSync(temporary);
+    } catch {
+      // Recovery can still report the committed member; the next pass retries cleanup.
+    }
+  }
+
+  function cleanupInterruptedMemberDirectory(directory: string, temporaryName: string): void {
+    const temporary = path.join(directory, temporaryName);
+    const stat = lstatOrNull(temporary);
+    if (!stat || stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1) return;
+    try {
+      unlinkSync(temporary);
+    } catch {
+      // Cancellation remains safe; startup recovery retries before another write.
+    }
+  }
+
+  function recoverPendingIntentsLocked(top: string, action: string): void {
+    const journal = readManagedGroupJournal(root, top, action);
+    for (const intent of journal.intents) {
+      if (intent.status !== "pending" && intent.status !== "unknown") continue;
+      let groupDirectory = root;
+      let groupStat: Stats | null = null;
+      const groupPathSegments = intent.group.split("/");
+      const groupPathStats: Stats[] = [];
+      for (const segment of groupPathSegments) {
+        groupDirectory = path.join(groupDirectory, segment);
+        groupStat = lstatOrNull(groupDirectory);
+        if (!groupStat || groupStat.isSymbolicLink() || !groupStat.isDirectory()) {
+          updateIntentStatus(top, intent.operationId, "unknown", action);
+          throw makeError(intent.group, action, `interrupted group ${groupDirectory} is not a safe directory.`, groupDirectory, groupDirectory, groupIndex(intent.group));
+        }
+        assertCanonicalWithin(root, groupDirectory, intent.group, action);
+        groupPathStats.push(groupStat);
+      }
+      if (!groupStat) {
+        updateIntentStatus(top, intent.operationId, "unknown", action);
+        throw makeError(intent.group, action, `interrupted group ${groupDirectory} is not a safe directory.`, groupDirectory, groupDirectory, groupIndex(intent.group));
+      }
+      assertCanonicalWithin(root, groupDirectory, intent.group, action);
+      const verifiedGroupStat = groupStat;
+      const memberDirectory = path.join(groupDirectory, intent.directory ?? intent.name);
+      const memberDirectoryStat = lstatOrNull(memberDirectory);
+      if (!memberDirectoryStat) {
+        updateIntentStatus(top, intent.operationId, "cancelled", action);
+        continue;
+      }
+      if (memberDirectoryStat.isSymbolicLink() || !memberDirectoryStat.isDirectory()) {
+        updateIntentStatus(top, intent.operationId, "unknown", action);
+        throw makeError(intent.group, action, `interrupted member directory ${memberDirectory} is not safe.`, memberDirectory, memberDirectory, groupIndex(intent.group));
+      }
+      assertCanonicalWithin(root, memberDirectory, intent.group, action);
+      const initialMemberDirectoryStat = memberDirectoryStat;
+      function assertRecoveryDirectoriesUnchanged(): void {
+        let directory = root;
+        for (let index = 0; index < groupPathSegments.length; index += 1) {
+          directory = path.join(directory, groupPathSegments[index]);
+          const current = lstatOrNull(directory);
+          if (
+            !current ||
+            current.isSymbolicLink() ||
+            !current.isDirectory() ||
+            !sameFileIdentity(groupPathStats[index], current)
+          ) {
+            updateIntentStatus(top, intent.operationId, "unknown", action);
+            throw makeError(intent.group, action, `interrupted group ${directory} changed during recovery.`, directory, directory, groupIndex(intent.group));
+          }
+          assertCanonicalWithin(root, directory, intent.group, action);
+        }
+        const currentMemberDirectory = lstatOrNull(memberDirectory);
+        if (
+          !currentMemberDirectory ||
+          currentMemberDirectory.isSymbolicLink() ||
+          !currentMemberDirectory.isDirectory() ||
+          !sameFileIdentity(initialMemberDirectoryStat, currentMemberDirectory)
+        ) {
+          updateIntentStatus(top, intent.operationId, "unknown", action);
+          throw makeError(intent.group, action, `interrupted member directory ${memberDirectory} changed during recovery.`, memberDirectory, memberDirectory, groupIndex(intent.group));
+        }
+        assertCanonicalWithin(root, memberDirectory, intent.group, action);
+      }
+      const memberFile = path.join(memberDirectory, SKILL_FILE_NAME);
+      const memberStat = lstatOrNull(memberFile);
+      if (!memberStat) {
+        assertRecoveryDirectoriesUnchanged();
+        cleanupInterruptedMemberDirectory(memberDirectory, intent.temporaryName);
+        assertRecoveryDirectoriesUnchanged();
+        try {
+          if (readdirSync(memberDirectory).length === 0) rmdirSync(memberDirectory);
+        } catch {
+          // An empty directory left by an interrupted create is harmless.
+        }
+        updateIntentStatus(top, intent.operationId, "cancelled", action);
+        continue;
+      }
+      if (memberStat.isSymbolicLink() || !memberStat.isFile()) {
+        updateIntentStatus(top, intent.operationId, "unknown", action);
+        throw makeError(intent.group, action, `interrupted member ${memberFile} is not a regular file; its commit cannot be confirmed.`, memberFile, memberFile, groupIndex(intent.group));
+      }
+      let content: string;
+      try {
+        content = readFileSync(memberFile, "utf8");
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        updateIntentStatus(top, intent.operationId, "unknown", action);
+        throw makeError(intent.group, action, `interrupted member ${memberFile} could not be verified: ${reason}`, memberFile, memberFile, groupIndex(intent.group));
+      }
+      if (intent.previousHash && createHash("sha256").update(content).digest("hex") === intent.previousHash) {
+        assertRecoveryDirectoriesUnchanged();
+        cleanupInterruptedMemberDirectory(memberDirectory, intent.temporaryName);
+        updateIntentStatus(top, intent.operationId, "cancelled", action);
+        continue;
+      }
+      if (createHash("sha256").update(content).digest("hex") !== intent.contentHash) {
+        updateIntentStatus(top, intent.operationId, "unknown", action);
+        throw makeError(intent.group, action, `interrupted member ${memberFile} differs from its recorded content; refusing to report it as a committed add.`, memberFile, memberFile, groupIndex(intent.group));
+      }
+      assertRecoveryDirectoriesUnchanged();
+      cleanupInterruptedMemberLink(memberFile, memberStat, intent.temporaryName);
+      assertRecoveryDirectoriesUnchanged();
+      const verifiedGroup = lstatOrNull(groupDirectory);
+      const verifiedDirectory = lstatOrNull(memberDirectory);
+      const verifiedMember = lstatOrNull(memberFile);
+      if (
+        !verifiedGroup ||
+        verifiedGroup.isSymbolicLink() ||
+        !verifiedGroup.isDirectory() ||
+        !sameFileIdentity(verifiedGroupStat, verifiedGroup) ||
+        !verifiedDirectory ||
+        verifiedDirectory.isSymbolicLink() ||
+        !verifiedDirectory.isDirectory() ||
+        !sameFileIdentity(initialMemberDirectoryStat, verifiedDirectory) ||
+        !verifiedMember ||
+        verifiedMember.isSymbolicLink() ||
+        !verifiedMember.isFile() ||
+        verifiedMember.nlink !== 1 ||
+        !sameFileIdentity(memberStat, verifiedMember)
+      ) {
+        updateIntentStatus(top, intent.operationId, "unknown", action);
+        throw makeError(intent.group, action, `interrupted member ${memberFile} could not be confirmed as a private file.`, memberFile, memberFile, groupIndex(intent.group));
+      }
+      let verifiedContent: string;
+      try {
+        verifiedContent = readFileSync(memberFile, "utf8");
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        updateIntentStatus(top, intent.operationId, "unknown", action);
+        throw makeError(intent.group, action, `interrupted member ${memberFile} could not be reverified: ${reason}`, memberFile, memberFile, groupIndex(intent.group));
+      }
+      if (createHash("sha256").update(verifiedContent).digest("hex") !== intent.contentHash) {
+        updateIntentStatus(top, intent.operationId, "unknown", action);
+        throw makeError(intent.group, action, `interrupted member ${memberFile} changed during recovery; refusing to report it as a committed add.`, memberFile, memberFile, groupIndex(intent.group));
+      }
+
+      const tree = discoverGroupTree(root, top, action);
+      const groups: string[] = [];
+      if (!tree || !collectGroupPathOrder(tree, intent.group, groups)) {
+        updateIntentStatus(top, intent.operationId, "unknown", action);
+        throw makeError(intent.group, action, `interrupted member ${memberFile} is not part of a discoverable managed group.`, memberFile, memberFile, groupIndex(intent.group));
+      }
+      const staleRecoveredWork = groups.some(group => {
+        const snapshot = inspectGroup(root, group, action, false);
+        if (!snapshot) return false;
+        const previous = groupSummaryState(snapshot, action);
+        return previous.operationId === intent.operationId &&
+          previous.trigger === "automatic" &&
+          (!previous.workFingerprint || previous.workFingerprint !== groupContentFingerprint(snapshot, action));
+      });
+      if (staleRecoveredWork) {
+        invalidateOperationLocked(top, intent.operationId, action);
+        const staleStates = staleStatesForPath(groups, action);
+        refreshGroupsLocked(root, groups, action, "written", memberFile, staleStates);
+        updateIntentStatus(top, intent.operationId, "completed", action);
+        continue;
+      }
+      const states = new Map<string, GroupSummaryState>();
+      for (let index = 0; index < groups.length; index += 1) {
+        const group = groups[index];
+        const snapshot = inspectGroup(root, group, action, false);
+        if (!snapshot) {
+          throw makeError(group, action, `group "${group}" disappeared while recovering a committed add.`, memberFile, memberFile, groupIndex(group));
+        }
+        const previous = groupSummaryState(snapshot, action);
+        const affectedChildren = index === 0
+          ? snapshot.childGroups.map(child => path.join(group, child.name))
+          : [groups[index - 1]];
+        if (previous.operationId === intent.operationId && previous.trigger === "automatic") {
+          states.set(group, {
+            ...previous,
+            status: "pending",
+            affectedChildren,
+            resumable: true,
+            failureReason: undefined,
+          });
+        } else {
+          states.set(group, stateForWork(group, intent.operationId, "automatic", affectedChildren, action));
+        }
+      }
+      refreshGroupsLocked(root, groups, action, "written", memberFile, states);
+      updateIntentStatus(top, intent.operationId, "completed", action);
+    }
+  }
+
+  function reconcileSummaryWorkLocked(top: string, action: string): void {
+    const tree = discoverGroupTree(root, top, action);
+    if (!tree) return;
+    const groups = groupNamesInTree(tree);
+    refreshGroupsLocked(root, groups, action, "not-written", groupIndex(top));
+    const invalidated = new Set<string>();
+    for (const group of groups) {
+      const snapshot = inspectGroup(root, group, action, false);
+      if (!snapshot) continue;
+      const state = groupSummaryState(snapshot, action);
+      if (!state.operationId || !state.trigger) continue;
+      if (
+        (state.status === "pending" || state.status === "failed") &&
+        state.workFingerprint &&
+        state.workFingerprint !== groupContentFingerprint(snapshot, action)
+      ) {
+        invalidated.add(state.operationId);
+      }
+      if (
+        (state.status === "pending" || state.status === "failed") &&
+        state.trigger === "manual" &&
+        state.sessionId !== sessionId
+      ) {
+        invalidated.add(state.operationId);
+      }
+    }
+    for (const operationId of invalidated) invalidateOperationLocked(top, operationId, action);
+    const currentTree = discoverGroupTree(root, top, action);
+    if (!currentTree) return;
+    const currentGroups = groupNamesInTree(currentTree);
+    for (const group of currentGroups) {
+      const snapshot = inspectGroup(root, group, action, false);
+      if (!snapshot) continue;
+      const state = groupSummaryState(snapshot, action);
+      if (
+        (state.status !== "current" && state.status !== "skipped") ||
+        !state.hasGenerated
+      ) {
+        continue;
+      }
+      const summaryFingerprint = groupContentFingerprint(snapshot, action);
+      const dependencyFingerprint = groupDependencyFingerprint(root, snapshot, action);
+      const contentChanged =
+        state.summaryFingerprint !== undefined &&
+        state.summaryFingerprint !== summaryFingerprint;
+      const dependenciesChanged =
+        state.dependencyFingerprint !== undefined &&
+        state.dependencyFingerprint !== dependencyFingerprint;
+      const next = contentChanged || dependenciesChanged
+        ? {
+            ...state,
+            status: "stale" as const,
+            trigger: undefined,
+            operationId: undefined,
+            workFingerprint: undefined,
+            affectedChildren: [],
+            resumable: false,
+            resumeAutomatic: undefined,
+            sessionId: undefined,
+          }
+        : {
+            ...state,
+            summaryFingerprint: state.summaryFingerprint ?? summaryFingerprint,
+            dependencyFingerprint: state.dependencyFingerprint ?? dependencyFingerprint,
+          };
+      if (next !== state) {
+        refreshGroupsLocked(root, [group], action, "not-written", groupIndex(group), new Map([[group, next]]));
+      }
+    }
+  }
+
   function scan(): void {
     if (!assertSafeRoot(root, "<scan>", "scan", true)) return;
     let entries: string[];
@@ -1334,6 +2332,7 @@ export function createManagedGroupStore(rootPath: string): ManagedGroupStore {
       }
       if (!potential && !knownTop && !discoveryFailed) continue;
       withGroupLock(entry, "scan", () => {
+        recoverPendingIntentsLocked(entry, "scan");
         const tree = discoverGroupTree(root, entry, "scan");
         if (!tree) {
           checkKnownGroups(entry, null, "scan");
@@ -1344,6 +2343,7 @@ export function createManagedGroupStore(rootPath: string): ManagedGroupStore {
         recordTree(tree);
         const groups: string[] = [];
         collectPostOrder(tree, groups);
+        reconcileSummaryWorkLocked(entry, "scan");
         refreshGroupsLocked(root, groups, "scan", "not-written", groupIndex(entry));
       });
     }
@@ -1354,13 +2354,272 @@ export function createManagedGroupStore(rootPath: string): ManagedGroupStore {
     if (!assertSafeRoot(root, group, "refresh", true)) return;
     const top = group.split("/")[0];
     withGroupLock(top, "refresh", () => {
+      recoverPendingIntentsLocked(top, "refresh");
       const tree = discoverGroupTree(root, top, "refresh");
       checkKnownGroups(top, tree, "refresh");
       if (!tree) return;
       const groups: string[] = [];
       if (!collectRelatedGroupOrder(tree, group, groups)) return;
       recordTree(tree);
+      reconcileSummaryWorkLocked(top, "refresh");
       refreshGroupsLocked(root, groups, "refresh", "not-written", groupIndex(group));
+    });
+  }
+
+  function sameSummarySnapshot(
+    expected: ManagedGroupSummarySnapshot,
+    actual: ManagedGroupSummarySnapshot,
+  ): boolean {
+    return expected.group === actual.group &&
+      expected.revision === actual.revision &&
+      expected.generation === actual.generation &&
+      expected.summary === actual.summary &&
+      expected.hasGeneratedSummary === actual.hasGeneratedSummary &&
+      expected.status === actual.status &&
+      expected.contentFingerprint === actual.contentFingerprint &&
+      JSON.stringify(expected.entries) === JSON.stringify(actual.entries) &&
+      JSON.stringify(expected.dependencies) === JSON.stringify(actual.dependencies);
+  }
+
+  function withSummaryCAS<T extends { status: "committed" | "skipped" | "failed" | "stale" }>(
+    expected: ManagedGroupSummarySnapshot,
+    action: string,
+    operation: (
+      current: ManagedGroupSummarySnapshot,
+      state: GroupSummaryState,
+      groups: string[],
+    ) => T,
+  ): T | { status: "stale" } {
+    if (!expected || typeof expected.group !== "string") return { status: "stale" };
+    const group = sanitizeGroupName(expected.group, root);
+    if (!assertSafeRoot(root, group, action, true)) return { status: "stale" };
+    const top = group.split("/")[0];
+    return withGroupLock(top, action, () => {
+      recoverPendingIntentsLocked(top, action);
+      const tree = discoverGroupTree(root, top, action);
+      checkKnownGroups(top, tree, action);
+      if (!tree) return { status: "stale" };
+      const groups: string[] = [];
+      if (!collectRelatedGroupOrder(tree, group, groups)) return { status: "stale" };
+      recordTree(tree);
+      reconcileSummaryWorkLocked(top, action);
+      refreshGroupsLocked(root, groups, action, "not-written", groupIndex(group));
+      const target = inspectGroup(root, group, action, false);
+      if (!target) return { status: "stale" };
+      const state = groupSummaryState(target, action);
+      if (!state.operationId || !state.trigger) return { status: "stale" };
+      const work: ManagedGroupSummaryWork = {
+        group,
+        operationId: state.operationId,
+        generation: state.generation,
+        trigger: state.trigger,
+      };
+      const current = summarySnapshotForWork(work, action);
+      if (!current || !sameSummarySnapshot(expected, current)) return { status: "stale" };
+      for (const childGroup of state.affectedChildren) {
+        const child = inspectGroup(root, childGroup, action, false);
+        if (!child) return { status: "stale" };
+        const childStatus = groupSummaryState(child, action).status;
+        if (
+          childStatus === "uninitialized" ||
+          childStatus === "pending" ||
+          childStatus === "stale" ||
+          childStatus === "failed"
+        ) {
+          return { status: "stale" };
+        }
+      }
+      return operation(current, state, groups);
+    });
+  }
+
+  function pendingSummaryWork(): ManagedGroupSummaryWork[] {
+    scan();
+    const pending: ManagedGroupSummaryWork[] = [];
+    let tops: string[];
+    try {
+      tops = readdirSync(root).filter(entry => !entry.startsWith(".")).sort();
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw makeError("<summary>", "summary", `the managed-skills root could not be scanned: ${reason}`, root, root, root);
+    }
+    for (const top of tops) {
+      const stat = lstatOrNull(path.join(root, top));
+      if (!stat || (!stat.isDirectory() && !stat.isSymbolicLink())) continue;
+      withGroupLock(top, "summary", () => {
+        recoverPendingIntentsLocked(top, "summary");
+        const tree = discoverGroupTree(root, top, "summary");
+        checkKnownGroups(top, tree, "summary");
+        if (!tree) return;
+        recordTree(tree);
+        reconcileSummaryWorkLocked(top, "summary");
+        const groups = groupNamesInTree(tree);
+        refreshGroupsLocked(root, groups, "summary", "not-written", groupIndex(top));
+        for (const group of groups) {
+          const snapshot = inspectGroup(root, group, "summary", false);
+          if (!snapshot) continue;
+          const work = workFromState(group, groupSummaryState(snapshot, "summary"));
+          if (work?.trigger === "automatic") pending.push(work);
+        }
+      });
+    }
+    return pending;
+  }
+
+  function summarySnapshot(work: ManagedGroupSummaryWork): ManagedGroupSummarySnapshot | null {
+    if (
+      !work ||
+      typeof work.group !== "string" ||
+      typeof work.operationId !== "string" ||
+      !Number.isSafeInteger(work.generation) ||
+      (work.trigger !== "automatic" && work.trigger !== "manual")
+    ) {
+      return null;
+    }
+    const group = sanitizeGroupName(work.group, root);
+    if (!assertSafeRoot(root, group, "summary snapshot", true)) return null;
+    const top = group.split("/")[0];
+    return withGroupLock(top, "summary snapshot", () => {
+      recoverPendingIntentsLocked(top, "summary snapshot");
+      const tree = discoverGroupTree(root, top, "summary snapshot");
+      checkKnownGroups(top, tree, "summary snapshot");
+      if (!tree) return null;
+      const groups: string[] = [];
+      if (!collectRelatedGroupOrder(tree, group, groups)) return null;
+      recordTree(tree);
+      reconcileSummaryWorkLocked(top, "summary snapshot");
+      refreshGroupsLocked(root, groups, "summary snapshot", "not-written", groupIndex(group));
+      return summarySnapshotForWork(work, "summary snapshot");
+    });
+  }
+
+  function queueManualSummaryWork(): ManagedGroupSummaryWork[] {
+    scan();
+    const queued: ManagedGroupSummaryWork[] = [];
+    let tops: string[];
+    try {
+      tops = readdirSync(root).filter(entry => !entry.startsWith(".")).sort();
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw makeError("<summary>", "manual summary", `the managed-skills root could not be scanned: ${reason}`, root, root, root);
+    }
+    for (const top of tops) {
+      const stat = lstatOrNull(path.join(root, top));
+      if (!stat || (!stat.isDirectory() && !stat.isSymbolicLink())) continue;
+      withGroupLock(top, "manual summary", () => {
+        recoverPendingIntentsLocked(top, "manual summary");
+        const tree = discoverGroupTree(root, top, "manual summary");
+        checkKnownGroups(top, tree, "manual summary");
+        if (!tree) return;
+        recordTree(tree);
+        reconcileSummaryWorkLocked(top, "manual summary");
+        const groups = groupNamesInTree(tree);
+        refreshGroupsLocked(root, groups, "manual summary", "not-written", groupIndex(top));
+        const operationId = randomBytes(16).toString("hex");
+        const states = workStatesForPath(groups, operationId, "manual", "manual summary");
+        refreshGroupsLocked(root, groups, "manual summary", "not-written", groupIndex(top), states);
+        for (const group of groups) {
+          const state = states.get(group)!;
+          queued.push({ group, operationId, generation: state.generation, trigger: "manual" });
+        }
+      });
+    }
+    return queued;
+  }
+
+  function commitSummary(
+    snapshot: ManagedGroupSummarySnapshot,
+    description: string,
+  ): { status: "committed" | "stale" } {
+    const cleaned = sanitizeManagedDescription(description);
+    if (!cleaned || Array.from(cleaned).length > 200) {
+      throw makeError(snapshot?.group ?? "<summary>", "summary", "the generated group summary must be non-empty and at most 200 characters.", groupIndex(snapshot?.group ?? "<summary>"), groupIndex(snapshot?.group ?? "<summary>"), groupIndex(snapshot?.group ?? "<summary>"));
+    }
+    return withSummaryCAS(snapshot, "summary commit", (current, state, groups) => {
+      const next: GroupSummaryState = {
+        ...state,
+        status: "current",
+        summaryFingerprint: current.contentFingerprint,
+        dependencyFingerprint: managedGroupDependencyFingerprint(current.dependencies),
+        hasGenerated: true,
+        preserveExistingDescription: false,
+        trigger: undefined,
+        operationId: undefined,
+        workFingerprint: undefined,
+        affectedChildren: [],
+        resumable: false,
+        resumeAutomatic: undefined,
+        failureReason: undefined,
+        sessionId: undefined,
+      };
+      refreshGroupsLocked(
+        root,
+        groups,
+        "summary commit",
+        "not-written",
+        groupIndex(current.group),
+        new Map([[current.group, next]]),
+        new Map([[current.group, cleaned]]),
+      );
+      return { status: "committed" as const };
+    });
+  }
+
+  function skipSummary(
+    snapshot: ManagedGroupSummarySnapshot,
+  ): { status: "skipped" | "stale" } {
+    return withSummaryCAS(snapshot, "summary skip", (current, state, groups) => {
+      if (!state.hasGenerated) return { status: "stale" as const };
+      const next: GroupSummaryState = {
+        ...state,
+        status: "skipped",
+        summaryFingerprint: current.contentFingerprint,
+        dependencyFingerprint: managedGroupDependencyFingerprint(current.dependencies),
+        trigger: undefined,
+        operationId: undefined,
+        workFingerprint: undefined,
+        affectedChildren: [],
+        resumable: false,
+        resumeAutomatic: undefined,
+        failureReason: undefined,
+        sessionId: undefined,
+      };
+      refreshGroupsLocked(root, groups, "summary skip", "not-written", groupIndex(snapshot.group), new Map([[snapshot.group, next]]));
+      return { status: "skipped" as const };
+    });
+  }
+
+  function failSummary(
+    snapshot: ManagedGroupSummarySnapshot,
+    reason: string,
+  ): { status: "failed" | "stale" } {
+    return withSummaryCAS(snapshot, "summary failure", (current, state, groups) => {
+      const restoreAutomatic =
+        state.trigger === "manual" &&
+        state.resumeAutomatic !== undefined &&
+        state.workFingerprint === current.contentFingerprint;
+      const next: GroupSummaryState = restoreAutomatic
+        ? {
+            ...state,
+            status: "failed",
+            generation: state.generation + 1,
+            trigger: "automatic",
+            operationId: randomBytes(16).toString("hex"),
+            workFingerprint: current.contentFingerprint,
+            affectedChildren: [...state.resumeAutomatic!.affectedChildren],
+            resumable: true,
+            resumeAutomatic: undefined,
+            failureReason: String(reason).slice(0, 1000),
+            sessionId: undefined,
+          }
+        : {
+            ...state,
+            status: "failed",
+            failureReason: String(reason).slice(0, 1000),
+            resumable: state.trigger === "automatic",
+          };
+      refreshGroupsLocked(root, groups, "summary failure", "not-written", groupIndex(snapshot.group), new Map([[snapshot.group, next]]));
+      return { status: "failed" as const };
     });
   }
 
@@ -1428,8 +2687,10 @@ export function createManagedGroupStore(rootPath: string): ManagedGroupStore {
 
     try {
       return withGroupLock(group, action, () => {
+      recoverPendingIntentsLocked(group.split("/")[0], action);
       const createdDirectories: string[] = [];
       let createdMemberDirectory: string | undefined;
+      let createIntent: ManagedGroupIntent | undefined;
       let skillStatus: WriteStatus = "not-written";
       try {
         prepareGroupPath(group, action, action === "create", createdDirectories);
@@ -1453,9 +2714,10 @@ export function createManagedGroupStore(rootPath: string): ManagedGroupStore {
           if (lstatOrNull(memberDirectoryPath)) {
             throw makeError(group, action, `member directory ${memberDirectoryPath} already exists; refusing to overwrite it.`, targetSkillPath, targetSkillPath, groupIndex(group));
           }
+          createIntent = appendIntent(group, name, prepared!, action);
           const memberDirectory = ensureMemberDirectory(root, before, name, action);
           createdMemberDirectory = memberDirectory.path;
-          file = createMemberFile(root, before, memberDirectory, prepared!, action);
+          file = createMemberFile(root, before, memberDirectory, prepared!, action, createIntent!.temporaryName);
           skillStatus = "written";
         } else {
           if (!before) {
@@ -1463,7 +2725,11 @@ export function createManagedGroupStore(rootPath: string): ManagedGroupStore {
           }
           const member = findMember(before, name, action);
           if (action === "update") {
-            updateMemberFile(root, before, member, prepared!, action);
+            if (member.description !== sanitizeManagedDescription(input.description!)) {
+              assertWritableMember(before, member, root, action);
+              createIntent = appendIntent(group, name, prepared!, action, member);
+            }
+            updateMemberFile(root, before, member, prepared!, action, createIntent?.temporaryName);
           } else {
             deleteMemberDirectory(root, before, member, action);
           }
@@ -1480,10 +2746,31 @@ export function createManagedGroupStore(rootPath: string): ManagedGroupStore {
         if (!collectGroupPathOrder(tree, group, groups)) {
           throw makeError(group, action, `group "${group}" disappeared after the skill was written.`, groupIndex(group), file, groupIndex(group), "written", "not-written");
         }
-        const indexes = refreshGroupsLocked(root, groups, action, "written", file);
+        const summaryStates = createIntent
+          ? workStatesForPath(groups, createIntent.operationId, "automatic", action)
+          : staleStatesForPath(groups, action);
+        const indexes = refreshGroupsLocked(root, groups, action, "written", file, summaryStates);
         recordTree(tree);
         createdMemberDirectory = undefined;
-        return { path: file, indexes };
+        if (createIntent) {
+          try {
+            updateIntentStatus(top, createIntent.operationId, "completed", action);
+          } catch (error) {
+            const managedError = ensureManagedError(
+              error,
+              group,
+              action,
+              targetSkillPath,
+              targetSkillPath,
+              groupIndex(group),
+              "written",
+              "written",
+            );
+            managedError.indexes = indexes;
+            throw managedError;
+          }
+        }
+        return { path: file, indexes, summaryQueued: createIntent !== undefined };
       } catch (error) {
         const errorSkillStatus = mergeWriteStatus(
           error instanceof Error && "skillStatus" in error ? (error as ManagedGroupError).skillStatus : "not-written",
@@ -1492,6 +2779,13 @@ export function createManagedGroupStore(rootPath: string): ManagedGroupStore {
         const errorIndexStatus = error instanceof Error && "indexStatus" in error
           ? (error as ManagedGroupError).indexStatus
           : "not-written";
+        if (createIntent && errorSkillStatus === "not-written") {
+          try {
+            updateIntentStatus(group.split("/")[0], createIntent.operationId, "cancelled", action);
+          } catch {
+            // Startup recovery will cancel an intent whose target was never committed.
+          }
+        }
         if (createdMemberDirectory && errorSkillStatus === "not-written") {
           try {
             const file = path.join(createdMemberDirectory, SKILL_FILE_NAME);
@@ -1532,7 +2826,24 @@ export function createManagedGroupStore(rootPath: string): ManagedGroupStore {
     }
   }
 
-  const store = { scan, refresh, mutate, isGroup };
+  function beginSession(): void {
+    sessionId = randomBytes(16).toString("hex");
+    scan();
+  }
+
+  const store = {
+    beginSession,
+    scan,
+    refresh,
+    mutate,
+    isGroup,
+    pendingSummaryWork,
+    summarySnapshot,
+    commitSummary,
+    skipSummary,
+    failSummary,
+    queueManualSummaryWork,
+  };
   scan();
   return store;
 }

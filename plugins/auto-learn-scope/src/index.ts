@@ -3,11 +3,16 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { extractUriScheme, InternalUrlRouter, parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { parseReadUrlTarget } from "@oh-my-pi/pi-coding-agent/tools/fetch";
 import { splitDelimitedPathEntry, splitMixedUrlPathList } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
+import type { Model } from "@oh-my-pi/pi-ai";
+import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
   createManagedGroupStore,
   type ManagedGroupIndexResult,
   type ManagedGroupStore,
+  type ManagedGroupSummaryWork,
 } from "./managed-groups";
+import { runManagedGroupSummaryWork, type ManagedGroupSummaryOutcome } from "./model-summary";
 import { createProjectSkillWriter, type ProjectSkillWriter } from "./project-skills";
 
 type UnknownRecord = Record<string, unknown>;
@@ -36,7 +41,7 @@ type NativeInvoker = (params: UnknownRecord, options?: InvokeOptions) => Promise
 
 type ToolHandler = (event: UnknownRecord, ctx: UnknownRecord) => unknown | Promise<unknown>;
 
-type CommandHandler = (args: string, ctx: UnknownRecord) => unknown | Promise<unknown>;
+type CommandHandler = (args: string, ctx: UnknownRecord) => Promise<void>;
 
 type ToolApprovalTier = "read" | "write" | "exec";
 
@@ -75,6 +80,10 @@ type HostPi = {
   zod: ZodLike;
   registerTool: (definition: ToolDefinition) => void;
   registerCommand: (name: string, definition: { description: string; handler: CommandHandler }) => void;
+  sendMessage: (
+    message: { customType: string; content: string; display: true },
+    options?: { triggerTurn?: boolean },
+  ) => void;
   on: (event: string, handler: ToolHandler) => void;
 };
 
@@ -692,6 +701,7 @@ function managedSkillOutcome(
   mutationIndexes: ManagedIndexResult[] | undefined,
   failed: boolean,
   error: unknown,
+  summaryPending = false,
 ): UnknownRecord {
   const path = failed ? errorPath(error) : mutationPath;
   const skillPath = failed ? errorStringField(error, "skillPath") ?? path : path;
@@ -723,7 +733,7 @@ function managedSkillOutcome(
     .join("; ");
   const message = failed
     ? `${memorySaved ? "Memory was saved, but " : ""}managed skill "${name}" in group "${group}" failed (skillStatus=${skillStatus}, indexStatus=${indexStatus}${path ? `, path=${path}` : ""}): ${reason}; indexes: ${indexSummary}.`
-    : `${memorySaved ? "Memory was saved and " : ""}${action === "delete" ? "deleted" : `${action}d`} managed skill "${name}" in group "${group}"${path ? ` at ${path}` : ""}; indexes: ${indexSummary}.`;
+    : `${memorySaved ? "Memory was saved and " : ""}${action === "delete" ? "deleted" : `${action}d`} managed skill "${name}" in group "${group}"${path ? ` at ${path}` : ""}; indexes: ${indexSummary}.${summaryPending ? " Summary update is queued; its completion is not implied by this result." : ""}`;
   return {
     ...(memorySaved && memoryResult !== null && typeof memoryResult === "object"
       ? (memoryResult as UnknownRecord)
@@ -738,6 +748,7 @@ function managedSkillOutcome(
     ...(skillPath ? { skillPath } : {}),
     indexPath,
     ...(failed ? { reason, isError: true } : {}),
+    ...(summaryPending ? { summaryStatus: "pending" } : {}),
     content: [
       ...(memorySaved ? contentOf(memoryResult) : []),
       textContent(message),
@@ -753,14 +764,15 @@ function managedSkillOutcome(
       ...(path ? { path } : {}),
       ...(skillPath ? { skillPath } : {}),
       indexPath,
+      ...(summaryPending ? { summaryStatus: "pending" } : {}),
       ...(failed ? { reason, partial: memorySaved } : {}),
     },
   };
 }
 
 
-// Match the tool context to its registered live session before reading session-local skills.
-function activeSessionSkillsFor(pi: HostPi, ctx: unknown): unknown[] | undefined {
+// Match tool and background work to the registered live session before using session-local state.
+function activeSessionFor(pi: HostPi, ctx: unknown): UnknownRecord | undefined {
   if (ctx === null || typeof ctx !== "object" || Array.isArray(ctx)) return undefined;
   const context = ctx as UnknownRecord;
   const agent = context.agent;
@@ -805,7 +817,16 @@ function activeSessionSkillsFor(pi: HostPi, ctx: unknown): unknown[] | undefined
     if (typeof getSessionId !== "function") return undefined;
     const registeredSessionId = Reflect.apply(getSessionId, sessionManager, []);
     if (registeredSessionId !== contextSessionId) return undefined;
-    const skills = Reflect.get(session, "skills");
+    return session as UnknownRecord;
+  } catch {
+    return undefined;
+  }
+}
+
+function activeSessionSkillsFor(pi: HostPi, ctx: unknown): unknown[] | undefined {
+  const session = activeSessionFor(pi, ctx);
+  try {
+    const skills = session ? Reflect.get(session, "skills") : undefined;
     return Array.isArray(skills) ? skills : undefined;
   } catch {
     return undefined;
@@ -1151,6 +1172,176 @@ export function installAutoLearnScope(pi: HostPi, options?: AutoLearnScopeOption
           return input.skill || factorySettings.get("memory.backend") === "local" ? "write" : "read";
         };
 
+  function summaryContextOptions(
+    ctx: unknown,
+    work: ManagedGroupSummaryWork,
+    force: boolean,
+    failedDependencies: ReadonlySet<string>,
+  ) {
+    const context = ctx !== null && typeof ctx === "object" && !Array.isArray(ctx) ? (ctx as UnknownRecord) : {};
+    const modelApi = context.models !== null && typeof context.models === "object"
+      ? (context.models as UnknownRecord)
+      : {};
+    const resolve = modelApi.resolve;
+    const sessionManager = context.sessionManager !== null && typeof context.sessionManager === "object"
+      ? (context.sessionManager as UnknownRecord)
+      : {};
+    let sessionId: string | undefined;
+    if (typeof sessionManager.getSessionId === "function") {
+      const resolvedSessionId = Reflect.apply(sessionManager.getSessionId, sessionManager, []);
+      if (typeof resolvedSessionId === "string" && resolvedSessionId.length > 0) sessionId = resolvedSessionId;
+    }
+    const session = activeSessionFor(pi, ctx);
+    let settings: Settings | undefined;
+    try {
+      settings = session?.settings as Settings | undefined;
+    } catch {
+      settings = undefined;
+    }
+    return {
+      store: groupStore,
+      work,
+      force,
+      settings,
+      registry: context.modelRegistry as ModelRegistry | undefined,
+      sessionId,
+      resolveModel(spec: string): Model | undefined {
+        if (typeof resolve !== "function") return undefined;
+        return Reflect.apply(resolve, modelApi, [spec]) as Model | undefined;
+      },
+      failedDependencies,
+    };
+  }
+
+  function sendSummaryMessage(outcome: ManagedGroupSummaryOutcome): void {
+    try {
+      pi.sendMessage(
+        { customType: "auto-learn-scope:managed-skill-summary", content: outcome.message, display: true },
+        { triggerTurn: false },
+      );
+    } catch {
+      // Durable summary state remains available if a host cannot display the message.
+    }
+  }
+
+  function notifySummaryOutcome(
+    ctx: unknown,
+    outcome: ManagedGroupSummaryOutcome,
+    sendCustomWhenNoUI = true,
+  ): void {
+    const context = ctx !== null && typeof ctx === "object" && !Array.isArray(ctx) ? (ctx as UnknownRecord) : {};
+    const ui = context.ui !== null && typeof context.ui === "object" ? (context.ui as UnknownRecord) : {};
+    const hasUI = context.hasUI === true;
+    if (hasUI && typeof ui.notify === "function") {
+      const severity = outcome.status === "failed" || outcome.status === "blocked" || outcome.status === "conflict"
+        ? "warning"
+        : "info";
+      try {
+        Reflect.apply(ui.notify, ui, [outcome.message, severity]);
+        return;
+      } catch {
+        // Fall back to a visible custom message if the host notification surface is unavailable.
+      }
+    }
+    const isIdle = typeof context.isIdle === "function" && Reflect.apply(context.isIdle, context, []) === true;
+    if (sendCustomWhenNoUI && isIdle) sendSummaryMessage(outcome);
+  }
+  async function executeSummaryWork(
+    ctx: unknown,
+    work: ManagedGroupSummaryWork,
+    force: boolean,
+    failedDependencies: Set<string>,
+    sendCustomWhenNoUI = true,
+  ): Promise<ManagedGroupSummaryOutcome> {
+    let outcome: ManagedGroupSummaryOutcome;
+    try {
+      outcome = await runManagedGroupSummaryWork(
+        summaryContextOptions(ctx, work, force, failedDependencies),
+      );
+    } catch (error) {
+      outcome = {
+        group: work.group,
+        status: "failed",
+        message: `${work.group}: summary work failed unexpectedly: ${errorReason(error)}`,
+      };
+    }
+    if (outcome.status === "generated" || outcome.status === "skipped") {
+      failedDependencies.delete(work.group);
+    } else {
+      failedDependencies.add(work.group);
+    }
+    notifySummaryOutcome(ctx, outcome, sendCustomWhenNoUI);
+    return outcome;
+  }
+
+
+  async function runSummaryWorkBatch(
+    ctx: unknown,
+    works: ManagedGroupSummaryWork[],
+    force: boolean,
+  ): Promise<ManagedGroupSummaryOutcome[]> {
+    const failedDependencies = new Set<string>();
+    const outcomes: ManagedGroupSummaryOutcome[] = [];
+    for (const work of works) {
+      const outcome = await executeSummaryWork(ctx, work, force, failedDependencies, false);
+      outcomes.push(outcome);
+      sendSummaryMessage(outcome);
+    }
+    return outcomes;
+  }
+
+
+  let automaticDrain: Promise<void> | undefined;
+  let restartAfterDrainContext: unknown;
+  let restartAfterDrainRequested = false;
+
+
+  async function drainAutomaticSummaryWork(ctx: unknown): Promise<void> {
+    const attempted = new Set<string>();
+    const failedDependencies = new Set<string>();
+    while (true) {
+      let pending: ManagedGroupSummaryWork[];
+      try {
+        pending = groupStore.pendingSummaryWork();
+      } catch (error) {
+        notifySummaryOutcome(ctx, {
+          group: "<managed skills>",
+          status: "failed",
+          message: `Automatic managed skill summary recovery failed: ${errorReason(error)}`,
+        });
+        return;
+      }
+      const work = pending.find(candidate =>
+        candidate.trigger === "automatic" &&
+        !attempted.has(`${candidate.group}\0${candidate.operationId}\0${candidate.generation}`),
+      );
+      if (!work) return;
+      attempted.add(`${work.group}\0${work.operationId}\0${work.generation}`);
+      await executeSummaryWork(ctx, work, false, failedDependencies);
+    }
+  }
+
+  function startAutomaticSummaryWork(ctx: unknown): void {
+    if (automaticDrain) {
+      // The active drain clears its flag only after the last empty scan returns.
+      // Work queued in this gap must schedule one more scan.
+      restartAfterDrainContext = ctx;
+      restartAfterDrainRequested = true;
+      return;
+    }
+    const running = drainAutomaticSummaryWork(ctx);
+    automaticDrain = running;
+    void running.finally(() => {
+      if (automaticDrain !== running) return;
+      automaticDrain = undefined;
+      if (!restartAfterDrainRequested) return;
+      const nextContext = restartAfterDrainContext;
+      restartAfterDrainContext = undefined;
+      restartAfterDrainRequested = false;
+      startAutomaticSummaryWork(nextContext);
+    }).catch(() => undefined);
+  }
+
   pi.registerTool({
     name: "learn",
     label: "Learn",
@@ -1203,6 +1394,7 @@ export function installAutoLearnScope(pi: HostPi, options?: AutoLearnScopeOption
             body: managedSkill.body,
           });
           rememberManagedGroupPath(knownGroups, group);
+          if (result.summaryQueued) startAutomaticSummaryWork(ctx);
           return managedSkillOutcome(
             managedSkill.action,
             managedSkill.name,
@@ -1213,6 +1405,7 @@ export function installAutoLearnScope(pi: HostPi, options?: AutoLearnScopeOption
             result.indexes,
             false,
             undefined,
+            result.summaryQueued,
           );
         } catch (error) {
           return managedSkillOutcome(
@@ -1287,6 +1480,7 @@ export function installAutoLearnScope(pi: HostPi, options?: AutoLearnScopeOption
               : { description: manageParams.description ?? "", body: manageParams.body ?? "" }),
           });
           rememberManagedGroupPath(knownGroups, group);
+          if (result.summaryQueued) startAutomaticSummaryWork(ctx);
           return managedSkillOutcome(
             manageParams.action,
             name,
@@ -1297,6 +1491,7 @@ export function installAutoLearnScope(pi: HostPi, options?: AutoLearnScopeOption
             result.indexes,
             false,
             undefined,
+            result.summaryQueued,
           );
         } catch (error) {
           return managedSkillOutcome(
@@ -1365,24 +1560,60 @@ export function installAutoLearnScope(pi: HostPi, options?: AutoLearnScopeOption
   };
 
   pi.registerCommand("refresh-managed-skills", {
-    description:
-      "Scan managed skill groups; enter this command in an interactive/RPC session to refresh discovery via /reload-plugins.",
-    handler: (_args, _ctx) => {
-      scanManagedGroups();
-      throw new Error(
-        "Managed skill groups were scanned, but discovery was not reloaded. " +
-        "In an interactive/RPC session, enter /refresh-managed-skills; otherwise start a new session.",
-      );
+    description: "Refresh every managed skill group bottom-up; use --force to skip the judge and regenerate all summaries.",
+    async handler(args, ctx): Promise<void> {
+      const normalizedArgs = args.trim();
+      if (normalizedArgs !== "" && normalizedArgs !== "--force") {
+        const outcome: ManagedGroupSummaryOutcome = {
+          group: "<managed skills>",
+          status: "failed",
+          message: "Usage: /refresh-managed-skills [--force]",
+        };
+        notifySummaryOutcome(ctx, outcome, false);
+        sendSummaryMessage(outcome);
+        return;
+      }
+      const force = normalizedArgs === "--force";
+      try {
+        scanManagedGroups();
+        const work = groupStore.queueManualSummaryWork();
+        const outcomes = await runSummaryWorkBatch(ctx, work, force);
+        if (outcomes.length === 0) {
+          const outcome: ManagedGroupSummaryOutcome = {
+            group: "<managed skills>",
+            status: "generated",
+            message: "No managed skill groups were found.",
+          };
+          notifySummaryOutcome(ctx, outcome, false);
+          sendSummaryMessage(outcome);
+        }
+      } catch (error) {
+        const outcome: ManagedGroupSummaryOutcome = {
+          group: "<managed skills>",
+          status: "failed",
+          message: `Managed skill summary refresh failed: ${errorReason(error)}`,
+        };
+        notifySummaryOutcome(ctx, outcome, false);
+        sendSummaryMessage(outcome);
+      }
     },
   });
 
-  pi.on("input", event => {
-    const text = event.text;
-    if (typeof text !== "string" || !/^\/refresh-managed-skills(?:\s+refresh)?\s*$/.test(text)) {
+  pi.on("session_start", (_event, ctx) => {
+    startAutomaticSummaryWork(ctx);
+  });
+  pi.on("session_switch", (_event, ctx) => {
+    try {
+      groupStore.beginSession();
+    } catch (error) {
+      notifySummaryOutcome(ctx, {
+        group: "<managed skills>",
+        status: "failed",
+        message: `Managed skill session recovery failed: ${errorReason(error)}`,
+      });
       return;
     }
-    scanManagedGroups();
-    return { text: "/reload-plugins" };
+    startAutomaticSummaryWork(ctx);
   });
 
   pi.on("tool_call", async (event, ctx) => {
