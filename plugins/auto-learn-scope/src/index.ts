@@ -1,6 +1,13 @@
-import { readdirSync, statSync, type Dirent } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
-import { createManagedGroupStore, type ManagedGroupStore } from "./managed-groups";
+import { lstatSync, readFileSync, readlinkSync, readdirSync, realpathSync, statSync, type Dirent } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { extractUriScheme, InternalUrlRouter, parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { parseReadUrlTarget } from "@oh-my-pi/pi-coding-agent/tools/fetch";
+import { splitDelimitedPathEntry, splitMixedUrlPathList } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
+import {
+  createManagedGroupStore,
+  type ManagedGroupIndexResult,
+  type ManagedGroupStore,
+} from "./managed-groups";
 import { createProjectSkillWriter, type ProjectSkillWriter } from "./project-skills";
 
 type UnknownRecord = Record<string, unknown>;
@@ -60,7 +67,7 @@ type HostPiNamespace = {
     rawValue?: (setting: unknown) => unknown;
   };
   getAgentDir?: () => string;
-  getActiveSkills?: () => unknown;
+  AgentRegistry?: unknown;
 };
 
 type HostPi = {
@@ -101,6 +108,12 @@ type ManageParams = {
   description?: string;
   body?: string;
 };
+type ManagedIndexResult = ManagedGroupIndexResult;
+
+type ManagedRootPaths = { root: string; requested: string };
+
+type ManagedGroupRead = { group: string; targetPath: string; directory: boolean };
+
 
 const SCOPE_VALUES = ["global", "project"] as const;
 const LEARN_ACTION_VALUES = ["create", "update"] as const;
@@ -210,7 +223,7 @@ const LEARN_DESCRIPTION = [
   "Capture reusable lessons in long-term memory; optionally mint/enhance a managed skill in the same call.",
   "Use after solving insight likely to pay off again: a non-obvious fix, discovered project convention, or workflow that worked.",
   "`skill` optional; provide only for a repeatable procedure worth codifying as `SKILL.md`, not a fact.",
-  "For a global skill, `skill.group` is required; choose the existing managed-skill group that best fits or create a new one by name.",
+  "For a global skill, `skill.group` is required; use a slash-separated path such as `engineering/database/postgresql` to reuse existing groups or create missing levels.",
   "Managed skills live under the OMP agent directory's `managed-skills` folder; never touch user-authored skills.",
   "Frontmatter: generated from `name` and `description`.",
   "Capture sparingly, specifically: one strong reusable lesson > several vague ones.",
@@ -222,13 +235,13 @@ const MANAGE_DESCRIPTION = [
   "Use: repeatable procedures worth codifying — setup sequence, debugging recipe, project-specific workflow.",
   "User-authored skills separate; tool NEVER edits them.",
   '`action: "create"` — fails if skill exists; `action: "update"` — overwrites body; fails if skill absent; `action: "delete"` — fails if skill absent.',
-  "`group` and `name`: kebab-case (lowercase letters, digits, hyphens); group is required for global scope.",
+  "`group` is required for global scope and accepts slash-separated kebab-case path segments; `name` is kebab-case.",
   "`description`: specific; drives discovery.",
   "No frontmatter in `body`; generated from `name` and `description`.",
   'Scope defaults to "global"; `scope: "project"` writes the isolated project skill under this repository instead, without a group.',
 ].join(" ");
 const GUIDANCE =
-  "Auto-learn guidance: scope defaults to global. Use native memory/learn for durable facts or conventions; use a procedure/skill only when it is reusable. Global skills require an explicit group: choose the existing group that best fits or name a new group. Memory-only learn calls need no group. Choose scope=project only when a skill should be saved in this repository, check whether an existing skill already covers it, and never put secrets or tokens in a skill.";
+  "Auto-learn guidance: scope defaults to global. Use native memory/learn for durable facts or conventions; use a procedure/skill only when it is reusable. Global skills require an explicit group path such as engineering/database/postgresql: choose the existing group that best fits or name a new nested path. Memory-only learn calls need no group. Choose scope=project only when a skill should be saved in this repository, check whether an existing skill already covers it, and never put secrets or tokens in a skill.";
 
 function asRecord(value: unknown, label: string): UnknownRecord {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -362,6 +375,37 @@ function normalisedSkillName(name: string): string {
 function isManagedName(value: unknown): boolean {
   return typeof value === "string" && MANAGED_NAME_PATTERN.test(normalisedSkillName(value));
 }
+function isManagedGroup(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const group = normalisedSkillName(value);
+  if (group.includes("\\")) return false;
+  const segments = group.split("/");
+  return segments.length > 0 && segments.every(segment => MANAGED_NAME_PATTERN.test(segment));
+}
+
+function requireManagedGroup(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`${label} is required.`);
+  }
+  const group = normalisedSkillName(value);
+  if (!isManagedGroup(group)) {
+    throw new Error(
+      `Invalid ${label} "${value}"; use slash-separated lowercase letters, digits, and hyphens (1-64 characters per segment).`,
+    );
+  }
+  return group;
+}
+
+function topManagedGroup(group: string): string {
+  return group.slice(0, group.indexOf("/") < 0 ? group.length : group.indexOf("/"));
+}
+
+function rememberManagedGroupPath(knownGroups: Set<string>, group: string): void {
+  const segments = group.split("/");
+  for (let count = 1; count <= segments.length; count++) {
+    knownGroups.add(segments.slice(0, count).join("/"));
+  }
+}
 
 function requireManagedName(value: unknown, label: string): string {
   if (typeof value !== "string" || value.trim().length === 0) {
@@ -486,23 +530,88 @@ function projectWriterFrom(options?: AutoLearnScopeOptions): ProjectSkillWriter 
   return createProjectSkillWriter();
 }
 
-function managedRootFrom(pi: HostPi, options?: AutoLearnScopeOptions): string {
+// Freeze symlinked ancestors too; append a missing suffix to the nearest existing real path.
+function canonicalManagedRootPath(root: string): string {
+  let current = resolve(root);
+  const suffix: string[] = [];
+  for (;;) {
+    try {
+      return resolve(realpathSync(current), ...suffix);
+    } catch (error) {
+      const code =
+        error !== null && typeof error === "object" && typeof (error as UnknownRecord).code === "string"
+          ? (error as UnknownRecord).code
+          : undefined;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+      try {
+        if (lstatSync(current).isSymbolicLink()) {
+          current = resolve(dirname(current), readlinkSync(current));
+          continue;
+        }
+      } catch (linkError) {
+        const linkCode =
+          linkError !== null && typeof linkError === "object" && typeof (linkError as UnknownRecord).code === "string"
+            ? (linkError as UnknownRecord).code
+            : undefined;
+        if (linkCode !== "ENOENT" && linkCode !== "ENOTDIR") throw linkError;
+      }
+      const parent = dirname(current);
+      if (parent === current) throw error;
+      suffix.unshift(relative(parent, current));
+      current = parent;
+    }
+  }
+}
+
+
+function managedRootFrom(pi: HostPi, options?: AutoLearnScopeOptions): ManagedRootPaths {
+  let requested: string;
   if (options?.managedRoot !== undefined) {
     if (typeof options.managedRoot !== "string" || options.managedRoot.trim().length === 0) {
       throw new Error("managedRoot must be a non-empty path when provided.");
     }
-    return resolve(options.managedRoot);
+    requested = resolve(options.managedRoot);
+  } else {
+    const namespace = pi.pi;
+    if (!namespace || typeof namespace.getAgentDir !== "function") {
+      throw new Error("OMP host does not expose pi.getAgentDir(); provide options.managedRoot explicitly.");
+    }
+    const agentDir = namespace.getAgentDir.call(namespace);
+    if (typeof agentDir !== "string" || agentDir.trim().length === 0) {
+      throw new Error("OMP host pi.getAgentDir() did not return an agent directory.");
+    }
+    requested = join(resolve(agentDir), "managed-skills");
   }
-  const namespace = pi.pi;
-  if (!namespace || typeof namespace.getAgentDir !== "function") {
-    throw new Error("OMP host does not expose pi.getAgentDir(); provide options.managedRoot explicitly.");
-  }
-  const agentDir = namespace.getAgentDir.call(namespace);
-  if (typeof agentDir !== "string" || agentDir.trim().length === 0) {
-    throw new Error("OMP host pi.getAgentDir() did not return an agent directory.");
-  }
-  return join(resolve(agentDir), "managed-skills");
+  return { root: canonicalManagedRootPath(requested), requested };
 }
+
+function pathWithinManagedRoot(roots: ManagedRootPaths, candidate: string): string | undefined {
+  if (canonicalManagedRootPath(roots.requested) !== roots.root) {
+    throw new Error("The managed-skills root symlink target changed after extension initialization.");
+  }
+  const canonicalCandidate = canonicalManagedRootPath(resolve(candidate));
+  if (canonicalManagedRootPath(roots.requested) !== roots.root) {
+    throw new Error("The managed-skills root symlink target changed after extension initialization.");
+  }
+  const rootRelative = relative(roots.root, canonicalCandidate);
+  if (
+    rootRelative === "" ||
+    (rootRelative !== ".." && !rootRelative.startsWith(`..${sep}`) && !isAbsolute(rootRelative))
+  ) {
+    return canonicalCandidate;
+  }
+  return undefined;
+}
+
+function samePathTarget(left: string, right: string): boolean {
+  if (resolve(left) === resolve(right)) return true;
+  try {
+    return realpathSync(left) === realpathSync(right);
+  } catch {
+    return false;
+  }
+}
+
 
 function rememberManagedGroups(
   root: string,
@@ -523,36 +632,32 @@ function rememberManagedGroups(
   }
 }
 
-function assertGroupNotShadowed(pi: HostPi, managedRoot: string, group: string): void {
-  const namespace = pi.pi;
-  if (!namespace || typeof namespace.getActiveSkills !== "function") {
-    throw new Error("OMP host does not expose pi.getActiveSkills(); cannot verify group-name conflicts.");
-  }
-  let skills: unknown;
-  try {
-    skills = namespace.getActiveSkills.call(namespace);
-  } catch (error) {
-    throw new Error(`OMP host active skills are unavailable; cannot verify group-name conflicts: ${errorReason(error)}`);
-  }
-  if (!Array.isArray(skills)) {
-    throw new Error("OMP host returned no active-skill list; cannot verify group-name conflicts.");
+function assertGroupNotShadowed(
+  skills: unknown[] | undefined,
+  roots: ManagedRootPaths,
+  group: string,
+  verifiedGroup: boolean,
+): void {
+  if (!skills) {
+    throw new Error("OMP current-session skills are unavailable; cannot verify group-name conflicts.");
   }
 
-  const groupIndex = resolve(managedRoot, group, "SKILL.md");
-  for (const entry of skills) {
-    if (entry === null || typeof entry !== "object") continue;
-    const candidate = entry as UnknownRecord;
-    if (candidate.name !== group) continue;
-    if (typeof candidate.filePath !== "string" || candidate.filePath.length === 0) {
-      throw new Error(`Cannot create managed skill group "${group}": an active same-named skill has no file path.`);
-    }
-    const activePath = resolve(candidate.filePath);
-    throw new Error(
-      `Cannot create managed skill group "${group}": an active skill with the same name resolves to "${candidate.filePath}"${
-        activePath === groupIndex ? " but that path is not a verified managed group index" : ""
-      }.`,
-    );
-  }
+  const candidate = skills.find(
+    (entry): entry is UnknownRecord =>
+      entry !== null && typeof entry === "object" && (entry as UnknownRecord).name === group,
+  );
+  if (!candidate) return;
+  const groupIndex = resolve(roots.root, group, "SKILL.md");
+  const activePath =
+    typeof candidate.filePath === "string" && candidate.filePath.length > 0
+      ? pathWithinManagedRoot(roots, candidate.filePath) ?? resolve(candidate.filePath)
+      : undefined;
+  if (verifiedGroup && activePath && samePathTarget(activePath, groupIndex)) return;
+  throw new Error(
+    `Cannot create managed skill group "${group}": active same-named skill conflict; OMP resolves its top-level skill name to "${
+      typeof candidate.filePath === "string" ? candidate.filePath : "<missing file path>"
+    }" instead of a verified managed group index.`,
+  );
 }
 
 function nativeToolFailed(result: unknown): boolean {
@@ -570,22 +675,35 @@ function storeStatus(error: unknown, key: "skillStatus" | "indexStatus"): string
   return "unknown";
 }
 
+function indexResultsFrom(value: unknown): ManagedIndexResult[] {
+  if (value !== null && typeof value === "object" && Array.isArray((value as UnknownRecord).indexes)) {
+    return (value as UnknownRecord).indexes as ManagedIndexResult[];
+  }
+  throw new Error("Managed group mutation error omitted its per-index results.");
+}
+
 function managedSkillOutcome(
   action: ManageAction,
   name: string,
   group: string,
-  managedRoot: string,
   memorySaved: boolean,
   memoryResult: unknown,
   mutationPath: string | undefined,
+  mutationIndexes: ManagedIndexResult[] | undefined,
   failed: boolean,
   error: unknown,
 ): UnknownRecord {
   const path = failed ? errorPath(error) : mutationPath;
   const skillPath = failed ? errorStringField(error, "skillPath") ?? path : path;
   const skillStatus = failed ? storeStatus(error, "skillStatus") : action === "delete" ? "deleted" : "written";
-  const indexStatus = failed ? storeStatus(error, "indexStatus") : "written";
-  const indexPath = failed ? errorStringField(error, "indexPath") ?? join(managedRoot, group, "SKILL.md") : join(managedRoot, group, "SKILL.md");
+  const indexes = failed ? indexResultsFrom(error) : mutationIndexes;
+  if (!indexes || indexes.length === 0) {
+    throw new Error("Managed group mutation returned no per-index results.");
+  }
+  const primaryIndex = indexes[0];
+  if (!primaryIndex) throw new Error("Managed group mutation returned an invalid per-index result list.");
+  const indexStatus = failed ? storeStatus(error, "indexStatus") : primaryIndex.status;
+  const indexPath = (failed ? errorStringField(error, "indexPath") : undefined) ?? primaryIndex.path;
   const reason = failed ? errorReason(error) : undefined;
   const skill = {
     action,
@@ -595,9 +713,17 @@ function managedSkillOutcome(
     ...(skillPath ? { path: skillPath } : {}),
   };
   const index = { status: indexStatus, path: indexPath };
+  const indexSummary = indexes
+    .map(
+      item =>
+        `${item.group}: ${item.status} at ${item.path}${item.needsRebuild ? " (needs rebuild)" : ""}${
+          item.reason ? ` (${item.reason})` : ""
+        }`,
+    )
+    .join("; ");
   const message = failed
-    ? `${memorySaved ? "Memory was saved, but " : ""}managed skill "${name}" in group "${group}" failed (skillStatus=${skillStatus}, indexStatus=${indexStatus}${path ? `, path=${path}` : ""}): ${reason}`
-    : `${memorySaved ? "Memory was saved and " : ""}${action === "delete" ? "deleted" : `${action}d`} managed skill "${name}" in group "${group}"${path ? ` at ${path}` : ""}; group index ${indexStatus} at ${indexPath}.`;
+    ? `${memorySaved ? "Memory was saved, but " : ""}managed skill "${name}" in group "${group}" failed (skillStatus=${skillStatus}, indexStatus=${indexStatus}${path ? `, path=${path}` : ""}): ${reason}; indexes: ${indexSummary}.`
+    : `${memorySaved ? "Memory was saved and " : ""}${action === "delete" ? "deleted" : `${action}d`} managed skill "${name}" in group "${group}"${path ? ` at ${path}` : ""}; indexes: ${indexSummary}.`;
   return {
     ...(memorySaved && memoryResult !== null && typeof memoryResult === "object"
       ? (memoryResult as UnknownRecord)
@@ -607,6 +733,7 @@ function managedSkillOutcome(
     index,
     skillStatus,
     indexStatus,
+    indexes,
     ...(path ? { path } : {}),
     ...(skillPath ? { skillPath } : {}),
     indexPath,
@@ -622,6 +749,7 @@ function managedSkillOutcome(
       index,
       skillStatus,
       indexStatus,
+      indexes,
       ...(path ? { path } : {}),
       ...(skillPath ? { skillPath } : {}),
       indexPath,
@@ -630,63 +758,309 @@ function managedSkillOutcome(
   };
 }
 
-function managedGroupForRead(pi: HostPi, managedRoot: string, event: UnknownRecord): string | undefined {
-  if (event.toolName !== "read") return undefined;
-  const input = event.input;
-  if (input === null || typeof input !== "object" || Array.isArray(input)) return undefined;
-  const requestPath = (input as UnknownRecord).path;
-  if (typeof requestPath !== "string" || !requestPath.trim().startsWith("skill://")) return undefined;
-  const route = requestPath.trim().slice("skill://".length);
-  if (!route || route.startsWith("/") || /(^|\/)\.{1,2}(\/|$)|\/\//.test(route)) return undefined;
-  const namespace = pi.pi;
-  if (!namespace || typeof namespace.getActiveSkills !== "function") return undefined;
 
-  let skills: unknown;
+// Match the tool context to its registered live session before reading session-local skills.
+function activeSessionSkillsFor(pi: HostPi, ctx: unknown): unknown[] | undefined {
+  if (ctx === null || typeof ctx !== "object" || Array.isArray(ctx)) return undefined;
+  const context = ctx as UnknownRecord;
+  const agent = context.agent;
+  const contextSessionManager = context.sessionManager;
+  if (
+    agent === null ||
+    typeof agent !== "object" ||
+    typeof (agent as UnknownRecord).id !== "string" ||
+    contextSessionManager === null ||
+    typeof contextSessionManager !== "object"
+  ) {
+    return undefined;
+  }
   try {
-    skills = namespace.getActiveSkills.call(namespace);
+    const agentId = (agent as UnknownRecord).id as string;
+    const getContextSessionId = Reflect.get(contextSessionManager, "getSessionId");
+    if (typeof getContextSessionId !== "function") return undefined;
+    const contextSessionId = Reflect.apply(getContextSessionId, contextSessionManager, []);
+    if (typeof contextSessionId !== "string" || contextSessionId.length === 0) return undefined;
+
+    const registryProvider = pi.pi?.AgentRegistry;
+    if (
+      registryProvider === null ||
+      (typeof registryProvider !== "object" && typeof registryProvider !== "function")
+    ) {
+      return undefined;
+    }
+    const getRegistry = Reflect.get(registryProvider, "global");
+    if (typeof getRegistry !== "function") return undefined;
+    const registry = Reflect.apply(getRegistry, registryProvider, []);
+    if (registry === null || typeof registry !== "object") return undefined;
+    const getAgent = Reflect.get(registry, "get");
+    if (typeof getAgent !== "function") return undefined;
+    const registeredAgent = Reflect.apply(getAgent, registry, [agentId]);
+    if (registeredAgent === null || typeof registeredAgent !== "object") return undefined;
+
+    const session = Reflect.get(registeredAgent, "session");
+    if (!session || typeof session !== "object") return undefined;
+    const sessionManager = Reflect.get(session, "sessionManager");
+    if (sessionManager === null || typeof sessionManager !== "object") return undefined;
+    const getSessionId = Reflect.get(sessionManager, "getSessionId");
+    if (typeof getSessionId !== "function") return undefined;
+    const registeredSessionId = Reflect.apply(getSessionId, sessionManager, []);
+    if (registeredSessionId !== contextSessionId) return undefined;
+    const skills = Reflect.get(session, "skills");
+    return Array.isArray(skills) ? skills : undefined;
   } catch {
     return undefined;
   }
-  if (!Array.isArray(skills)) return undefined;
+}
 
-  let resolvedName = "";
-  let resolvedFilePath = "";
-  let longestName = -1;
-  let ambiguous = false;
-  for (const entry of skills) {
-    if (entry === null || typeof entry !== "object") continue;
-    const candidate = entry as UnknownRecord;
-    if (typeof candidate.name !== "string" || typeof candidate.filePath !== "string") continue;
-    if (route !== candidate.name && !route.startsWith(`${candidate.name}/`)) continue;
-    if (candidate.name.length > longestName) {
-      resolvedName = candidate.name;
-      resolvedFilePath = candidate.filePath;
-      longestName = candidate.name.length;
-      ambiguous = false;
-    } else if (candidate.name.length === longestName) {
-      ambiguous = true;
-    }
-  }
-  if (longestName < 0 || ambiguous || resolvedName.length === 0 || resolvedFilePath.length === 0) {
+
+function skillRouteParts(requestPath: string): string[] | undefined {
+  const router = InternalUrlRouter.instance();
+  const { path: normalizedPath } = router.split(requestPath.trim());
+  if (extractUriScheme(normalizedPath) !== "skill" || !router.canResolve(normalizedPath)) return undefined;
+  let host: string;
+  let pathname: string;
+  try {
+    const url = parseInternalUrl(normalizedPath);
+    host = url.rawHost || url.hostname;
+    pathname = url.pathname;
+  } catch {
     return undefined;
   }
+  if (!host || pathname.startsWith("//")) return undefined;
+  let route = pathname.startsWith("/") ? pathname.slice(1) : pathname;
+  if (route.endsWith("/")) route = route.slice(0, -1);
+  if (route.includes("\\") || route.includes("?") || route.includes("#")) return undefined;
+  const encodedParts = route ? route.split("/") : [];
+  if (encodedParts.some(part => part.length === 0)) return undefined;
+  let parts: string[];
+  try {
+    parts = encodedParts.map(part => decodeURIComponent(part));
+  } catch {
+    return undefined;
+  }
+  const decodedPath = parts.join("/");
+  if (
+    parts.some(part => !part || part === "." || part.includes("\\")) ||
+    decodedPath.startsWith("/") ||
+    decodedPath.split(/[\\/]/).includes("..")
+  ) {
+    return undefined;
+  }
+  return [host, ...parts];
+}
 
-  const relativePath = relative(resolve(managedRoot), resolve(resolvedFilePath));
-  const parts = relativePath.split(/[\\/]/);
-  if (parts[0] === ".." || (parts.length !== 2 && parts.length !== 3)) return undefined;
-  if (parts.at(-1) !== "SKILL.md" || !isManagedName(parts[0])) return undefined;
-  const group = parts[0];
-  const routeGroup = route.slice(0, route.indexOf("/") < 0 ? route.length : route.indexOf("/"));
-  if (group !== normalisedSkillName(group) || routeGroup !== group) return undefined;
-  if (parts.length === 3 && !isManagedName(parts[1])) return undefined;
-  return group;
+function activeSkillTarget(
+  skills: unknown[],
+  routeParts: string[],
+  directory = false,
+): { name: string; targetPath: string; directory: boolean } | undefined {
+  const [host, ...pathParts] = routeParts;
+  if (!host) return undefined;
+  let candidate: UnknownRecord | undefined;
+  let remainingPath = pathParts;
+  // OMP checks exactly <host>/<first path segment> before falling back to the bare host skill.
+  if (pathParts.length > 0) {
+    const namespaceName = `${host}/${pathParts[0]}`;
+    const match = skills.find(
+      (entry): entry is UnknownRecord =>
+        entry !== null && typeof entry === "object" && (entry as UnknownRecord).name === namespaceName,
+    );
+    if (match) {
+      candidate = match;
+      remainingPath = pathParts.slice(1);
+    }
+  }
+  candidate ??= skills.find(
+    (entry): entry is UnknownRecord =>
+      entry !== null && typeof entry === "object" && (entry as UnknownRecord).name === host,
+  );
+  if (!candidate || typeof candidate.name !== "string" || typeof candidate.filePath !== "string") {
+    return undefined;
+  }
+  const filePath = resolve(candidate.filePath);
+  const baseDir = typeof candidate.baseDir === "string" ? resolve(candidate.baseDir) : dirname(filePath);
+  return {
+    name: candidate.name,
+    targetPath: remainingPath.length === 0 ? (directory ? baseDir : filePath) : resolve(baseDir, ...remainingPath),
+    directory: remainingPath.length === 0 && directory,
+  };
+}
+
+function managedGroupForRead(
+  roots: ManagedRootPaths,
+  groupStore: ManagedGroupStore,
+  knownGroups: Set<string>,
+  routeParts: string[],
+  skills: unknown[],
+  directoryRequested: boolean,
+): ManagedGroupRead | undefined {
+  const target = activeSkillTarget(skills, routeParts, directoryRequested);
+  if (!target) return undefined;
+  const targetPath = pathWithinManagedRoot(roots, target.targetPath);
+  if (!targetPath) return undefined;
+
+  let directory = target.directory;
+  try {
+    directory = statSync(targetPath).isDirectory();
+  } catch {
+    if (directoryRequested && routeParts.at(-1) !== "SKILL.md") directory = true;
+  }
+
+  const relativePath = relative(roots.root, targetPath);
+  if (!relativePath || relativePath === ".." || relativePath.startsWith(`..${sep}`)) {
+    return undefined;
+  }
+  const targetParts = relativePath.split(/[\\/]/);
+  const directoryParts = directory ? targetParts : targetParts.slice(0, -1);
+  if (directoryParts.length === 0 || !isManagedName(directoryParts[0])) return undefined;
+
+  let group: string | undefined;
+  for (let count = 1; count <= directoryParts.length; count++) {
+    const segments = directoryParts.slice(0, count);
+    if (segments.some(segment => segment !== normalisedSkillName(segment) || !isManagedName(segment))) break;
+    const candidate = segments.join("/");
+    if (groupStore.isGroup(candidate) || knownGroups.has(candidate)) group = candidate;
+  }
+  return group ? { group, targetPath, directory } : undefined;
+}
+
+async function readPathEntries(requestPath: string, cwd: string): Promise<string[]> {
+  const router = InternalUrlRouter.instance();
+  const mixedParts = await splitMixedUrlPathList(
+    requestPath,
+    cwd,
+    part => parseReadUrlTarget(part) !== null || router.canResolve(part),
+  );
+  if (mixedParts) return mixedParts;
+  if (router.canResolve(requestPath)) {
+    return (
+      (await splitDelimitedPathEntry(requestPath, cwd, {
+        routedUrlPredicate: part => router.canResolve(part),
+      })) ?? [requestPath]
+    );
+  }
+  if (parseReadUrlTarget(requestPath) !== null) return [requestPath];
+  if (requestPath.toLowerCase().includes("skill:")) {
+    return (await splitDelimitedPathEntry(requestPath, cwd)) ?? [requestPath];
+  }
+  return [requestPath];
+}
+
+function mayAddressKnownManagedTopGroup(
+  routeParts: string[],
+  groupStore: ManagedGroupStore,
+  knownGroups: Set<string>,
+): boolean {
+  for (let index = 0; index < routeParts.length && index < 2; index++) {
+    const candidate = routeParts[index];
+    if (!candidate) continue;
+    const group = topManagedGroup(candidate);
+    if (!isManagedName(group)) continue;
+    if (knownGroups.has(group) || groupStore.isGroup(group)) return true;
+    for (const known of knownGroups) {
+      if (known.startsWith(`${group}/`)) return true;
+    }
+  }
+  return false;
+}
+
+
+async function managedGroupReadsForRead(
+  pi: HostPi,
+  roots: ManagedRootPaths,
+  groupStore: ManagedGroupStore,
+  knownGroups: Set<string>,
+  event: UnknownRecord,
+  ctx: unknown,
+): Promise<{ reads: ManagedGroupRead[]; skills: unknown[] } | undefined> {
+  if (event.toolName !== "read") return undefined;
+  const input = event.input;
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return undefined;
+  const inputRecord = input as UnknownRecord;
+  const requestPath = inputRecord.path;
+  if (typeof requestPath !== "string" || !requestPath.toLowerCase().includes("skill:")) return undefined;
+  const context = ctx !== null && typeof ctx === "object" && !Array.isArray(ctx) ? (ctx as UnknownRecord) : {};
+  const cwd = typeof context.cwd === "string" ? context.cwd : "";
+  const entries = await readPathEntries(requestPath, cwd);
+  const routes: string[][] = [];
+  for (const entry of entries) {
+    const routeParts = skillRouteParts(entry);
+    if (routeParts) routes.push(routeParts);
+  }
+  if (routes.length === 0) return undefined;
+  const skills = activeSessionSkillsFor(pi, ctx);
+  if (!skills) {
+    if (routes.some(route => mayAddressKnownManagedTopGroup(route, groupStore, knownGroups))) {
+      throw new Error("OMP current-session skills are unavailable; cannot verify this possible managed skill read.");
+    }
+    return undefined;
+  }
+  const directoryRequested = inputRecord.directory === true;
+  const reads: ManagedGroupRead[] = [];
+  for (const routeParts of routes) {
+    const read = managedGroupForRead(
+      roots,
+      groupStore,
+      knownGroups,
+      routeParts,
+      skills,
+      directoryRequested,
+    );
+    if (read) reads.push(read);
+  }
+  return { reads, skills };
+}
+
+function assertGroupIndexLinksVisible(
+  skills: unknown[],
+  roots: ManagedRootPaths,
+  indexPath: string,
+): void {
+  const canonicalIndexPath = pathWithinManagedRoot(roots, indexPath);
+  if (!canonicalIndexPath) throw new Error("Managed skill index is outside the managed-skills root.");
+  const relativeIndexPath = relative(roots.root, canonicalIndexPath);
+  const indexParts = relativeIndexPath.split(/[\\/]/);
+  if (indexParts.at(-1) === "SKILL.md") {
+    const indexGroup = indexParts.slice(0, -1).join("/");
+    if (isManagedGroup(indexGroup)) {
+      const route = `${indexGroup}/SKILL.md`;
+      const actual = activeSkillTarget(skills, [...indexGroup.split("/"), "SKILL.md"]);
+      const expectedPath = resolve(roots.root, indexGroup, "SKILL.md");
+      if (actual) {
+        const actualPath = pathWithinManagedRoot(roots, actual.targetPath) ?? resolve(actual.targetPath);
+        if (!samePathTarget(actualPath, expectedPath)) {
+          throw new Error(
+            `OMP resolves "skill://${route}" to active skill "${actual.name}" at "${actual.targetPath}", ` +
+              `masking the managed group index at "${expectedPath}".`,
+          );
+        }
+      }
+    }
+  }
+  const index = readFileSync(canonicalIndexPath, "utf8");
+  const links = /^[ \t]+Read: skill:\/\/([^\/\s]+(?:\/[^\/\s]+)+\/SKILL\.md)[ \t]*\r?$/gm;
+  for (const match of index.matchAll(links)) {
+    const route = match[1];
+    if (!route) continue;
+    const routeParts = skillRouteParts(`skill://${route}`);
+    if (!routeParts || routeParts.length < 3) continue;
+    const actual = activeSkillTarget(skills, routeParts);
+    if (!actual) continue;
+    const expectedPath = resolve(roots.root, ...routeParts);
+    const actualPath = pathWithinManagedRoot(roots, actual.targetPath) ?? resolve(actual.targetPath);
+    if (samePathTarget(actualPath, expectedPath)) continue;
+    throw new Error(
+      `OMP resolves "skill://${route}" to active skill "${actual.name}" at "${actual.targetPath}", ` +
+        `masking the managed group entry at "${expectedPath}".`,
+    );
+  }
 }
 
 function buildSchemas(z: ZodLike): { learn: Schema; manageSkill: Schema } {
   const learnSkill = z.object({
     group: optionalSchema(
       z,
-      describeSchema(z.string(), "required for a global scope skill; kebab-case managed-skill group name"),
+      describeSchema(z.string(), "required for a global skill; slash-separated kebab-case group path, e.g. engineering/database/postgresql"),
     ),
     action: z.enum(LEARN_ACTION_VALUES),
     name: describeSchema(z.string(), "kebab-case skill name"),
@@ -710,7 +1084,7 @@ function buildSchemas(z: ZodLike): { learn: Schema; manageSkill: Schema } {
             if (params.scope === "project" || params.skill === undefined) return true;
             if (params.skill === null || typeof params.skill !== "object" || Array.isArray(params.skill)) return false;
             const skill = params.skill as UnknownRecord;
-            return isManagedName(skill.group) && isManagedName(skill.name);
+            return isManagedGroup(skill.group) && isManagedName(skill.name);
           },
           'global learn with "skill" requires a valid skill "group" and "name".',
         )
@@ -719,7 +1093,7 @@ function buildSchemas(z: ZodLike): { learn: Schema; manageSkill: Schema } {
   const manageSkillSchema = z.object({
     group: optionalSchema(
       z,
-      describeSchema(z.string(), "required for global scope; kebab-case managed-skill group name"),
+      describeSchema(z.string(), "required for global scope; slash-separated kebab-case group path, e.g. engineering/database/postgresql"),
     ),
     action: z.enum(MANAGE_ACTION_VALUES),
     name: describeSchema(z.string(), "kebab-case skill name"),
@@ -738,7 +1112,7 @@ function buildSchemas(z: ZodLike): { learn: Schema; manageSkill: Schema } {
           value => {
             if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
             const params = value as UnknownRecord;
-            if (params.scope !== "project" && (!isManagedName(params.group) || !isManagedName(params.name))) return false;
+            if (params.scope !== "project" && (!isManagedGroup(params.group) || !isManagedName(params.name))) return false;
             if (params.action === "delete") return true;
             return (
               (params.action === "create" || params.action === "update") &&
@@ -753,7 +1127,8 @@ function buildSchemas(z: ZodLike): { learn: Schema; manageSkill: Schema } {
 }
 
 export function installAutoLearnScope(pi: HostPi, options?: AutoLearnScopeOptions): void {
-  const managedRoot = managedRootFrom(pi, options);
+  const managedRoots = managedRootFrom(pi, options);
+  const managedRoot = managedRoots.root;
   const groupStore = createManagedGroupStore(managedRoot);
   const knownGroups = new Set<string>();
   rememberManagedGroups(managedRoot, groupStore, knownGroups);
@@ -795,14 +1170,13 @@ export function installAutoLearnScope(pi: HostPi, options?: AutoLearnScopeOption
         scope === "global" && skill
           ? {
               ...skill,
-              group: requireManagedName(skill.group, 'learn skill "group"'),
+              group: requireManagedGroup(skill.group, 'learn skill "group"'),
               name: requireManagedName(skill.name, "learn skill name"),
             }
           : skill;
       if (scope === "global" && managedSkill?.action === "create" && managedSkill.group) {
-        if (!groupStore.isGroup(managedSkill.group)) {
-          assertGroupNotShadowed(pi, managedRoot, managedSkill.group);
-        }
+        const topGroup = topManagedGroup(managedSkill.group);
+        assertGroupNotShadowed(activeSessionSkillsFor(pi, ctx), managedRoots, topGroup, groupStore.isGroup(topGroup));
       }
       const invoke = requireNative(ctx, "learn");
       const invokeOptions = { signal, onUpdate };
@@ -828,15 +1202,15 @@ export function installAutoLearnScope(pi: HostPi, options?: AutoLearnScopeOption
             description: managedSkill.description,
             body: managedSkill.body,
           });
-          knownGroups.add(group);
+          rememberManagedGroupPath(knownGroups, group);
           return managedSkillOutcome(
             managedSkill.action,
             managedSkill.name,
             group,
-            managedRoot,
             true,
             memoryResult,
             result.path,
+            result.indexes,
             false,
             undefined,
           );
@@ -845,9 +1219,9 @@ export function installAutoLearnScope(pi: HostPi, options?: AutoLearnScopeOption
             managedSkill.action,
             managedSkill.name,
             group,
-            managedRoot,
             true,
             memoryResult,
+            undefined,
             undefined,
             true,
             error,
@@ -897,10 +1271,11 @@ export function installAutoLearnScope(pi: HostPi, options?: AutoLearnScopeOption
       const manageParams = validateManageParams(nativeParams);
 
       if (scope === "global") {
-        const group = requireManagedName(manageParams.group, 'manage_skill "group"');
+        const group = requireManagedGroup(manageParams.group, 'manage_skill "group"');
         const name = requireManagedName(manageParams.name, "manage_skill name");
-        if (manageParams.action === "create" && !groupStore.isGroup(group)) {
-          assertGroupNotShadowed(pi, managedRoot, group);
+        if (manageParams.action === "create") {
+          const topGroup = topManagedGroup(group);
+          assertGroupNotShadowed(activeSessionSkillsFor(pi, ctx), managedRoots, topGroup, groupStore.isGroup(topGroup));
         }
         try {
           const result = groupStore.mutate({
@@ -911,15 +1286,15 @@ export function installAutoLearnScope(pi: HostPi, options?: AutoLearnScopeOption
               ? {}
               : { description: manageParams.description ?? "", body: manageParams.body ?? "" }),
           });
-          knownGroups.add(group);
+          rememberManagedGroupPath(knownGroups, group);
           return managedSkillOutcome(
             manageParams.action,
             name,
             group,
-            managedRoot,
             false,
             undefined,
             result.path,
+            result.indexes,
             false,
             undefined,
           );
@@ -928,8 +1303,8 @@ export function installAutoLearnScope(pi: HostPi, options?: AutoLearnScopeOption
             manageParams.action,
             name,
             group,
-            managedRoot,
             false,
+            undefined,
             undefined,
             undefined,
             true,
@@ -1010,25 +1385,55 @@ export function installAutoLearnScope(pi: HostPi, options?: AutoLearnScopeOption
     return { text: "/reload-plugins" };
   });
 
-  pi.on("tool_call", event => {
-    const group = managedGroupForRead(pi, managedRoot, event);
-    if (!group) return;
+  pi.on("tool_call", async (event, ctx) => {
+    let batch: { reads: ManagedGroupRead[]; skills: unknown[] } | undefined;
     try {
-      const isGroup = groupStore.isGroup(group);
-      if (!isGroup) {
-        if (!knownGroups.has(group)) return;
-        return {
-          block: true,
-          reason: `Managed skill group "${group}" no longer has a valid index; resolve the conflict and refresh managed skills.`,
-        };
-      }
-      knownGroups.add(group);
-      groupStore.refresh(group);
+      batch = await managedGroupReadsForRead(pi, managedRoots, groupStore, knownGroups, event, ctx);
     } catch (error) {
       return {
         block: true,
-        reason: `Managed skill group "${group}" could not refresh before read: ${errorReason(error)}`,
+        reason: `Managed skill read could not be verified: ${errorReason(error)}`,
       };
+    }
+    if (!batch || batch.reads.length === 0) return;
+    const refreshGroups = new Set<string>();
+    for (const read of batch.reads) {
+      const { group, targetPath, directory } = read;
+      try {
+        const isGroup = groupStore.isGroup(group);
+        if (!isGroup) {
+          if (!knownGroups.has(group)) continue;
+          return {
+            block: true,
+            reason: `Managed skill group "${group}" no longer has a valid index; resolve the conflict and refresh managed skills.`,
+          };
+        }
+        const relativePath = relative(resolve(managedRoot), resolve(targetPath));
+        const targetParts = relativePath.split(/[\\/]/);
+        if (!directory && targetParts.at(-1) === "SKILL.md") {
+          const indexGroup = targetParts.slice(0, -1).join("/");
+          if (indexGroup && groupStore.isGroup(indexGroup)) {
+            assertGroupIndexLinksVisible(batch.skills, managedRoots, targetPath);
+          }
+        }
+        refreshGroups.add(group);
+      } catch (error) {
+        return {
+          block: true,
+          reason: `Managed skill group "${group}" could not refresh before read: ${errorReason(error)}`,
+        };
+      }
+    }
+    for (const group of refreshGroups) {
+      try {
+        rememberManagedGroupPath(knownGroups, group);
+        groupStore.refresh(group);
+      } catch (error) {
+        return {
+          block: true,
+          reason: `Managed skill group "${group}" could not refresh before read: ${errorReason(error)}`,
+        };
+      }
     }
   });
 }

@@ -9,16 +9,17 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  statSync,
   realpathSync,
   renameSync,
+  rmdirSync,
   rmSync,
   unlinkSync,
   writeFileSync,
   type Stats,
 } from "node:fs";
 import * as path from "node:path";
-import { YAML } from "bun";
-import { withFileLockSync } from "@oh-my-pi/pi-utils";
+import { parseFrontmatter as parseOmpFrontmatter, withFileLockSync } from "@oh-my-pi/pi-utils";
 import {
   MAX_PROJECT_SKILL_BYTES,
   sanitizeManagedDescription,
@@ -40,10 +41,23 @@ export interface ManagedGroupInput {
   body?: string;
 }
 
+export interface ManagedGroupIndexResult {
+  group: string;
+  path: string;
+  status: WriteStatus;
+  needsRebuild: boolean;
+  reason?: "failed" | "not-attempted";
+}
+
+export interface ManagedGroupMutation {
+  path: string;
+  indexes: ManagedGroupIndexResult[];
+}
+
 export interface ManagedGroupStore {
   scan(): void;
   refresh(group: string): void;
-  mutate(input: ManagedGroupInput): { path: string };
+  mutate(input: ManagedGroupInput): ManagedGroupMutation;
   isGroup(group: string): boolean;
 }
 
@@ -53,6 +67,7 @@ export type ManagedGroupError = Error & {
   path: string;
   skillPath: string;
   indexPath: string;
+  indexes: ManagedGroupIndexResult[];
 };
 
 type GroupMember = {
@@ -66,14 +81,28 @@ type GroupMember = {
   writable: boolean;
 };
 
+type GroupEntry = {
+  kind: "group" | "skill";
+  name: string;
+  description: string;
+  uri: string;
+};
+
+type GroupTree = {
+  group: string;
+  children: GroupTree[];
+};
+
 type GroupSnapshot = {
   name: string;
+  displayName: string;
   directory: string;
   directoryStat: Stats | null;
   index: string;
   indexStat: Stats | null;
   indexContents: string | null;
   members: GroupMember[];
+  childGroups: GroupEntry[];
 };
 
 let temporaryFileCounter = 0;
@@ -117,6 +146,7 @@ function makeError(
   error.path = targetPath;
   error.skillPath = skillPath;
   error.indexPath = indexPath;
+  error.indexes = [];
   return error;
 }
 function mergeWriteStatus(left: WriteStatus, right: WriteStatus): WriteStatus {
@@ -144,6 +174,7 @@ function ensureManagedError(
     "indexPath" in error
   ) {
     const managedError = error as ManagedGroupError;
+    if (!Array.isArray(managedError.indexes)) managedError.indexes = [];
     managedError.skillStatus = mergeWriteStatus(managedError.skillStatus, skillStatus);
     managedError.indexStatus = mergeWriteStatus(managedError.indexStatus, indexStatus);
     return managedError;
@@ -154,7 +185,14 @@ function ensureManagedError(
 
 function sanitizeGroupName(raw: unknown, root: string): string {
   try {
-    return sanitizeSkillName(raw);
+    if (typeof raw !== "string" || raw.includes("\\") || raw.startsWith("/") || path.isAbsolute(raw)) {
+      throw new Error("group must be a non-empty slash-separated path of valid skill names.");
+    }
+    const segments = raw.split("/");
+    if (segments.some(segment => segment === "" || segment === "." || segment === "..")) {
+      throw new Error("group must be a non-empty slash-separated path of valid skill names.");
+    }
+    return segments.map(segment => sanitizeSkillName(segment)).join("/");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw makeError(
@@ -192,7 +230,7 @@ function parseFrontmatter(
 
   let value: unknown;
   try {
-    value = YAML.parse(match[1]);
+    value = parseOmpFrontmatter(content.replace(/^\uFEFF/, ""), { level: "fatal", rawKeys: true }).frontmatter;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     throw makeError(group, action, `frontmatter at ${file} is not valid YAML: ${reason}`, file, skillPath, indexPath);
@@ -203,18 +241,52 @@ function parseFrontmatter(
   return value as Record<string, unknown>;
 }
 
+function resolveManagedRoot(rootPath: string): string {
+  const requestedRoot = path.resolve(rootPath);
+  let existing = requestedRoot;
+  while (true) {
+    if (lstatOrNull(existing)) {
+      return path.resolve(realpathSync(existing), path.relative(existing, requestedRoot));
+    }
+    const parent = path.dirname(existing);
+    if (parent === existing) return requestedRoot;
+    existing = parent;
+  }
+}
+
 function assertSafeRoot(root: string, group: string, action: string, allowMissing: boolean): boolean {
   const stat = lstatOrNull(root);
   if (stat === null) {
-    if (allowMissing) return false;
-    throw makeError(group, action, "the managed-skills root does not exist.", root, root, root);
+    if (!allowMissing) {
+      throw makeError(group, action, "the managed-skills root does not exist.", root, root, root);
+    }
+    let ancestor = root;
+    let ancestorStat = lstatOrNull(ancestor);
+    while (ancestorStat === null) {
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) break;
+      ancestor = parent;
+      ancestorStat = lstatOrNull(ancestor);
+    }
+    try {
+      if (!ancestorStat || realpathSync(ancestor) !== ancestor) {
+        throw makeError(group, action, "the managed-skills root ancestry changed from its startup path.", root, root, root);
+      }
+    } catch (error) {
+      if (error instanceof Error && "skillStatus" in error) throw error;
+      throw makeError(group, action, "the managed-skills root ancestry could not be resolved safely.", root, root, root);
+    }
+    return false;
   }
   if (stat.isSymbolicLink() || !stat.isDirectory()) {
     throw makeError(group, action, "the managed-skills root is not a safe directory.", root, root, root);
   }
   try {
-    realpathSync(root);
-  } catch {
+    if (realpathSync(root) !== root) {
+      throw makeError(group, action, "the managed-skills root no longer resolves to its startup path.", root, root, root);
+    }
+  } catch (error) {
+    if (error instanceof Error && "skillStatus" in error) throw error;
     throw makeError(group, action, "the managed-skills root could not be resolved safely.", root, root, root);
   }
   return true;
@@ -230,6 +302,9 @@ function assertCanonicalWithin(
 ): void {
   try {
     const canonicalRoot = realpathSync(root);
+    if (canonicalRoot !== root) {
+      throw makeError(group, action, `${root} no longer resolves to the fixed managed-skills root.`, candidate, skillPath, indexPath);
+    }
     const canonicalCandidate = realpathSync(candidate);
     if (!isPathWithin(canonicalRoot, canonicalCandidate)) {
       throw makeError(group, action, `${candidate} resolves outside the managed-skills root.`, candidate, skillPath, indexPath);
@@ -297,19 +372,114 @@ function readMember(
   };
 }
 
-function readGroupMembers(root: string, group: string, action: string): GroupMember[] {
+function hasGroupMarker(contents: string): boolean {
+  const frontmatter = /^(?:\uFEFF)?---\r?\n[\s\S]*?\r?\n---\r?\n\r?\n/.exec(contents);
+  if (!frontmatter) return false;
+  return contents.slice(frontmatter[0].length).split(/\r?\n/, 1)[0] === GROUP_MARKER;
+}
+
+function readIndexContents(index: string, group: string, action: string): { stat: Stats | null; contents: string | null } {
+  try {
+    const stat = lstatOrNull(index);
+    if (!stat) return { stat: null, contents: null };
+    if (stat.isSymbolicLink()) {
+      if (!statSync(index).isFile()) return { stat, contents: null };
+      return { stat, contents: readFileSync(index, "utf8") };
+    }
+    if (!stat.isFile()) return { stat, contents: null };
+    return { stat, contents: readFileSync(index, "utf8") };
+  } catch (error) {
+    throw ensureManagedError(error, group, action, index, index, index);
+  }
+}
+
+function discoverGroupTree(root: string, group: string, action: string): GroupTree | null {
+  const directory = path.join(root, group);
+  const directoryStat = lstatOrNull(directory);
+  if (!directoryStat || (!directoryStat.isDirectory() && !directoryStat.isSymbolicLink())) return null;
+  const index = path.join(directory, SKILL_FILE_NAME);
+  const indexInfo = readIndexContents(index, group, action);
+  if (indexInfo.stat && !indexInfo.stat.isSymbolicLink()) {
+    if (!indexInfo.stat.isFile() || !hasGroupMarker(indexInfo.contents ?? "")) return null;
+  }
+  if (indexInfo.stat?.isSymbolicLink()) {
+    if (hasGroupMarker(indexInfo.contents ?? "")) {
+      throw makeError(group, action, `group index ${index} is a symlink; refusing to replace its target.`, index, index, index);
+    }
+    return null;
+  }
+  let children: string[];
+  try {
+    children = readdirSync(directory);
+  } catch (error) {
+    throw ensureManagedError(error, group, action, directory, index, index);
+  }
+  const childGroups: GroupTree[] = [];
+  let hasDirectMembers = false;
+  for (const child of children) {
+    if (child === SKILL_FILE_NAME || child.startsWith(TEMP_FILE_PREFIX)) continue;
+    const childPath = path.join(directory, child);
+    const childStat = lstatOrNull(childPath);
+    if (!childStat || (!childStat.isDirectory() && !childStat.isSymbolicLink())) continue;
+    const childGroup = path.join(group, child);
+    const childTree = discoverGroupTree(root, childGroup, action);
+    if (childTree) {
+      validateDirectoryGroupName(child, root);
+      childGroups.push(childTree);
+    } else if (lstatOrNull(path.join(childPath, SKILL_FILE_NAME))) {
+      hasDirectMembers = true;
+    }
+  }
+
+  if (!indexInfo.stat && !hasDirectMembers && childGroups.length === 0) return null;
+  if (directoryStat.isSymbolicLink()) {
+    throw makeError(group, action, `group directory ${directory} is a symlink; refusing to follow it for writes.`, directory, directory, index);
+  }
+  assertCanonicalWithin(root, directory, group, action);
+  return { group, children: childGroups };
+}
+
+function discoverDirectChildGroups(root: string, group: string, action: string): GroupTree[] {
   const directory = path.join(root, group);
   let children: string[];
   try {
     children = readdirSync(directory);
   } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    throw makeError(group, action, `could not scan group directory ${directory}: ${reason}`, directory, path.join(directory, SKILL_FILE_NAME), path.join(directory, SKILL_FILE_NAME));
+    throw ensureManagedError(error, group, action, directory, path.join(directory, SKILL_FILE_NAME), path.join(directory, SKILL_FILE_NAME));
   }
-
-  const members: GroupMember[] = [];
+  const groups: GroupTree[] = [];
   for (const child of children) {
     if (child === SKILL_FILE_NAME || child.startsWith(TEMP_FILE_PREFIX)) continue;
+    const childPath = path.join(directory, child);
+    const childStat = lstatOrNull(childPath);
+    if (!childStat || (!childStat.isDirectory() && !childStat.isSymbolicLink())) continue;
+    const childTree = discoverGroupTree(root, path.join(group, child), action);
+    if (childTree) {
+      validateDirectoryGroupName(child, root);
+      groups.push(childTree);
+    }
+  }
+  return groups;
+}
+
+function readGroupMembers(
+  root: string,
+  group: string,
+  action: string,
+  childGroups: GroupTree[],
+): GroupMember[] {
+  const directory = path.join(root, group);
+  let children: string[];
+  try {
+    children = readdirSync(directory);
+  } catch (error) {
+    throw ensureManagedError(error, group, action, directory, path.join(directory, SKILL_FILE_NAME), path.join(directory, SKILL_FILE_NAME));
+  }
+
+  const groupDirectories = new Set(childGroups.map(child => path.basename(child.group)));
+  const members: GroupMember[] = [];
+  for (const child of children) {
+    if (child === SKILL_FILE_NAME || child.startsWith(TEMP_FILE_PREFIX) || groupDirectories.has(child)) continue;
     const member = readMember(root, group, child, action);
     if (member) members.push(member);
   }
@@ -333,57 +503,26 @@ function readGroupMembers(root: string, group: string, action: string): GroupMem
   return members;
 }
 
-function topLevelIndexIsMarked(root: string, group: string): boolean {
-  const index = path.join(root, group, SKILL_FILE_NAME);
-  try {
-    const stat = lstatOrNull(index);
-    if (!stat) return false;
-    return readFileSync(index, "utf8").includes(GROUP_MARKER);
-  } catch {
-    return false;
-  }
-}
-
-function hasDirectMemberSkills(directory: string): boolean {
-  let children: string[];
-  try {
-    children = readdirSync(directory);
-  } catch {
-    return false;
-  }
-  for (const child of children) {
-    if (child === SKILL_FILE_NAME) continue;
-    const childPath = path.join(directory, child);
-    try {
-      const stat = lstatOrNull(childPath);
-      if (!stat || (!stat.isDirectory() && !stat.isSymbolicLink())) continue;
-      if (lstatOrNull(path.join(childPath, SKILL_FILE_NAME))) return true;
-    } catch {
-      // Unreadable ordinary entries are not enough evidence to treat a skill as a group.
+function groupIndexEntry(root: string, child: GroupTree, action: string): GroupEntry {
+  const index = path.join(root, child.group, SKILL_FILE_NAME);
+  const { stat, contents } = readIndexContents(index, child.group, action);
+  let source = contents;
+  if (!stat) {
+    const snapshot = inspectGroup(root, child.group, action, true);
+    if (!snapshot) {
+      throw makeError(child.group, action, `group index ${index} could not be generated safely.`, index, index, index);
     }
+    source = buildGroupIndex(snapshot);
+  } else if (stat.isSymbolicLink() || !stat.isFile() || !hasGroupMarker(contents ?? "")) {
+    throw makeError(child.group, action, `group index ${index} is not a valid marked index.`, index, index, index);
   }
-  return false;
-}
-
-function isGroupCandidate(root: string, group: string): boolean {
-  const directory = path.join(root, group);
-  let stat: Stats | null;
-  try {
-    stat = lstatOrNull(directory);
-  } catch {
-    return false;
+  const parsed = parseFrontmatter(source!, child.group, index, action, index, index);
+  const displayName = path.basename(child.group);
+  if (parsed.name !== displayName || typeof parsed.description !== "string") {
+    throw makeError(child.group, action, `group index ${index} has invalid name or description metadata.`, index, index, index);
   }
-  if (!stat || (!stat.isDirectory() && !stat.isSymbolicLink())) return false;
-
-  let indexStat: Stats | null;
-  try {
-    indexStat = lstatOrNull(path.join(directory, SKILL_FILE_NAME));
-  } catch {
-    return false;
-  }
-  if (indexStat?.isFile()) return topLevelIndexIsMarked(root, group);
-  if (indexStat?.isSymbolicLink() && topLevelIndexIsMarked(root, group)) return true;
-  return hasDirectMemberSkills(directory);
+  const uri = `skill://${child.group.split("/").map(encodeSkillUriSegment).join("/")}/SKILL.md`;
+  return { kind: "group", name: displayName, description: parsed.description, uri };
 }
 
 function validateGroupIndex(snapshot: GroupSnapshot, action: string): void {
@@ -395,15 +534,12 @@ function validateGroupIndex(snapshot: GroupSnapshot, action: string): void {
     throw makeError(snapshot.name, action, `group index ${snapshot.index} is not a regular file.`, snapshot.index, snapshot.index, snapshot.index);
   }
   const contents = snapshot.indexContents ?? "";
-  if (!contents.includes(GROUP_MARKER)) {
-    if (snapshot.members.length > 0) {
-      throw makeError(snapshot.name, action, `group index ${snapshot.index} is unmarked user data; refusing to overwrite it.`, snapshot.index, snapshot.index, snapshot.index);
-    }
-    throw makeError(snapshot.name, action, `SKILL.md at ${snapshot.index} is not a marked managed group index.`, snapshot.index, snapshot.index, snapshot.index);
+  if (!hasGroupMarker(contents)) {
+    throw makeError(snapshot.name, action, `group index ${snapshot.index} is unmarked user data; refusing to overwrite it.`, snapshot.index, snapshot.index, snapshot.index);
   }
   const frontmatter = parseFrontmatter(contents, snapshot.name, snapshot.index, action, snapshot.index, snapshot.index);
-  if (frontmatter.name !== snapshot.name) {
-    throw makeError(snapshot.name, action, `group index name must match directory name "${snapshot.name}".`, snapshot.index, snapshot.index, snapshot.index);
+  if (frontmatter.name !== snapshot.displayName) {
+    throw makeError(snapshot.name, action, `group index name must match directory name "${snapshot.displayName}".`, snapshot.index, snapshot.index, snapshot.index);
   }
   if (typeof frontmatter.description !== "string") {
     throw makeError(snapshot.name, action, `group index ${snapshot.index} must have a description.`, snapshot.index, snapshot.index, snapshot.index);
@@ -419,70 +555,70 @@ function inspectGroup(
   if (!assertSafeRoot(root, group, action, true)) return null;
   const directory = path.join(root, group);
   const directoryStat = lstatOrNull(directory);
+  const index = path.join(directory, SKILL_FILE_NAME);
   if (directoryStat === null) {
-    if (allowEmpty) {
-      return {
-        name: group,
-        directory,
-        directoryStat: null,
-        index: path.join(directory, SKILL_FILE_NAME),
-        indexStat: null,
-        indexContents: null,
-        members: [],
-      };
-    }
-    return null;
+    if (!allowEmpty) return null;
+    return {
+      name: group,
+      displayName: path.basename(group),
+      directory,
+      directoryStat: null,
+      index,
+      indexStat: null,
+      indexContents: null,
+      members: [],
+      childGroups: [],
+    };
   }
   if (directoryStat.isSymbolicLink()) {
-    throw makeError(group, action, `group directory ${directory} is a symlink; refusing to follow it for writes.`, directory, directory, path.join(directory, SKILL_FILE_NAME));
+    throw makeError(group, action, `group directory ${directory} is a symlink; refusing to follow it for writes.`, directory, directory, index);
   }
   if (!directoryStat.isDirectory()) {
-    throw makeError(group, action, `group path ${directory} is not a directory.`, directory, directory, path.join(directory, SKILL_FILE_NAME));
+    throw makeError(group, action, `group path ${directory} is not a directory.`, directory, directory, index);
   }
   assertCanonicalWithin(root, directory, group, action);
 
-  const index = path.join(directory, SKILL_FILE_NAME);
-  let indexStat: Stats | null;
-  let indexContents: string | null = null;
-  try {
-    indexStat = lstatOrNull(index);
-    if (indexStat && !indexStat.isSymbolicLink() && indexStat.isFile()) {
-      indexContents = readFileSync(index, "utf8");
-    } else if (indexStat?.isSymbolicLink()) {
-      // Keep link targets read-only while determining whether this is a marked empty group.
-      try {
-        indexContents = readFileSync(index, "utf8");
-      } catch {
-        indexContents = null;
-      }
-    }
-  } catch (error) {
-    throw ensureManagedError(error, group, action, index, index, index);
+  const indexInfo = readIndexContents(index, group, action);
+  if (indexInfo.stat?.isSymbolicLink()) {
+    throw makeError(group, action, `group index ${index} is a symlink; refusing to replace its target.`, index, index, index);
   }
-
-  const members = readGroupMembers(root, group, action);
-  if (indexStat) {
-    if (indexStat.isSymbolicLink()) {
-      if (members.length > 0 || indexContents?.includes(GROUP_MARKER)) {
-        throw makeError(group, action, `group index ${index} is a symlink; refusing to replace its target.`, index, index, index);
-      }
-      if (!allowEmpty) return null;
-      throw makeError(group, action, `SKILL.md at ${index} is a symlinked non-group skill and conflicts with group "${group}".`, index, index, index);
-    }
-    if (indexContents?.includes(GROUP_MARKER)) {
-      const snapshot: GroupSnapshot = { name: group, directory, directoryStat, index, indexStat, indexContents, members };
-      validateGroupIndex(snapshot, action);
-      return snapshot;
-    }
-    if (members.length > 0) {
-      throw makeError(group, action, `group index ${index} is unmarked user data; refusing to overwrite it.`, index, index, index);
-    }
-    if (!allowEmpty) return null;
+  if (indexInfo.stat && !indexInfo.stat.isFile()) {
+    throw makeError(group, action, `group index ${index} is not a regular file.`, index, index, index);
+  }
+  if (indexInfo.stat && !hasGroupMarker(indexInfo.contents ?? "")) {
     throw makeError(group, action, `SKILL.md at ${index} is unmarked user data and conflicts with group "${group}".`, index, index, index);
   }
 
-  if (members.length === 0 && !allowEmpty) return null;
-  return { name: group, directory, directoryStat, index, indexStat: null, indexContents: null, members };
+  const childTrees = discoverDirectChildGroups(root, group, action);
+  const members = readGroupMembers(root, group, action, childTrees);
+  const names = new Set(members.map(member => member.name));
+  for (const child of childTrees) {
+    const childName = path.basename(child.group);
+    if (names.has(childName) || members.some(member => member.directory === childName)) {
+      throw makeError(
+        group,
+        action,
+        `child group "${childName}" conflicts with a direct skill name or directory.`,
+        path.join(directory, childName),
+        path.join(directory, childName, SKILL_FILE_NAME),
+        index,
+      );
+    }
+  }
+  if (!indexInfo.stat && members.length === 0 && childTrees.length === 0 && !allowEmpty) return null;
+  const snapshot: GroupSnapshot = {
+    name: group,
+    displayName: path.basename(group),
+    directory,
+    directoryStat,
+    index,
+    indexStat: indexInfo.stat,
+    indexContents: indexInfo.contents,
+    members,
+    childGroups: childTrees.map(child => groupIndexEntry(root, child, action)),
+  };
+  validateGroupIndex(snapshot, action);
+  return snapshot;
 }
 
 function encodeSkillUriSegment(segment: string): string {
@@ -491,15 +627,25 @@ function encodeSkillUriSegment(segment: string): string {
   );
 }
 
-function buildGroupIndex(group: string, members: GroupMember[]): string {
-  const summary = members.length === 0
-    ? `${group} managed skills.`
-    : `${group}: ${members.map(member => member.description).join(" ")}`;
-  const description = Array.from(sanitizeManagedDescription(summary)).slice(0, 200).join("");
-  const sections = members.length === 0
-    ? "No skills are currently in this group."
-    : members.map(member => `- ${member.name}: ${member.description}\n  Read: skill://${encodeSkillUriSegment(group)}/${encodeSkillUriSegment(member.directory)}/SKILL.md`).join("\n");
-  return `${toSkillFrontmatter(group, description)}\n${GROUP_MARKER}\n\n# ${group}\n\n${sections}\n`;
+function buildGroupIndex(snapshot: GroupSnapshot): string {
+  const entries: GroupEntry[] = [
+    ...snapshot.childGroups,
+    ...snapshot.members.map(member => ({
+      kind: "skill" as const,
+      name: member.name,
+      description: member.description,
+      uri: `skill://${snapshot.name.split("/").map(encodeSkillUriSegment).join("/")}/${encodeSkillUriSegment(member.directory)}/SKILL.md`,
+    })),
+  ];
+  entries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : left.kind < right.kind ? -1 : left.kind > right.kind ? 1 : 0);
+  const summarySource = entries.length === 0
+    ? `${snapshot.displayName} managed skills.`
+    : `${snapshot.displayName}: ${entries.map(entry => entry.description).join(" ")}`;
+  const description = Array.from(sanitizeManagedDescription(summarySource)).slice(0, 200).join("");
+  const sections = entries.length === 0
+    ? "No direct groups or skills are currently in this group."
+    : entries.map(entry => `- ${entry.kind === "group" ? "Group" : "Skill"}: ${entry.name} — ${entry.description}\n  Read: ${entry.uri}`).join("\n");
+  return `${toSkillFrontmatter(snapshot.displayName, description)}\n${GROUP_MARKER}\n\n# ${snapshot.displayName}\n\n${sections}\n`;
 }
 
 function openTemporaryFile(directory: string, mode = 0o666): { file: string; descriptor: number } {
@@ -551,7 +697,7 @@ function writeGroupIndex(
   skillStatus: WriteStatus,
   skillPath: string = snapshot.index,
 ): void {
-  const content = buildGroupIndex(snapshot.name, snapshot.members);
+  const content = buildGroupIndex(snapshot);
   if (snapshot.indexContents === content) return;
 
   let temporaryFile: string | undefined;
@@ -642,11 +788,96 @@ function writeGroupIndex(
   }
 }
 
-function refreshGroupLocked(root: string, group: string, action: string, skillStatus: WriteStatus): void {
-  const snapshot = inspectGroup(root, group, action, false);
-  if (!snapshot) return;
-  writeGroupIndex(root, snapshot, action, skillStatus);
+function collectPostOrder(tree: GroupTree, result: string[]): void {
+  for (const child of tree.children) collectPostOrder(child, result);
+  result.push(tree.group);
 }
+
+function collectRelatedGroupOrder(tree: GroupTree, target: string, result: string[]): boolean {
+  if (tree.group === target) {
+    collectPostOrder(tree, result);
+    return true;
+  }
+  for (const child of tree.children) {
+    if (target === child.group || target.startsWith(`${child.group}/`)) {
+      if (collectRelatedGroupOrder(child, target, result)) {
+        result.push(tree.group);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+function collectGroupPathOrder(tree: GroupTree, target: string, result: string[]): boolean {
+  if (tree.group === target) {
+    result.push(tree.group);
+    return true;
+  }
+  for (const child of tree.children) {
+    if (target === child.group || target.startsWith(`${child.group}/`)) {
+      if (collectGroupPathOrder(child, target, result)) {
+        result.push(tree.group);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function indexResultsForFailure(
+  root: string,
+  groups: string[],
+  completed: Set<string>,
+  error: ManagedGroupError,
+  failedGroup: string,
+): ManagedGroupIndexResult[] {
+  return groups.map(group => {
+    const indexPath = path.join(root, group, SKILL_FILE_NAME);
+    if (completed.has(group)) return { group, path: indexPath, status: "written", needsRebuild: false };
+    if (group === failedGroup) {
+      const result: ManagedGroupIndexResult = {
+        group,
+        path: indexPath,
+        status: error.indexStatus,
+        needsRebuild: error.indexStatus !== "written",
+      };
+      if (error.indexStatus === "not-written") result.reason = "failed";
+      return result;
+    }
+    return { group, path: indexPath, status: "not-written", needsRebuild: true, reason: "not-attempted" };
+  });
+}
+
+function refreshGroupsLocked(
+  root: string,
+  groups: string[],
+  action: string,
+  skillStatus: WriteStatus,
+  skillPath: string,
+): ManagedGroupIndexResult[] {
+  const completed = new Set<string>();
+  const results: ManagedGroupIndexResult[] = [];
+  for (const group of groups) {
+    try {
+      const snapshot = inspectGroup(root, group, action, false);
+      if (!snapshot) {
+        throw makeError(group, action, `group "${group}" could not be scanned for index rebuilding.`, path.join(root, group, SKILL_FILE_NAME), skillPath, path.join(root, group, SKILL_FILE_NAME));
+      }
+      writeGroupIndex(root, snapshot, action, skillStatus, skillPath);
+      completed.add(group);
+      results.push({ group, path: snapshot.index, status: "written", needsRebuild: false });
+    } catch (error) {
+      const indexPath = path.join(root, group, SKILL_FILE_NAME);
+      const managedError = ensureManagedError(error, group, action, indexPath, skillPath, indexPath, skillStatus);
+      if (skillStatus === "written") managedError.skillPath = skillPath;
+      managedError.indexes = indexResultsForFailure(root, groups, completed, managedError, group);
+      throw managedError;
+    }
+  }
+  return results;
+}
+
+ 
 
 function makeGroupMemberContent(
   group: string,
@@ -719,8 +950,8 @@ function ensureGroupDirectory(root: string, group: string, action: string): bool
   return createdByThisCall;
 }
 
-function ensureMemberDirectory(snapshot: GroupSnapshot, name: string, action: string): { path: string; stat: Stats } {
-  assertSameDirectory(snapshot, path.dirname(snapshot.directory), action);
+function ensureMemberDirectory(root: string, snapshot: GroupSnapshot, name: string, action: string): { path: string; stat: Stats } {
+  assertSameDirectory(snapshot, root, action);
   const directory = path.join(snapshot.directory, name);
   const existing = lstatOrNull(directory);
   if (existing) {
@@ -739,10 +970,12 @@ function ensureMemberDirectory(snapshot: GroupSnapshot, name: string, action: st
   if (!stat || stat.isSymbolicLink() || !stat.isDirectory()) {
     throw makeError(snapshot.name, action, `member directory ${directory} was not created as a safe directory.`, directory, path.join(directory, SKILL_FILE_NAME), snapshot.index);
   }
-  assertCanonicalWithin(path.dirname(snapshot.directory), directory, snapshot.name, action);
+  assertSameDirectory(snapshot, root, action);
+  assertCanonicalWithin(root, directory, snapshot.name, action);
   return { path: directory, stat };
 }
 function createMemberFile(
+  root: string,
   snapshot: GroupSnapshot,
   directory: { path: string; stat: Stats },
   content: string,
@@ -754,6 +987,8 @@ function createMemberFile(
   let committed = false;
   let expectedStat: Stats | null = null;
   try {
+    assertSameDirectory(snapshot, root, action);
+    assertCanonicalWithin(root, directory.path, snapshot.name, action, file, snapshot.index);
     const existing = lstatOrNull(file);
     if (existing) {
       throw makeError(snapshot.name, action, `member SKILL.md ${file} already exists; refusing to overwrite it.`, file, file, snapshot.index);
@@ -768,7 +1003,8 @@ function createMemberFile(
     if (!expectedStat.isFile() || expectedStat.nlink !== 1) {
       throw makeError(snapshot.name, action, "the temporary member file is not a private regular file.", temporaryFile, file, snapshot.index);
     }
-    assertSameDirectory(snapshot, path.dirname(snapshot.directory), action);
+    assertSameDirectory(snapshot, root, action);
+    assertCanonicalWithin(root, directory.path, snapshot.name, action, file, snapshot.index);
     const currentDirectory = lstatOrNull(directory.path);
     if (!currentDirectory || currentDirectory.isSymbolicLink() || !currentDirectory.isDirectory() || !sameFileIdentity(directory.stat, currentDirectory)) {
       throw makeError(snapshot.name, action, `member directory ${directory.path} changed while creating the skill.`, directory.path, file, snapshot.index);
@@ -786,7 +1022,7 @@ function createMemberFile(
     }
     return file;
   } catch (error) {
-    throw ensureManagedError(error, snapshot.name, action, file, file, snapshot.index, committed ? "written" : "not-written", "not-written");
+    throw ensureManagedError(error, snapshot.name, action, file, file, snapshot.index, committed ? "unknown" : "not-written", "not-written");
   } finally {
     if (descriptor !== undefined) {
       try {
@@ -861,7 +1097,7 @@ function updateMemberFile(
       throw makeError(snapshot.name, action, `member SKILL.md ${member.file} could not be verified after writing.`, member.file, member.file, snapshot.index, "unknown", "not-written");
     }
   } catch (error) {
-    throw ensureManagedError(error, snapshot.name, action, member.file, member.file, snapshot.index, committed ? "written" : "not-written", "not-written");
+    throw ensureManagedError(error, snapshot.name, action, member.file, member.file, snapshot.index, committed ? "unknown" : "not-written", "not-written");
   } finally {
     if (descriptor !== undefined) {
       try {
@@ -927,53 +1163,150 @@ export function createManagedGroupStore(rootPath: string): ManagedGroupStore {
   if (typeof rootPath !== "string" || rootPath.trim() === "") {
     throw makeError("<invalid>", "scan", "a managed-skills root directory is required.", String(rootPath), String(rootPath), String(rootPath));
   }
-  const requestedRoot = path.resolve(rootPath);
-  const root = lstatOrNull(requestedRoot)?.isSymbolicLink() ? realpathSync(requestedRoot) : requestedRoot;
+  const root = resolveManagedRoot(rootPath);
+  const knownGroups = new Set<string>();
 
   function groupIndex(group: string): string {
     return path.join(root, group, SKILL_FILE_NAME);
   }
 
-  function groupSkillPath(group: string, name: string): string {
-    return path.join(root, group, name, SKILL_FILE_NAME);
+  function recordTree(tree: GroupTree): void {
+    knownGroups.add(tree.group);
+    for (const child of tree.children) recordTree(child);
   }
+
+  function collectTreeGroups(tree: GroupTree, result: Set<string>): void {
+    result.add(tree.group);
+    for (const child of tree.children) collectTreeGroups(child, result);
+  }
+
+  function checkKnownGroups(top: string, tree: GroupTree | null, action: string): void {
+    const current = new Set<string>();
+    if (tree) collectTreeGroups(tree, current);
+    for (const group of knownGroups) {
+      if (group.split("/")[0] !== top || current.has(group)) continue;
+      if (!lstatOrNull(path.join(root, group))) {
+        knownGroups.delete(group);
+        continue;
+      }
+      const snapshot = inspectGroup(root, group, action, false);
+      if (!snapshot) {
+        const index = groupIndex(group);
+        throw makeError(group, action, `previously managed group "${group}" is no longer identifiable.`, index, index, index);
+      }
+    }
+  }
+
+  function assertExplicitGroup(group: string, action: string): boolean {
+    const directory = path.join(root, group);
+    const directoryStat = lstatOrNull(directory);
+    if (!directoryStat) return false;
+    const index = groupIndex(group);
+    if (directoryStat.isSymbolicLink()) {
+      throw makeError(group, action, `group directory ${directory} is a symlink; refusing to follow it for writes.`, directory, directory, index);
+    }
+    if (!directoryStat.isDirectory()) {
+      throw makeError(group, action, `group path ${directory} is not a directory.`, directory, directory, index);
+    }
+    assertCanonicalWithin(root, directory, group, action);
+    const indexInfo = readIndexContents(index, group, action);
+    if (indexInfo.stat?.isSymbolicLink()) {
+      throw makeError(group, action, `group index ${index} is a symlink; refusing to replace its target.`, index, index, index);
+    }
+    if (indexInfo.stat && !indexInfo.stat.isFile()) {
+      throw makeError(group, action, `group index ${index} is not a regular file.`, index, index, index);
+    }
+    if (indexInfo.stat) {
+      if (!hasGroupMarker(indexInfo.contents ?? "")) {
+        throw makeError(group, action, `SKILL.md at ${index} is unmarked user data and conflicts with group "${group}".`, index, index, index);
+      }
+      const frontmatter = parseFrontmatter(indexInfo.contents!, group, index, action, index, index);
+      if (frontmatter.name !== path.basename(group) || typeof frontmatter.description !== "string") {
+        throw makeError(group, action, `group index ${index} has invalid name or description metadata.`, index, index, index);
+      }
+    }
+    return true;
+  }
+
+  function assertNoParentSkillCollision(parent: string, childName: string, action: string): void {
+    const childGroups = discoverDirectChildGroups(root, parent, action);
+    const members = readGroupMembers(root, parent, action, childGroups);
+    for (const child of childGroups) {
+      const groupName = path.basename(child.group);
+      const conflict = members.find(member => member.name === groupName || member.directory === groupName);
+      if (conflict) {
+        throw makeError(
+          parent,
+          action,
+          `child group "${groupName}" conflicts with direct skill "${conflict.name}" or its directory.`,
+          conflict.file,
+          conflict.file,
+          groupIndex(parent),
+        );
+      }
+    }
+    const collision = members.find(member => member.name === childName || member.directory === childName);
+    if (collision) {
+      throw makeError(
+        parent,
+        action,
+        `child group "${childName}" conflicts with direct skill "${collision.name}" or its directory.`,
+        collision.file,
+        collision.file,
+        groupIndex(parent),
+      );
+    }
+  }
+
+  function prepareGroupPath(group: string, action: string, createMissing: boolean, createdDirectories: string[]): void {
+    const segments = group.split("/");
+    for (let index = 0; index < segments.length; index += 1) {
+      const prefix = segments.slice(0, index + 1).join("/");
+      if (index > 0) {
+        const parent = segments.slice(0, index).join("/");
+        if (!assertExplicitGroup(parent, action)) {
+          throw makeError(parent, action, `parent group "${parent}" does not exist.`, groupIndex(parent), groupIndex(parent), groupIndex(parent));
+        }
+        assertNoParentSkillCollision(parent, segments[index], action);
+      }
+      const directory = path.join(root, prefix);
+      if (!lstatOrNull(directory)) {
+        if (!createMissing) {
+          throw makeError(prefix, action, `group "${prefix}" does not exist.`, groupIndex(prefix), groupIndex(prefix), groupIndex(prefix));
+        }
+        if (ensureGroupDirectory(root, prefix, action)) createdDirectories.push(directory);
+      }
+      if (!assertExplicitGroup(prefix, action)) {
+        throw makeError(prefix, action, `group directory ${directory} could not be prepared safely.`, directory, directory, groupIndex(prefix));
+      }
+    }
+  }
+
   function isGroup(rawGroup: string): boolean {
     const group = sanitizeGroupName(rawGroup, root);
     if (!assertSafeRoot(root, group, "isGroup", true)) return false;
-
     const directory = path.join(root, group);
-    let directoryStat: Stats | null;
-    try {
-      directoryStat = lstatOrNull(directory);
-    } catch {
-      return false;
-    }
+    const directoryStat = lstatOrNull(directory);
     if (!directoryStat || !directoryStat.isDirectory() || directoryStat.isSymbolicLink()) return false;
     assertCanonicalWithin(root, directory, group, "isGroup");
-
     const index = groupIndex(group);
-    let indexStat: Stats | null;
-    try {
-      indexStat = lstatOrNull(index);
-    } catch {
-      return false;
-    }
+    const indexStat = lstatOrNull(index);
     if (!indexStat || !indexStat.isFile() || indexStat.isSymbolicLink()) return false;
-
     try {
-      return readFileSync(index, "utf8").includes(GROUP_MARKER);
+      return hasGroupMarker(readFileSync(index, "utf8"));
     } catch {
       return false;
     }
   }
 
-
   function withGroupLock<T>(group: string, action: string, operation: () => T): T {
+    const top = group.split("/")[0];
     try {
-      const lockTarget = path.join(root, `.auto-learn-scope-managed-${group}`);
+      const lockTarget = path.join(root, `.auto-learn-scope-managed-${top}`);
       return withFileLockSync(lockTarget, operation);
     } catch (error) {
-      throw ensureManagedError(error, group, action, groupIndex(group), groupIndex(group), groupIndex(group));
+      const index = groupIndex(group);
+      throw ensureManagedError(error, group, action, index, index, index);
     }
   }
 
@@ -981,22 +1314,37 @@ export function createManagedGroupStore(rootPath: string): ManagedGroupStore {
     if (!assertSafeRoot(root, "<scan>", "scan", true)) return;
     let entries: string[];
     try {
-      entries = readdirSync(root);
+      entries = readdirSync(root).sort();
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       throw makeError("<scan>", "scan", `the managed-skills root could not be scanned: ${reason}`, root, root, root);
     }
-
-    const candidates: string[] = [];
     for (const entry of entries) {
       if (entry.startsWith(".")) continue;
-      if (isGroupCandidate(root, entry)) candidates.push(validateDirectoryGroupName(entry, root));
-    }
-    candidates.sort();
-
-    for (const group of candidates) {
-      withGroupLock(group, "scan", () => {
-        if (isGroupCandidate(root, group)) refreshGroupLocked(root, group, "scan", "not-written");
+      const entryPath = path.join(root, entry);
+      const stat = lstatOrNull(entryPath);
+      if (!stat || (!stat.isDirectory() && !stat.isSymbolicLink())) continue;
+      const knownTop = [...knownGroups].some(group => group.split("/")[0] === entry);
+      let potential: GroupTree | null = null;
+      let discoveryFailed = false;
+      try {
+        potential = discoverGroupTree(root, entry, "scan");
+      } catch {
+        discoveryFailed = true;
+      }
+      if (!potential && !knownTop && !discoveryFailed) continue;
+      withGroupLock(entry, "scan", () => {
+        const tree = discoverGroupTree(root, entry, "scan");
+        if (!tree) {
+          checkKnownGroups(entry, null, "scan");
+          return;
+        }
+        validateDirectoryGroupName(entry, root);
+        checkKnownGroups(entry, tree, "scan");
+        recordTree(tree);
+        const groups: string[] = [];
+        collectPostOrder(tree, groups);
+        refreshGroupsLocked(root, groups, "scan", "not-written", groupIndex(entry));
       });
     }
   }
@@ -1004,92 +1352,138 @@ export function createManagedGroupStore(rootPath: string): ManagedGroupStore {
   function refresh(rawGroup: string): void {
     const group = sanitizeGroupName(rawGroup, root);
     if (!assertSafeRoot(root, group, "refresh", true)) return;
-    if (!isGroupCandidate(root, group)) return;
-    withGroupLock(group, "refresh", () => {
-      if (isGroupCandidate(root, group)) refreshGroupLocked(root, group, "refresh", "not-written");
+    const top = group.split("/")[0];
+    withGroupLock(top, "refresh", () => {
+      const tree = discoverGroupTree(root, top, "refresh");
+      checkKnownGroups(top, tree, "refresh");
+      if (!tree) return;
+      const groups: string[] = [];
+      if (!collectRelatedGroupOrder(tree, group, groups)) return;
+      recordTree(tree);
+      refreshGroupsLocked(root, groups, "refresh", "not-written", groupIndex(group));
     });
   }
 
-  function mutate(input: ManagedGroupInput): { path: string } {
+  function mutate(input: ManagedGroupInput): ManagedGroupMutation {
     const group = sanitizeGroupName(input?.group, root);
     const action = input?.action;
+    const actionName = action === "create" || action === "update" || action === "delete" ? action : "mutate";
+    let targetSkillPath = groupIndex(group);
+    function unattemptedIndexes(error: ManagedGroupError): ManagedGroupIndexResult[] {
+      const indexes: ManagedGroupIndexResult[] = [];
+      const segments = group.split("/");
+      for (let length = segments.length; length > 0; length -= 1) {
+        const indexedGroup = segments.slice(0, length).join("/");
+        const indexPath = groupIndex(indexedGroup);
+        let hasValidIndex = false;
+        try {
+          const snapshot = inspectGroup(root, indexedGroup, actionName, false);
+          hasValidIndex = snapshot !== null && snapshot.indexStat !== null;
+        } catch {
+          // An unreadable or invalid index cannot be treated as current.
+        }
+        indexes.push({
+          group: indexedGroup,
+          path: indexPath,
+          status: "not-written",
+          needsRebuild: error.skillStatus !== "not-written" || error.indexStatus === "unknown" || !hasValidIndex,
+          reason: "not-attempted",
+        });
+      }
+      return indexes;
+    }
+    function failedMutation(error: unknown): ManagedGroupError {
+      const managedError = ensureManagedError(error, group, actionName, targetSkillPath, targetSkillPath, groupIndex(group));
+      if (managedError.skillPath === managedError.indexPath) managedError.skillPath = targetSkillPath;
+      if (managedError.indexes.length === 0) {
+        managedError.indexes = unattemptedIndexes(managedError);
+      }
+      return managedError;
+    }
     if (action !== "create" && action !== "update" && action !== "delete") {
-      throw makeError(group, "mutate", "action must be create, update, or delete.", groupIndex(group), groupIndex(group), groupIndex(group));
+      throw failedMutation(makeError(group, "mutate", "action must be create, update, or delete.", groupIndex(group), groupIndex(group), groupIndex(group)));
     }
     let name: string;
     try {
       name = sanitizeSkillName(input?.name);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      throw makeError(group, action, reason, groupIndex(group), groupIndex(group), groupIndex(group));
+      throw failedMutation(makeError(group, action, reason, groupIndex(group), groupIndex(group), groupIndex(group)));
     }
 
-    const prepared = action === "delete"
-      ? null
-      : makeGroupMemberContent(group, name, input?.description, input?.body, action, root);
-    const targetSkillPath = groupSkillPath(group, name);
-    ensureRootDirectory(root, group, action);
+    targetSkillPath = path.join(root, group, name, SKILL_FILE_NAME);
+    let prepared: string | null;
+    try {
+      prepared = action === "delete"
+        ? null
+        : makeGroupMemberContent(group, name, input?.description, input?.body, action, root);
+    } catch (error) {
+      throw failedMutation(error);
+    }
+    try {
+      ensureRootDirectory(root, group, action);
+    } catch (error) {
+      throw failedMutation(error);
+    }
 
-    return withGroupLock(group, action, () => {
-      let createdGroupDirectory: string | undefined;
+    try {
+      return withGroupLock(group, action, () => {
+      const createdDirectories: string[] = [];
       let createdMemberDirectory: string | undefined;
       let skillStatus: WriteStatus = "not-written";
       try {
+        prepareGroupPath(group, action, action === "create", createdDirectories);
         const before = inspectGroup(root, group, action, action === "create");
+        if (!before && action !== "create") {
+          throw makeError(group, action, `group "${group}" does not exist or has no managed members.`, groupIndex(group), targetSkillPath, groupIndex(group));
+        }
+
+        let file: string;
         if (action === "create") {
           if (!before) {
             throw makeError(group, action, "the group could not be prepared safely.", groupIndex(group), targetSkillPath, groupIndex(group));
           }
-          if (before.members.some(member => member.name === name)) {
-            throw makeError(group, action, `skill \"${name}\" already exists; use action \"update\" instead.`, targetSkillPath, targetSkillPath, groupIndex(group));
+          if (
+            before.members.some(member => member.name === name || member.directory === name) ||
+            before.childGroups.some(child => child.name === name)
+          ) {
+            throw makeError(group, action, `skill or child group "${name}" already exists.`, targetSkillPath, targetSkillPath, groupIndex(group));
           }
           const memberDirectoryPath = path.join(before.directory, name);
           if (lstatOrNull(memberDirectoryPath)) {
             throw makeError(group, action, `member directory ${memberDirectoryPath} already exists; refusing to overwrite it.`, targetSkillPath, targetSkillPath, groupIndex(group));
           }
-
-          if (ensureGroupDirectory(root, group, action)) createdGroupDirectory = before.directory;
-          const snapshot = inspectGroup(root, group, action, true);
-          if (!snapshot) {
-            throw makeError(group, action, "the group directory disappeared before creation.", before.directory, targetSkillPath, groupIndex(group));
-          }
-          if (snapshot.members.some(member => member.name === name) || lstatOrNull(memberDirectoryPath)) {
-            throw makeError(group, action, `skill \"${name}\" or its target directory already exists.`, targetSkillPath, targetSkillPath, groupIndex(group));
-          }
-          const memberDirectory = ensureMemberDirectory(snapshot, name, action);
+          const memberDirectory = ensureMemberDirectory(root, before, name, action);
           createdMemberDirectory = memberDirectory.path;
-          const file = createMemberFile(snapshot, memberDirectory, prepared!, action);
-          skillStatus = "written";
-          createdGroupDirectory = undefined;
-          createdMemberDirectory = undefined;
-
-          const after = inspectGroup(root, group, action, false);
-          if (!after) {
-            throw makeError(group, action, "the group disappeared after the skill was written.", groupIndex(group), file, groupIndex(group), "written", "not-written");
-          }
-          writeGroupIndex(root, after, action, "written", file);
-          return { path: file };
-        }
-
-        if (!before) {
-          throw makeError(group, action, `group \"${group}\" does not exist or has no managed members.`, groupIndex(group), targetSkillPath, groupIndex(group));
-        }
-        const member = findMember(before, name, action);
-        if (action === "update") {
-          assertWritableMember(before, member, root, action);
-          updateMemberFile(root, before, member, prepared!, action);
+          file = createMemberFile(root, before, memberDirectory, prepared!, action);
           skillStatus = "written";
         } else {
-          deleteMemberDirectory(root, before, member, action);
+          if (!before) {
+            throw makeError(group, action, `group "${group}" does not exist or has no managed members.`, groupIndex(group), targetSkillPath, groupIndex(group));
+          }
+          const member = findMember(before, name, action);
+          if (action === "update") {
+            updateMemberFile(root, before, member, prepared!, action);
+          } else {
+            deleteMemberDirectory(root, before, member, action);
+          }
+          file = member.file;
           skillStatus = "written";
         }
 
-        const after = inspectGroup(root, group, action, false);
-        if (!after) {
-          throw makeError(group, action, "the group disappeared after the skill was changed.", groupIndex(group), member.file, groupIndex(group), "written", "not-written");
+        const top = group.split("/")[0];
+        const tree = discoverGroupTree(root, top, action);
+        if (!tree) {
+          throw makeError(group, action, `group "${group}" disappeared after the skill was written.`, groupIndex(group), file, groupIndex(group), "written", "not-written");
         }
-        writeGroupIndex(root, after, action, "written", member.file);
-        return { path: member.file };
+        const groups: string[] = [];
+        if (!collectGroupPathOrder(tree, group, groups)) {
+          throw makeError(group, action, `group "${group}" disappeared after the skill was written.`, groupIndex(group), file, groupIndex(group), "written", "not-written");
+        }
+        const indexes = refreshGroupsLocked(root, groups, action, "written", file);
+        recordTree(tree);
+        createdMemberDirectory = undefined;
+        return { path: file, indexes };
       } catch (error) {
         const errorSkillStatus = mergeWriteStatus(
           error instanceof Error && "skillStatus" in error ? (error as ManagedGroupError).skillStatus : "not-written",
@@ -1102,22 +1496,22 @@ export function createManagedGroupStore(rootPath: string): ManagedGroupStore {
           try {
             const file = path.join(createdMemberDirectory, SKILL_FILE_NAME);
             if (!lstatOrNull(file) && readdirSync(createdMemberDirectory).length === 0) {
-              rmSync(createdMemberDirectory, { recursive: false, force: false });
+              rmdirSync(createdMemberDirectory);
             }
           } catch {
             // A failed cleanup must not hide the original operation error.
           }
         }
-        if (createdGroupDirectory && errorSkillStatus === "not-written") {
-          try {
-            if (readdirSync(createdGroupDirectory).length === 0) {
-              rmSync(createdGroupDirectory, { recursive: false, force: false });
+        if (errorSkillStatus === "not-written") {
+          for (const directory of createdDirectories.reverse()) {
+            try {
+              if (readdirSync(directory).length === 0) rmdirSync(directory);
+            } catch {
+              // A failed cleanup must not hide the original operation error.
             }
-          } catch {
-            // A failed cleanup must not hide the original operation error.
           }
         }
-        throw ensureManagedError(
+        const managedError = ensureManagedError(
           error,
           group,
           action,
@@ -1127,8 +1521,15 @@ export function createManagedGroupStore(rootPath: string): ManagedGroupStore {
           errorSkillStatus,
           errorIndexStatus,
         );
+        if (managedError.indexes.length === 0) {
+          managedError.indexes = unattemptedIndexes(managedError);
+        }
+        throw managedError;
       }
-    });
+      });
+    } catch (error) {
+      throw failedMutation(error);
+    }
   }
 
   const store = { scan, refresh, mutate, isGroup };

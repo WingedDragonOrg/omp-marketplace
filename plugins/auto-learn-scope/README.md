@@ -23,28 +23,28 @@ Skill 写入需要在 OMP 配置中将 `autolearn.enabled` 设为 `true`（默�
 
 `learn` 和 `manage_skill` 使用原来的工具名，并支持 `scope`：
 
-- **默认 `global`**：Skill 操作必须指定 `group`。目标是
-  `<agentDir>/managed-skills/<group>/<name>/SKILL.md`；创建 Skill 时复用已有分组或创建新分组。
+- **默认 `global`**：Skill 操作必须指定 `group`，支持 `/` 分隔的多层组路径。目标是
+  `<agentDir>/managed-skills/<group>/<name>/SKILL.md`；创建 Skill 时复用已有组并逐级创建缺失的组。
   `learn` 中的 `group` 位于 `skill` 对象内；`manage_skill` 的 `group` 位于顶层。
 - **显式 `project`**：写入 `<repoRoot>/.omp/skills/<name>/SKILL.md`，不要求 `group`。
 
 两个作用域的 `learn` 都先委托 native `learn` 保存 memory，再写入可选 Skill；
 仅保存 memory 时不需要 `group`。`manage_skill` 支持 `create`、`update` 和 `delete`。
-memory 已保存而 Skill 或组索引写入失败时，结果分别报告各部分的状态和路径。
+memory 已保存而 Skill 或组索引写入失败时，结果分别报告各部分状态和路径；`indexes` 按目标组到顶层组列出每级索引的提交状态和是否需要重建。
 
 全局分组示例，以下是传给 `manage_skill` 的参数：
 
 ```json
 {
   "action": "create",
-  "group": "postgresql",
+  "group": "engineering/database/postgresql",
   "name": "space-audit",
   "description": "排查 PostgreSQL 磁盘占用",
   "body": "1. 检查数据库和表的磁盘占用。"
 }
 ```
 
-对应的 `learn` 写法是在 `skill` 对象中添加 `"group": "postgresql"`。
+对应的 `learn` 写法是在 `skill` 对象中添加 `"group": "engineering/database/postgresql"`。
 
 最小的 project skill 示例：
 
@@ -79,8 +79,9 @@ memory 已保存而 Skill 或组索引写入失败时，结果分别报告各部
 
 ## 分组与发现
 
-每个分组的顶层 `SKILL.md` 由插件生成，包含组内 Skill 的名称、description 和读取路径。
-模型首先看到组的名称和简短 description；读取组后才看到子 Skill 清单，再按需读取正文。
+每级分组的 `SKILL.md` 由插件生成，列出直接子组和直属 Skill 的名称、description 和读取路径。
+模型初始只看到顶层组的名称和简短 description，随后按索引逐层读取，最后读取 Skill 正文。
+成员 frontmatter 使用 OMP 的解析器；无法解析的内容会报错，生成索引时不修改成员文件。
 组 description 最多 200 个 Unicode 字符，正文索引保留各成员完整 description；较大分组的
 摘要可能不包含靠后的触发词。
 
@@ -88,12 +89,15 @@ memory 已保存而 Skill 或组索引写入失败时，结果分别报告各部
 修改成员后维护索引。交互或 RPC 会话中新增组后执行 `/refresh-managed-skills`，由 OMP
 原生 `/reload-plugins` 重新发现；ACP 和打印模式请开启新会话。
 已有平铺 Skill 保持原状。移动后旧的 `skill://<name>` 引用需要由用户自行更新为
-`skill://<group>/<child-directory>/SKILL.md`。
+`skill://<顶层组>/<相对路径>/SKILL.md`。
 
-组与成员名称采用小写字母、数字和连字符；顶层普通 Skill、指向外部的目录链接和共享硬链接
-不会被插件覆盖。组内符号链接可供读取和索引，插件不会通过链接修改其目标。
+组路径的每段及成员名称采用小写字母、数字和连字符；普通 Skill、组目录链接和共享硬链接
+不会被插件覆盖。直属 Skill 目录符号链接可供读取和索引，插件不会通过链接修改其目标。
 managed 根目录可以是指向目录的符号链接；插件在会话启动时解析并固定其目标。
 同名 authored Skill 的优先级高于 managed 分组，创建新组时须避免名称冲突。
+同一顶层组下的索引更新跨进程串行，其他顶层组可并行；OMP 命名空间遮蔽组内路径时，读取受影响索引会报告冲突。
+插件通过宿主注册表核对调用会话的 Skill 清单；自定义 SDK 注册表或远程会话若未暴露
+本地会话快照，无法确认的 managed 读取和新组创建会报错，不会使用其他会话的清单代替。
 
 project skill 继续使用 OMP 原生 project discovery；写入后通过 `/reload-plugins` 或新会话
 重新发现。两类 Skill 的发现均受 OMP 宿主版本与配置影响。
@@ -107,3 +111,10 @@ o200k 计数从 1,509 降至 1,478，Claude v5 计数从 2,399 降至 2,339。
 使用生成的组 description 和当前默认模型选择分组：PostgreSQL 锁等待、PostgreSQL
 catalog 膨胀均命中 database；macOS DNS 缓存、Tailscale 路由均命中 network，4 次
 中 0 次未命中。该样本不能代表更大分组或真实 Skill 库的召回率。
+
+OMP 18.18.6 隔离验收中，将五个不同主题的示例 Skill 放入同一个组，实际 provider 请求的
+Skill 清单从 598 字节、224 个 Claude V5 Sonnet token 降至 114 字节、36 个 token。
+该请求中的组摘要只保留了 incident postmortem 相关内容。以实际摘要和当前默认模型测试五项
+代表性任务，incident postmortem 命中；Kubernetes、PostgreSQL、Python CSV 和发布签名
+四项未命中。该结果来自合成样本，说明大型混合主题组的摘要可能无法召回靠后的成员；
+应按主题拆分组，实际召回仍取决于宿主摘要和模型。

@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type * as ExtensionExports from "../src/index";
 
 type UnknownRecord = Record<string, unknown>;
@@ -76,12 +77,28 @@ class FakePi {
   readonly tools: ToolDefinition[] = [];
   readonly handlers = new Map<string, ToolHandler[]>();
   readonly commands = new Map<string, CommandHandler>();
+  readonly registry = new AgentRegistry();
   activeSkills: unknown[] = [];
+  sessionId = "test-session";
   agentDir = "";
-  readonly pi = {
+  constructor() {
+    const pi = this;
+    this.registry.register({
+      id: "auto-learn-scope-test",
+      displayName: "auto-learn-scope-test",
+      kind: "main",
+      session: { get skills() { return pi.activeSkills; }, sessionManager: { getSessionId: () => pi.sessionId } } as never,
+    });
+  }
+
+  readonly pi: {
+    settings: FakeSettings;
+    getAgentDir: () => string;
+    AgentRegistry: { global: () => AgentRegistry } | undefined;
+  } = {
     settings: new FakeSettings(),
     getAgentDir: () => this.agentDir,
-    getActiveSkills: () => this.activeSkills,
+    AgentRegistry: { global: () => this.registry },
   };
 
   registerTool(definition: ToolDefinition): void {
@@ -99,6 +116,15 @@ class FakePi {
   }
 }
 
+function registerProcessGlobalSnapshot(skills: unknown[], sessionId = "test-session"): void {
+  AgentRegistry.global().register({
+    id: "auto-learn-scope-test",
+    displayName: "auto-learn-scope-test",
+    kind: "main",
+    session: { get skills() { return skills; }, sessionManager: { getSessionId: () => sessionId } } as never,
+  });
+}
+
 async function pathExists(path: string): Promise<boolean> {
   try {
     await stat(path);
@@ -109,7 +135,7 @@ async function pathExists(path: string): Promise<boolean> {
 }
 
 async function makeRoot(prefix: string): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), prefix));
+  const root = await realpath(await mkdtemp(join(tmpdir(), prefix)));
   temporaryRoots.push(root);
   return root;
 }
@@ -152,6 +178,7 @@ function makeContext(
   sessionFile: string | undefined = "/tmp/omp-session.jsonl",
 ): UnknownRecord {
   const context: UnknownRecord = {
+    agent: { id: "auto-learn-scope-test", kind: "main", name: "main", depth: 0 },
     cwd,
     mode: "print",
     hasUI: false,
@@ -159,7 +186,7 @@ function makeContext(
     getContextUsage: () => undefined,
     getAsyncJobSnapshot: () => null,
     compact: async () => undefined,
-    sessionManager: { getSessionFile: () => sessionFile },
+    sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "test-session" },
     modelRegistry: {},
     models: {
       list: () => [],
@@ -216,7 +243,9 @@ const nativeResult = {
   details: { source: "native" },
 };
 
+
 afterEach(async () => {
+  AgentRegistry.global().unregister("auto-learn-scope-test");
   await Promise.all(temporaryRoots.splice(0).map(root => rm(root, { recursive: true, force: true })));
 });
 
@@ -330,6 +359,7 @@ describe("managed skill group extension behavior", () => {
     const pi = new FakePi();
     pi.activeSkills = [{ name: "shadowed-group", filePath: shadowedSkill }];
     await install(pi, managedRoot);
+    registerProcessGlobalSnapshot([]);
     const calls: UnknownRecord[] = [];
     const invokeTool: NativeInvoker = async params => {
       calls.push({ ...params });
@@ -536,6 +566,26 @@ describe("managed skill group extension behavior", () => {
     expect(await pathExists(childSkillFile(managedRoot, "postgresql", "no-memory-skill"))).toBe(false);
   });
 
+  test("learn reports the target skill path when an update group is missing after memory succeeds", async () => {
+    const managedRoot = await makeRoot("auto-learn-scope-missing-group-");
+    const { cwd } = await makeRepository();
+    const pi = new FakePi();
+    await install(pi, managedRoot);
+    const result = await executeTool(findTool(pi, "learn"), {
+      memory: "Persist this lesson.",
+      skill: {
+        group: "engineering/database",
+        action: "update",
+        name: "space-audit",
+        description: "Audit database space.",
+        body: "Body.",
+      },
+    }, makeContext(cwd, async () => nativeResult)) as UnknownRecord;
+    expect(result.memoryStatus).toBe("written");
+    expect(result.skillStatus).toBe("not-written");
+    expect(result.skillPath).toEndWith("/engineering/database/space-audit/SKILL.md");
+  });
+
   test("global learn exposes native-memory partial success and store failure statuses", async () => {
     const managedRoot = await makeRoot("auto-learn-scope-group-");
     const { cwd } = await makeRepository();
@@ -574,6 +624,19 @@ describe("managed skill group extension behavior", () => {
     expect(typeof details.path).toBe("string");
     expect(details.indexPath).toBe(groupIndexFile(managedRoot, "postgresql"));
     expect(details.partial).toBe(true);
+    expect(details.skillStatus).toBe(outcome.skillStatus);
+    expect(details.skillPath).toBe(outcome.skillPath);
+    const indexes = outcome.indexes as UnknownRecord[];
+    expect(Array.isArray(indexes)).toBe(true);
+    expect(indexes).toHaveLength(1);
+    expect(indexes[0]?.group).toBe("postgresql");
+    expect(indexes[0]?.path).toBe(groupIndexFile(managedRoot, "postgresql"));
+    expect((["not-written", "written", "unknown"] as unknown[])).toContain(indexes[0]?.status);
+    expect(typeof indexes[0]?.needsRebuild).toBe("boolean");
+    if (indexes[0]?.status === "not-written") {
+      expect((["failed", "not-attempted"] as unknown[])).toContain(indexes[0]?.reason);
+    }
+    expect(details.indexes).toEqual(indexes);
     expect(await readFile(groupIndexFile(managedRoot, "postgresql"), "utf8")).toContain("Do not overwrite.");
     expect(await pathExists(childSkillFile(managedRoot, "postgresql", "space-audit"))).toBe(false);
   });
@@ -1043,6 +1106,374 @@ describe("managed skill group extension behavior", () => {
       expect(decision.block).toBe(true);
       expect(typeof decision.reason).toBe("string");
     }
+  });
+
+  test("global tools accept nested groups and expose index results from the target group to the root", async () => {
+    const managedRoot = await makeRoot("auto-learn-scope-group-");
+    const { cwd } = await makeRepository();
+    const pi = new FakePi();
+    await install(pi, managedRoot);
+    const calls: UnknownRecord[] = [];
+    const invokeTool: NativeInvoker = async params => {
+      calls.push({ ...params });
+      return nativeResult;
+    };
+    const expectedIndexes = (group: string): UnknownRecord[] => {
+      const segments = group.split("/");
+      return segments.map((_segment, index) => {
+        const indexedGroup = segments.slice(0, segments.length - index).join("/");
+        return {
+          group: indexedGroup,
+          path: groupIndexFile(managedRoot, indexedGroup),
+          status: "written",
+          needsRebuild: false,
+        };
+      });
+    };
+    const managedGroup = "engineering/database/postgresql";
+    const managedSkillPath = childSkillFile(managedRoot, managedGroup, "space-audit");
+    const managedResult = await executeTool(
+      findTool(pi, "manage_skill"),
+      {
+        scope: "global",
+        group: managedGroup,
+        action: "create",
+        name: "space-audit",
+        description: "Audit PostgreSQL disk usage.",
+        body: "Managed skill body.",
+      },
+      makeContext(cwd, invokeTool),
+    ) as UnknownRecord;
+    const managedDetails = managedResult.details as UnknownRecord;
+
+    expect(await readFile(managedSkillPath, "utf8")).toBe(
+      skillDocument("space-audit", "Audit PostgreSQL disk usage.", "Managed skill body."),
+    );
+    expect(managedResult.path).toBe(managedSkillPath);
+    expect(managedResult.indexes).toEqual(expectedIndexes(managedGroup));
+    expect(managedDetails.indexes).toEqual(expectedIndexes(managedGroup));
+
+    const learnedGroup = "engineering/database/warehouse";
+    const learnedSkillPath = childSkillFile(managedRoot, learnedGroup, "rotation-check");
+    const learnedResult = await executeTool(
+      findTool(pi, "learn"),
+      {
+        scope: "global",
+        memory: "Remember the warehouse rotation check.",
+        skill: {
+          group: learnedGroup,
+          action: "create",
+          name: "rotation-check",
+          description: "Check warehouse rotation.",
+          body: "Learned skill body.",
+        },
+      },
+      makeContext(cwd, invokeTool),
+    ) as UnknownRecord;
+    const learnedDetails = learnedResult.details as UnknownRecord;
+
+    expect(await readFile(learnedSkillPath, "utf8")).toBe(
+      skillDocument("rotation-check", "Check warehouse rotation.", "Learned skill body."),
+    );
+    expect(learnedResult.path).toBe(learnedSkillPath);
+    expect(learnedResult.indexes).toEqual(expectedIndexes(learnedGroup));
+    expect(learnedDetails.indexes).toEqual(expectedIndexes(learnedGroup));
+    expect(calls).toEqual([{ memory: "Remember the warehouse rotation check." }]);
+    expect(await readFile(groupIndexFile(managedRoot, "engineering"), "utf8")).toContain(
+      "skill://engineering/database/SKILL.md",
+    );
+    const databaseIndex = await readFile(groupIndexFile(managedRoot, "engineering/database"), "utf8");
+    expect(databaseIndex).toContain("skill://engineering/database/postgresql/SKILL.md");
+    expect(databaseIndex).toContain("skill://engineering/database/warehouse/SKILL.md");
+
+    await executeTool(findTool(pi, "manage_skill"), {
+      group: managedGroup, action: "update", name: "space-audit",
+      description: "Updated database audit.", body: "Updated manage body.",
+    }, makeContext(cwd, invokeTool));
+    expect(await readFile(managedSkillPath, "utf8")).toContain("Updated manage body.");
+
+    await executeTool(findTool(pi, "learn"), {
+      memory: "Remember the updated audit.",
+      skill: {
+        group: managedGroup, action: "update", name: "space-audit",
+        description: "Learned database audit.", body: "Updated learn body.",
+      },
+    }, makeContext(cwd, invokeTool));
+    expect(await readFile(managedSkillPath, "utf8")).toContain("Updated learn body.");
+    expect(await readFile(groupIndexFile(managedRoot, managedGroup), "utf8")).toContain("Learned database audit.");
+
+    await executeTool(findTool(pi, "manage_skill"), {
+      group: managedGroup, action: "delete", name: "space-audit",
+    }, makeContext(cwd, invokeTool));
+    expect(await pathExists(managedSkillPath)).toBe(false);
+    expect(await readFile(groupIndexFile(managedRoot, managedGroup), "utf8")).not.toContain("space-audit");
+  });
+
+  test("global tools reject traversal in a nested group before writing or saving memory", async () => {
+    const root = await makeRoot("auto-learn-scope-traversal-");
+    const managedRoot = join(root, "managed");
+    await mkdir(managedRoot, { recursive: true });
+    const { cwd } = await makeRepository();
+    const escapedSkillPath = join(root, "outside", "escaped-skill", "SKILL.md");
+
+    for (const toolName of ["manage_skill", "learn"] as const) {
+      const pi = new FakePi();
+      await install(pi, managedRoot);
+      const calls: UnknownRecord[] = [];
+      const invokeTool: NativeInvoker = async params => {
+        calls.push({ ...params });
+        return nativeResult;
+      };
+      const params =
+        toolName === "manage_skill"
+          ? {
+              scope: "global",
+              group: "branch/../../outside",
+              action: "create",
+              name: "escaped-skill",
+              description: "Must stay inside managed-skills.",
+              body: "Body.",
+            }
+          : {
+              scope: "global",
+              memory: "Invalid groups must not save memory first.",
+              skill: {
+                group: "branch/../../outside",
+                action: "create",
+                name: "escaped-skill",
+                description: "Must stay inside managed-skills.",
+                body: "Body.",
+              },
+            };
+
+      await expect(
+        executeTool(findTool(pi, toolName), params, makeContext(cwd, invokeTool)),
+      ).rejects.toThrow(/group|invalid|path/i);
+
+      expect(calls).toHaveLength(0);
+      expect(await pathExists(escapedSkillPath)).toBe(false);
+      expect(await pathExists(join(managedRoot, "branch"))).toBe(false);
+    }
+  });
+
+  test("reading a nested group or member refreshes its index and every ancestor", async () => {
+    const managedRoot = await makeRoot("auto-learn-scope-group-");
+    const group = "engineering/database/postgresql";
+    const memberPath = childSkillFile(managedRoot, group, "deep-audit");
+    await mkdir(join(managedRoot, group, "deep-audit"), { recursive: true });
+    await writeFile(memberPath, skillDocument("deep-audit", "Original deep audit.", "Stable body."), "utf8");
+    const pi = new FakePi();
+    pi.activeSkills = [{ name: "engineering", filePath: groupIndexFile(managedRoot, "engineering") }];
+    await install(pi, managedRoot);
+    const topIndex = groupIndexFile(managedRoot, "engineering");
+    const databaseIndex = groupIndexFile(managedRoot, "engineering/database");
+    const postgresqlIndex = groupIndexFile(managedRoot, group);
+    const initialTopIndex = await readFile(topIndex, "utf8");
+    const initialDatabaseIndex = await readFile(databaseIndex, "utf8");
+    const handler = pi.handlers.get("tool_call")?.find(candidate => candidate.length >= 1);
+    if (!handler) throw new Error("extension must register a tool_call handler that refreshes nested group reads");
+
+    await writeFile(
+      memberPath,
+      skillDocument("deep-audit", "Changed by nested group read.", "Stable body."),
+      "utf8",
+    );
+    const groupDecision = await handler(
+      {
+        type: "tool_call",
+        toolName: "read",
+        input: { path: "skill://engineering/database/SKILL.md" },
+      },
+      makeContext(process.cwd()),
+    );
+
+    const refreshedTopIndex = await readFile(topIndex, "utf8");
+    const refreshedDatabaseIndex = await readFile(databaseIndex, "utf8");
+    expect(groupDecision).toBeUndefined();
+    expect(refreshedDatabaseIndex).not.toBe(initialDatabaseIndex);
+    expect(refreshedDatabaseIndex).toContain("Changed by nested group read.");
+    expect(refreshedTopIndex).not.toBe(initialTopIndex);
+    expect(refreshedTopIndex).toContain("Changed by nested group read.");
+
+    const beforeMemberRead = refreshedTopIndex;
+    await writeFile(
+      memberPath,
+      skillDocument("deep-audit", "Changed by nested member read.", "Stable body."),
+      "utf8",
+    );
+    const memberDecision = await handler(
+      {
+        type: "tool_call",
+        toolName: "read",
+        input: { path: "skill://engineering/database/postgresql/deep-audit/SKILL.md" },
+      },
+      makeContext(process.cwd()),
+    );
+
+    expect(memberDecision).toBeUndefined();
+    expect(await readFile(postgresqlIndex, "utf8")).toContain("Changed by nested member read.");
+    expect(await readFile(databaseIndex, "utf8")).toContain("Changed by nested member read.");
+    expect(await readFile(topIndex, "utf8")).not.toBe(beforeMemberRead);
+    expect(await readFile(topIndex, "utf8")).toContain("Changed by nested member read.");
+    expect(await readFile(memberPath, "utf8")).toContain("Stable body.");
+
+    const addedPath = childSkillFile(managedRoot, group, "new-runbook");
+    await mkdir(join(managedRoot, group, "new-runbook"), { recursive: true });
+    await writeFile(addedPath, skillDocument("new-runbook", "New deep procedure.", "New body."));
+    await rm(memberPath);
+    await handler(
+      { type: "tool_call", toolName: "read", input: { path: "skill://engineering/database/postgresql/SKILL.md" } },
+      makeContext(process.cwd()),
+    );
+    const finalIndex = await readFile(postgresqlIndex, "utf8");
+    expect(finalIndex).toContain("new-runbook");
+    expect(finalIndex).not.toContain("deep-audit");
+    expect(await readFile(topIndex, "utf8")).toContain("New deep procedure.");
+  });
+
+  test("ranged and multi-path reads refresh every referenced managed group", async () => {
+    const root = await makeRoot("auto-learn-scope-selectors-");
+    const pi = new FakePi();
+    for (const group of ["alpha", "beta"]) {
+      await mkdir(join(root, group, "child"), { recursive: true });
+      await writeFile(childSkillFile(root, group, "child"), skillDocument("child", "Before edit.", "Body."));
+    }
+    pi.activeSkills = ["alpha", "beta"].map(name => ({ name, filePath: groupIndexFile(root, name) }));
+    await install(pi, root);
+    const handler = pi.handlers.get("tool_call")?.[0];
+    if (!handler) throw new Error("missing read interception");
+    for (const group of ["alpha", "beta"]) {
+      await writeFile(childSkillFile(root, group, "child"), skillDocument("child", `Changed ${group}.`, "Body."));
+    }
+    await handler(
+      { type: "tool_call", toolName: "read", input: { path: "skill://alpha/SKILL.md:raw;skill://beta/SKILL.md:1-20" } },
+      makeContext(process.cwd()),
+    );
+    expect(await readFile(groupIndexFile(root, "alpha"), "utf8")).toContain("Changed alpha.");
+    expect(await readFile(groupIndexFile(root, "beta"), "utf8")).toContain("Changed beta.");
+  });
+
+  test("read refresh uses the calling session skill snapshot rather than the process-global list", async () => {
+    const root = await makeRoot("auto-learn-scope-session-");
+    const member = childSkillFile(root, "alpha", "child");
+    await mkdir(join(root, "alpha", "child"), { recursive: true });
+    await writeFile(member, skillDocument("child", "Before edit.", "Body."));
+    const pi = new FakePi();
+    pi.activeSkills = [{ name: "alpha", filePath: groupIndexFile(root, "alpha") }];
+    await install(pi, root);
+    registerProcessGlobalSnapshot([]);
+    await writeFile(member, skillDocument("child", "Changed in this session.", "Body."));
+    const handler = pi.handlers.get("tool_call")?.[0];
+    if (!handler) throw new Error("missing read interception");
+    const result = await handler(
+      { type: "tool_call", toolName: "read", input: { path: "skill://alpha" } },
+      makeContext(process.cwd()),
+    );
+    expect(result).toBeUndefined();
+    expect(await readFile(groupIndexFile(root, "alpha"), "utf8")).toContain("Changed in this session.");
+  });
+
+  test("managed reads and global creates fail closed without a matching host session registry", async () => {
+    const root = await makeRoot("auto-learn-scope-session-guard-");
+    await mkdir(join(root, "alpha", "child"), { recursive: true });
+    await writeFile(childSkillFile(root, "alpha", "child"), skillDocument("child", "Existing skill.", "Body."));
+    const pi = new FakePi();
+    pi.activeSkills = [{ name: "alpha", filePath: groupIndexFile(root, "alpha") }];
+    await install(pi, root);
+    registerProcessGlobalSnapshot([]);
+    const handler = pi.handlers.get("tool_call")?.[0];
+    if (!handler) throw new Error("missing read interception");
+    const readEvent = { type: "tool_call", toolName: "read", input: { path: "skill://alpha" } };
+    const createTool = findTool(pi, "manage_skill");
+    const createParams = {
+      scope: "global",
+      group: "alpha",
+      action: "create",
+      name: "new-skill",
+      description: "A new skill.",
+      body: "Body.",
+    };
+
+    for (const sessionState of ["missing-registry", "mismatched-session", "mismatched-agent"] as const) {
+      if (sessionState === "missing-registry") {
+        pi.pi.AgentRegistry = undefined;
+      } else {
+        pi.pi.AgentRegistry = { global: () => pi.registry };
+        pi.sessionId = sessionState === "mismatched-session" ? "different-session" : "test-session";
+      }
+      const context = makeContext(process.cwd());
+      if (sessionState === "mismatched-agent") {
+        context.agent = { id: "different-agent" };
+      }
+      const readResult = await handler(readEvent, context);
+      expect(readResult).toMatchObject({
+        block: true,
+        reason: expect.stringMatching(/current-session skills are unavailable/i),
+      });
+      await expect(executeTool(createTool, createParams, context)).rejects.toThrow(
+        /current-session skills are unavailable/i,
+      );
+    }
+  });
+
+  test("a group index blocked by an active child namespace leaves direct namespace reads available", async () => {
+    const managedRoot = await makeRoot("auto-learn-scope-group-");
+    const namespaceRoot = await makeRoot("auto-learn-scope-namespace-");
+    const namespaceSkillPath = join(namespaceRoot, "SKILL.md");
+    await mkdir(join(managedRoot, "engineering", "database", "schema-audit"), { recursive: true });
+    await writeFile(
+      childSkillFile(managedRoot, "engineering/database", "schema-audit"),
+      skillDocument("schema-audit", "Inspect schema changes.", "Group member body."),
+      "utf8",
+    );
+    const namespaceSkillText = skillDocument("database", "A namespaced ordinary skill.", "Namespace body.");
+    await writeFile(namespaceSkillPath, namespaceSkillText, "utf8");
+    const topIndex = groupIndexFile(managedRoot, "engineering");
+    const pi = new FakePi();
+    pi.activeSkills = [
+      { name: "engineering", filePath: topIndex },
+      { name: "engineering/database", filePath: namespaceSkillPath },
+    ];
+    await install(pi, managedRoot);
+    const handler = pi.handlers.get("tool_call")?.find(candidate => candidate.length >= 1);
+    if (!handler) throw new Error("extension must register a tool_call handler for namespace shadow checks");
+
+    const blocked = await handler(
+      {
+        type: "tool_call",
+        toolName: "read",
+        input: { path: "skill://engineering/SKILL.md" },
+      },
+      makeContext(process.cwd()),
+    ) as UnknownRecord;
+
+    expect(blocked.block).toBe(true);
+    expect(blocked.reason).toMatch(/engineering\/database|namespace|shadow|conflict/i);
+    for (const path of [
+      "skill://engineering:raw",
+      "skill://engineering/SKILL.md:1-20",
+      "skill://engineering/SKILL.md#section",
+      "ordinary.txt;skill://engineering/SKILL.md:raw",
+    ]) {
+      const decision = await handler(
+        { type: "tool_call", toolName: "read", input: { path } },
+        makeContext(process.cwd()),
+      ) as UnknownRecord;
+      expect(decision.block).toBe(true);
+    }
+    expect(await readFile(namespaceSkillPath, "utf8")).toBe(namespaceSkillText);
+
+    const directNamespaceRead = await handler(
+      {
+        type: "tool_call",
+        toolName: "read",
+        input: { path: "skill://engineering/database/SKILL.md" },
+      },
+      makeContext(process.cwd()),
+    );
+
+    expect(directNamespaceRead).toBeUndefined();
+    expect(await readFile(namespaceSkillPath, "utf8")).toBe(namespaceSkillText);
   });
 
 });

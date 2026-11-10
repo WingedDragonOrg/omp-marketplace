@@ -1,8 +1,20 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { link, mkdtemp, mkdir, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  link,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readlink,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 
 type ManagedGroupInput = {
   group: string;
@@ -11,15 +23,30 @@ type ManagedGroupInput = {
   description?: string;
   body?: string;
 };
+type IndexWriteResult = {
+  group: string;
+  path: string;
+  status: "written" | "not-written" | "unknown";
+  needsRebuild: boolean;
+  reason?: "failed" | "not-attempted";
+};
+type ManagedGroupMutation = { path: string; indexes: IndexWriteResult[] };
+type ManagedGroupFailure = Error & {
+  skillStatus?: string;
+  skillPath?: string;
+  indexes?: IndexWriteResult[];
+};
 type ManagedGroupStore = {
   scan(): void;
   refresh(group: string): void;
-  mutate(input: ManagedGroupInput): { path: string };
+  mutate(input: ManagedGroupInput): ManagedGroupMutation;
   isGroup(group: string): boolean;
 };
 type ManagedGroupsModule = {
   createManagedGroupStore?: (root: string) => ManagedGroupStore;
 };
+
+const GROUP_INDEX_MARKER = "<!-- auto-learn-scope managed skill group index -->";
 
 const modulePromise: Promise<ManagedGroupsModule> = import("../src/managed-groups")
   .then(module => module as ManagedGroupsModule);
@@ -37,13 +64,13 @@ async function createStoreFactory(): Promise<NonNullable<ManagedGroupsModule["cr
 async function makeManagedRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "auto-learn-scope-managed-groups-"));
   temporaryRoots.push(root);
-  return root;
+  return realpath(root);
 }
 
 async function makeOutsideDirectory(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "auto-learn-scope-managed-groups-outside-"));
   temporaryRoots.push(root);
-  return root;
+  return realpath(root);
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -79,6 +106,20 @@ async function writeMember(
   await mkdir(join(root, group, directory), { recursive: true });
   await writeFile(file, skillText(name, description, body), "utf8");
   return file;
+}
+
+function expectIndexEntry(
+  index: string,
+  name: string,
+  uri: string,
+  kind: "group" | "skill",
+): void {
+  const lines = index.split(/\r?\n/);
+  const uriLine = lines.findIndex(line => line.includes(uri));
+  expect(uriLine).toBeGreaterThanOrEqual(0);
+  expect(index).toContain(name);
+  const label = lines.slice(Math.max(0, uriLine - 3), uriLine).join("\n");
+  expect(label).toMatch(kind === "group" ? /\bgroup\b|\bsubgroup\b/i : /\bskill\b/i);
 }
 
 function runChildMutation(root: string, group: string, name: string): Promise<void> {
@@ -123,6 +164,22 @@ afterEach(async () => {
 });
 
 describe("managed skill group storage", () => {
+  test("indexes a member description containing an unquoted colon accepted by OMP", async () => {
+    const root = await makeManagedRoot();
+    const file = join(root, "quality", "diagnosis", "SKILL.md");
+    const contents = "---\nname: diagnosis\ndescription: Diagnose a child hang: inspect stdout and process cleanup.\n---\n\nOriginal body.\n";
+    await mkdir(join(root, "quality", "diagnosis"), { recursive: true });
+    await writeFile(file, contents, "utf8");
+
+    const createStore = await createStoreFactory();
+    createStore(root);
+
+    const index = await readFile(groupSkillFile(root, "quality"), "utf8");
+    expect(index).toContain("diagnosis");
+    expect(index).toContain("Diagnose a child hang: inspect stdout and process cleanup.");
+    expect(await readFile(file, "utf8")).toBe(contents);
+  });
+
   test("a symlinked managed root supports discovery and grouped writes", async () => {
     const parent = await makeManagedRoot();
     const target = await makeOutsideDirectory();
@@ -144,6 +201,43 @@ describe("managed skill group storage", () => {
     expect(await readFile(memberSkillFile(target, "database", "new-skill"), "utf8")).toContain("New skill body.");
     expect(await readFile(groupSkillFile(target, "database"), "utf8")).toContain("New database skill.");
     expect(await readlink(root)).toBe(target);
+  });
+
+  test("a retargeted parent symlink cannot redirect writes from the original managed root", async () => {
+    const parent = await makeManagedRoot();
+    const original = await makeOutsideDirectory();
+    const replacement = await makeOutsideDirectory();
+    const alias = join(parent, "alias");
+    await mkdir(join(original, "managed"));
+    await mkdir(join(replacement, "managed"));
+    await symlink(original, alias, "dir");
+    const createStore = await createStoreFactory();
+    const store = createStore(join(alias, "managed"));
+    await rm(alias);
+    await symlink(replacement, alias, "dir");
+
+    store.mutate({ group: "safe", action: "create", name: "member", description: "Safe.", body: "Body." });
+    expect(await pathExists(memberSkillFile(join(original, "managed"), "safe", "member"))).toBe(true);
+    expect(await pathExists(memberSkillFile(join(replacement, "managed"), "safe", "member"))).toBe(false);
+  });
+
+  test("an initially missing root stays pinned to the resolved startup ancestor", async () => {
+    const parent = await makeManagedRoot();
+    const original = await makeOutsideDirectory();
+    const replacement = await makeOutsideDirectory();
+    const alias = join(parent, "alias");
+    await symlink(original, alias, "dir");
+    const root = join(alias, "managed");
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+
+    expect(await pathExists(join(original, "managed"))).toBe(false);
+    await rm(alias);
+    await symlink(replacement, alias, "dir");
+
+    store.mutate({ group: "safe", action: "create", name: "member", description: "Safe.", body: "Body." });
+    expect(await pathExists(memberSkillFile(join(original, "managed"), "safe", "member"))).toBe(true);
+    expect(await pathExists(memberSkillFile(join(replacement, "managed"), "safe", "member"))).toBe(false);
   });
 
   test("startup scan creates an index for a hand-built group without changing a flat skill", async () => {
@@ -174,6 +268,65 @@ describe("managed skill group storage", () => {
       skillText("database-capacity-audit", longDescription, "Read-only capacity procedure."),
     );
     expect(await readFile(flatFile, "utf8")).toBe(flatContents);
+  });
+
+  test("scan builds three nested indexes with only direct skills and child groups", async () => {
+    const root = await makeManagedRoot();
+    await writeMember(root, "engineering", "root-folder", "architecture-runbook", "Root direct member.");
+    await writeMember(root, "engineering/database", "database-folder", "database-guide", "Middle direct member.");
+    await writeMember(
+      root,
+      "engineering/database/postgresql",
+      "postgres-folder",
+      "postgres-guide",
+      "Leaf direct member.",
+    );
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    store.scan();
+
+    const rootIndex = await readFile(groupSkillFile(root, "engineering"), "utf8");
+    const databaseIndex = await readFile(groupSkillFile(root, "engineering/database"), "utf8");
+    const postgresIndex = await readFile(groupSkillFile(root, "engineering/database/postgresql"), "utf8");
+
+    expectIndexEntry(
+      rootIndex,
+      "architecture-runbook",
+      "skill://engineering/root-folder/SKILL.md",
+      "skill",
+    );
+    expectIndexEntry(rootIndex, "database", "skill://engineering/database/SKILL.md", "group");
+    expect(rootIndex).toContain("Root direct member.");
+    expect(rootIndex).toContain("Middle direct member.");
+    expect(rootIndex).not.toContain("database-guide");
+    expect(rootIndex).not.toContain("postgres-guide");
+
+    expectIndexEntry(
+      databaseIndex,
+      "database-guide",
+      "skill://engineering/database/database-folder/SKILL.md",
+      "skill",
+    );
+    expect(databaseIndex).toContain("Middle direct member.");
+    expect(databaseIndex).toContain("Leaf direct member.");
+    expectIndexEntry(
+      databaseIndex,
+      "postgresql",
+      "skill://engineering/database/postgresql/SKILL.md",
+      "group",
+    );
+    expect(databaseIndex).not.toContain("architecture-runbook");
+    expect(databaseIndex).not.toContain("postgres-guide");
+
+    expect(postgresIndex).toContain("Leaf direct member.");
+    expectIndexEntry(
+      postgresIndex,
+      "postgres-guide",
+      "skill://engineering/database/postgresql/postgres-folder/SKILL.md",
+      "skill",
+    );
+    expect(postgresIndex).not.toContain("architecture-runbook");
+    expect(postgresIndex).not.toContain("database-guide");
   });
   test("a member with a whitespace-only parsed description is rejected without rewriting it", async () => {
     const root = await makeManagedRoot();
@@ -308,6 +461,97 @@ describe("managed skill group storage", () => {
     expect(index).not.toContain("retired-process");
   });
 
+  test("a recursive delete failure reports unknown after partially removing a member", async () => {
+    const root = await makeManagedRoot();
+    const memberDirectory = join(root, "partial-delete", "member-folder");
+    const removable = join(memberDirectory, "0-removable.txt");
+    const blockedDirectory = join(memberDirectory, "1-blocked");
+    const blockedFile = join(blockedDirectory, "child.txt");
+    const member = memberSkillFile(root, "partial-delete", "member-folder");
+    await mkdir(memberDirectory, { recursive: true });
+    await writeFile(removable, "This entry is removed before the blocked directory.", "utf8");
+    await mkdir(blockedDirectory);
+    await writeFile(blockedFile, "The non-writable directory prevents completion.", "utf8");
+    await writeFile(member, skillText("partial-delete-member", "A member used to test partial deletion.", "Body."), "utf8");
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    await chmod(blockedDirectory, 0o500);
+
+    let failure: unknown;
+    try {
+      store.mutate({ group: "partial-delete", action: "delete", name: "partial-delete-member" });
+    } catch (error) {
+      failure = error;
+    } finally {
+      if (await pathExists(blockedDirectory)) await chmod(blockedDirectory, 0o700);
+    }
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as ManagedGroupFailure).skillStatus).toBe("unknown");
+    expect((await pathExists(member)) && (await pathExists(removable))).toBe(false);
+    expect(await pathExists(blockedFile)).toBe(true);
+  });
+
+  test("nested create, update, and delete report every index from target group to top level", async () => {
+    const root = await makeManagedRoot();
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    const group = "platform/data/postgresql";
+    const indexGroups = ["platform/data/postgresql", "platform/data", "platform"];
+    const expectSuccessfulIndexes = (result: ManagedGroupMutation) => {
+      expect(result.indexes.map(({ group: indexedGroup, path, status, needsRebuild }) => ({
+        group: indexedGroup,
+        path,
+        status,
+        needsRebuild,
+      }))).toEqual(indexGroups.map(indexedGroup => ({
+        group: indexedGroup,
+        path: groupSkillFile(root, indexedGroup),
+        status: "written",
+        needsRebuild: false,
+      })));
+    };
+
+    const created = store.mutate({
+      group,
+      action: "create",
+      name: "query-plan-review",
+      description: "Review PostgreSQL query plans.",
+      body: "Check the plan.",
+    });
+    expect(created.path).toBe(memberSkillFile(root, group, "query-plan-review"));
+    expectSuccessfulIndexes(created);
+    for (const indexedGroup of indexGroups) {
+      expect(await pathExists(groupSkillFile(root, indexedGroup))).toBe(true);
+    }
+    expect(await readFile(groupSkillFile(root, "platform"), "utf8")).toContain("skill://platform/data/SKILL.md");
+    expect(await readFile(groupSkillFile(root, "platform/data"), "utf8")).toContain(
+      "skill://platform/data/postgresql/SKILL.md",
+    );
+    expect(await readFile(groupSkillFile(root, group), "utf8")).toContain("query-plan-review");
+
+    const updated = store.mutate({
+      group,
+      action: "update",
+      name: "query-plan-review",
+      description: "Explain PostgreSQL query plans.",
+      body: "Compare estimated and actual rows.",
+    });
+    expect(updated.path).toBe(created.path);
+    expectSuccessfulIndexes(updated);
+    expect(await readFile(created.path, "utf8")).toBe(
+      skillText("query-plan-review", "Explain PostgreSQL query plans.", "Compare estimated and actual rows."),
+    );
+    expect(await readFile(groupSkillFile(root, group), "utf8")).toContain("Explain PostgreSQL query plans.");
+
+    const deleted = store.mutate({ group, action: "delete", name: "query-plan-review" });
+    expect(deleted.path).toBe(created.path);
+    expectSuccessfulIndexes(deleted);
+    expect(await pathExists(created.path)).toBe(false);
+    expect(await readFile(groupSkillFile(root, group), "utf8")).not.toContain("query-plan-review");
+    expect(await readFile(groupSkillFile(root, "platform"), "utf8")).not.toContain("query-plan-review");
+  });
+
   test("create makes a missing group and its index", async () => {
     const root = await makeManagedRoot();
     const createStore = await createStoreFactory();
@@ -351,6 +595,42 @@ describe("managed skill group storage", () => {
     expect(await readFile(groupSkillFile(root, "reusable"), "utf8")).toContain("second-skill");
   });
 
+  test("a failed create removes its empty member directory so a retry can proceed", async () => {
+    const root = await makeManagedRoot();
+    await writeMember(root, "retryable", "existing", "existing-skill", "Existing member.");
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    const newMemberDirectory = join(root, "retryable", "retry-skill");
+    const originalUmask = process.umask(0o222);
+    let failure: unknown;
+    try {
+      store.mutate({
+        group: "retryable",
+        action: "create",
+        name: "retry-skill",
+        description: "Retry member.",
+        body: "Retry after cleanup.",
+      });
+    } catch (error) {
+      failure = error;
+    } finally {
+      process.umask(originalUmask);
+    }
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(await pathExists(newMemberDirectory)).toBe(false);
+    const retry = store.mutate({
+      group: "retryable",
+      action: "create",
+      name: "retry-skill",
+      description: "Retry member.",
+      body: "Retry after cleanup.",
+    });
+    expect(await readFile(retry.path, "utf8")).toBe(
+      skillText("retry-skill", "Retry member.", "Retry after cleanup."),
+    );
+  });
+
   test("an empty skill name is rejected without creating or changing user files", async () => {
     const root = await makeManagedRoot();
     const keep = join(root, "keep.txt");
@@ -368,6 +648,51 @@ describe("managed skill group storage", () => {
 
     expect(await pathExists(join(root, "safe-group"))).toBe(false);
     expect(await readFile(keep, "utf8")).toBe("user data");
+  });
+
+  test("group paths reject empty segments and traversal without touching outside files", async () => {
+    const root = await makeManagedRoot();
+    const outside = await makeOutsideDirectory();
+    const keep = join(outside, "keep.txt");
+    await writeFile(keep, "outside user data", "utf8");
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    const invalidGroups = ["safe//child", relative(root, outside)];
+
+    for (const group of invalidGroups) {
+      expect(() => store.mutate({
+        group,
+        action: "create",
+        name: "escaped-skill",
+        description: "Must not be written outside the root.",
+        body: "Must not be written.",
+      })).toThrow();
+    }
+
+    expect(await pathExists(join(root, "safe"))).toBe(false);
+    expect(await pathExists(join(outside, "escaped-skill"))).toBe(false);
+    expect(await readFile(keep, "utf8")).toBe("outside user data");
+  });
+
+  test("a nested group cannot be created beneath an ordinary skill", async () => {
+    const root = await makeManagedRoot();
+    const ordinaryIndex = groupSkillFile(root, "engineering");
+    const contents = skillText("engineering", "An ordinary managed skill.", "Keep this file unchanged.");
+    await mkdir(join(root, "engineering"), { recursive: true });
+    await writeFile(ordinaryIndex, contents, "utf8");
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+
+    expect(() => store.mutate({
+      group: "engineering/database",
+      action: "create",
+      name: "query-guide",
+      description: "Must not replace the ordinary skill.",
+      body: "Must not be written.",
+    })).toThrow();
+
+    expect(await readFile(ordinaryIndex, "utf8")).toBe(contents);
+    expect(await pathExists(join(root, "engineering/database"))).toBe(false);
   });
 
   test("a member without a frontmatter name is reported without rewriting it", async () => {
@@ -410,19 +735,60 @@ describe("managed skill group storage", () => {
     expect(await pathExists(join(outside, "SKILL.md"))).toBe(false);
   });
 
+  test("a nested group symlink blocks creation without touching its target", async () => {
+    const root = await makeManagedRoot();
+    const outside = await makeOutsideDirectory();
+    const keep = join(outside, "keep.txt");
+    const linkedGroup = join(root, "engineering", "linked");
+    await writeMember(root, "engineering", "runbook", "engineering-runbook", "Parent member.");
+    await writeFile(keep, "outside user data", "utf8");
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    await symlink(outside, linkedGroup, "dir");
+
+    expect(() => store.mutate({
+      group: "engineering/linked",
+      action: "create",
+      name: "must-not-escape",
+      description: "Must not be written outside the managed root.",
+      body: "Must not be written.",
+    })).toThrow();
+
+    expect(await readlink(linkedGroup)).toBe(outside);
+    expect(await readFile(keep, "utf8")).toBe("outside user data");
+    expect(await pathExists(join(outside, "must-not-escape"))).toBe(false);
+  });
+
   test("a symlinked group index is reported without replacing its target", async () => {
     const root = await makeManagedRoot();
     const outside = await makeOutsideDirectory();
     const target = join(outside, "keep.md");
     const linkedIndex = groupSkillFile(root, "linked-index");
     await writeMember(root, "linked-index", "child", "child-skill", "Child member.");
-    await writeFile(target, "externally managed index", "utf8");
+    const targetContents = "---\nname: linked-index\ndescription: Existing group.\n---\n\n<!-- auto-learn-scope managed skill group index -->\n";
+    await writeFile(target, targetContents, "utf8");
     await symlink(target, linkedIndex, "file");
     const createStore = await createStoreFactory();
 
     expect(() => createStore(root)).toThrow(/symlink|link|conflict/i);
     expect(await readlink(linkedIndex)).toBe(target);
-    expect(await readFile(target, "utf8")).toBe("externally managed index");
+    expect(await readFile(target, "utf8")).toBe(targetContents);
+  });
+
+  test("a symlinked ordinary skill with nested files is not converted into a group", async () => {
+    const root = await makeManagedRoot();
+    const outside = await makeOutsideDirectory();
+    const target = join(outside, "ordinary.md");
+    const contents = skillText("ordinary", "An ordinary skill.", "Preserve this content.");
+    await writeMember(root, "ordinary", "child", "child-skill", "Nested file.");
+    await writeFile(target, contents);
+    await symlink(target, groupSkillFile(root, "ordinary"), "file");
+
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    expect(() => store.mutate({ group: "ordinary", action: "create", name: "new-skill", description: "New.", body: "Body." })).toThrow();
+    expect(await readFile(target, "utf8")).toBe(contents);
+    expect(await readlink(groupSkillFile(root, "ordinary"))).toBe(target);
   });
 
   test("a symlinked member can be indexed but cannot be overwritten through its target", async () => {
@@ -476,6 +842,47 @@ describe("managed skill group storage", () => {
     expect(await pathExists(memberSkillFile(root, "user-owned", "new-skill"))).toBe(false);
   });
 
+  test("only a marker in its reserved position identifies a group index", async () => {
+    const cases = [
+      {
+        group: "marker-in-body",
+        contents: skillText(
+          "marker-in-body",
+          "A user-authored skill.",
+          `Keep this prose.\n\n${GROUP_INDEX_MARKER}`,
+        ),
+      },
+      {
+        group: "marker-without-blank",
+        contents: `---\nname: marker-without-blank\ndescription: A user-authored skill.\n---\n${GROUP_INDEX_MARKER}\n\nKeep this file.\n`,
+      },
+    ];
+    const createStore = await createStoreFactory();
+
+    for (const { group, contents } of cases) {
+      const root = await makeManagedRoot();
+      const child = await writeMember(root, group, "child-folder", `${group}-child`, "Child member.");
+      const childContents = await readFile(child, "utf8");
+      const index = groupSkillFile(root, group);
+      await writeFile(index, contents, "utf8");
+      const store = createStore(root);
+
+      expect(store.isGroup(group)).toBe(false);
+      expect(() => store.scan()).not.toThrow();
+      expect(await readFile(index, "utf8")).toBe(contents);
+      expect(() => store.mutate({
+        group,
+        action: "create",
+        name: "blocked-skill",
+        description: "Must not overwrite the user-owned index.",
+        body: "Must not be written.",
+      })).toThrow();
+      expect(await readFile(index, "utf8")).toBe(contents);
+      expect(await readFile(child, "utf8")).toBe(childContents);
+      expect(await pathExists(memberSkillFile(root, group, "blocked-skill"))).toBe(false);
+    }
+  });
+
   test("concurrent child processes leave every successful member in the group index", async () => {
     const root = await makeManagedRoot();
     await writeMember(root, "parallel", "seed", "seed-skill", "Seed member.");
@@ -491,6 +898,31 @@ describe("managed skill group storage", () => {
       expect(index).toContain(name);
       expect(index).toContain(`skill://parallel/${name}/SKILL.md`);
     }
+  });
+
+  test("concurrent processes updating different branches preserve every nested index", async () => {
+    const root = await makeManagedRoot();
+    await writeMember(root, "parallel/alpha", "seed", "alpha-seed", "Alpha seed member.");
+    await writeMember(root, "parallel/beta", "seed", "beta-seed", "Beta seed member.");
+    const createStore = await createStoreFactory();
+    createStore(root);
+
+    await Promise.all([
+      runChildMutation(root, "parallel/alpha", "alpha-worker"),
+      runChildMutation(root, "parallel/beta", "beta-worker"),
+    ]);
+
+    const rootIndex = await readFile(groupSkillFile(root, "parallel"), "utf8");
+    const alphaIndex = await readFile(groupSkillFile(root, "parallel/alpha"), "utf8");
+    const betaIndex = await readFile(groupSkillFile(root, "parallel/beta"), "utf8");
+    expect(rootIndex).toContain("skill://parallel/alpha/SKILL.md");
+    expect(rootIndex).toContain("skill://parallel/beta/SKILL.md");
+    expect(alphaIndex).toContain("alpha-seed");
+    expect(alphaIndex).toContain("alpha-worker");
+    expect(betaIndex).toContain("beta-seed");
+    expect(betaIndex).toContain("beta-worker");
+    expect(await pathExists(memberSkillFile(root, "parallel/alpha", "alpha-worker"))).toBe(true);
+    expect(await pathExists(memberSkillFile(root, "parallel/beta", "beta-worker"))).toBe(true);
   });
   test("group descriptions are capped at 200 Unicode characters and index ordering is stable", async () => {
     const root = await makeManagedRoot();
@@ -545,8 +977,7 @@ describe("managed skill group storage", () => {
 
     const damagedIndex = "not valid frontmatter\\n<!-- auto-learn-scope managed skill group index -->\\n";
     await writeFile(index, damagedIndex, "utf8");
-    expect(store.isGroup("marked-group")).toBe(true);
-    expect(() => store.refresh("marked-group")).toThrow(/frontmatter|YAML/i);
+    expect(() => store.refresh("marked-group")).toThrow();
     expect(await readFile(index, "utf8")).toBe(damagedIndex);
   });
 
@@ -683,6 +1114,58 @@ describe("managed skill group storage", () => {
     }
   });
 
+  test("a hard-link failure reports status for each affected index from target to top level", async () => {
+    const root = await makeManagedRoot();
+    const outside = await makeOutsideDirectory();
+    const top = "engineering";
+    const middle = "engineering/database";
+    const leaf = "engineering/database/postgresql";
+    const member = await writeMember(root, leaf, "reader-folder", "read-runbook", "Before update.", "Old body.");
+    await writeMember(root, middle, "database-folder", "database-guide", "Database member.");
+    await writeMember(root, top, "root-folder", "engineering-guide", "Engineering member.");
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    const topIndex = groupSkillFile(root, top);
+    const middleIndex = groupSkillFile(root, middle);
+    const leafIndex = groupSkillFile(root, leaf);
+    const linkedIndex = join(outside, "shared-middle-index.md");
+    await link(middleIndex, linkedIndex);
+    const originalMiddle = await readFile(middleIndex, "utf8");
+    const originalTop = await readFile(topIndex, "utf8");
+    let failure: unknown;
+    try {
+      store.mutate({
+        group: leaf,
+        action: "update",
+        name: "read-runbook",
+        description: "After update.",
+        body: "New body.",
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(Error);
+    const details = failure as ManagedGroupFailure;
+    expect(details.skillStatus).toBe("written");
+    expect(details.skillPath).toBe(member);
+    expect(details.indexes).toEqual([
+      { group: leaf, path: leafIndex, status: "written", needsRebuild: false },
+      { group: middle, path: middleIndex, status: "not-written", needsRebuild: true, reason: "failed" },
+      { group: top, path: topIndex, status: "not-written", needsRebuild: true, reason: "not-attempted" },
+    ]);
+    expect(await readFile(member, "utf8")).toBe(skillText("read-runbook", "After update.", "New body."));
+    expect(await readFile(leafIndex, "utf8")).toContain("After update.");
+    expect(await readFile(middleIndex, "utf8")).toBe(originalMiddle);
+    expect(await readFile(linkedIndex, "utf8")).toBe(originalMiddle);
+    expect(await readFile(topIndex, "utf8")).toBe(originalTop);
+
+    await rm(linkedIndex);
+    store.refresh(leaf);
+    expect(await readFile(middleIndex, "utf8")).toContain("After update.");
+    expect(await readFile(topIndex, "utf8")).toContain("After update.");
+  });
+
 
   test("an oversized member is rejected before any member or group is created", async () => {
     const root = await makeManagedRoot();
@@ -700,15 +1183,17 @@ describe("managed skill group storage", () => {
     expect(await pathExists(join(root, "oversized"))).toBe(false);
   });
 
-  test("scan reports a group index whose name does not match its directory", async () => {
+  test("scan rejects a correctly marked group index whose name does not match its directory", async () => {
     const root = await makeManagedRoot();
     const groupIndex = groupSkillFile(root, "wrong-name");
-    await writeMember(root, "wrong-name", "child", "child-skill", "Child description.");
-    await writeFile(groupIndex, `${skillText("different-name", "Manual.", "User data.")}\n<!-- auto-learn-scope managed skill group index -->\n`, "utf8");
+    const child = await writeMember(root, "wrong-name", "child", "child-skill", "Child description.");
+    const contents = `---\nname: different-name\ndescription: Manual.\n---\n\n${GROUP_INDEX_MARKER}\n\nUser data.\n`;
+    await writeFile(groupIndex, contents, "utf8");
     const createStore = await createStoreFactory();
 
     expect(() => createStore(root)).toThrow(/name|match|conflict|group/i);
-    expect(await readFile(groupIndex, "utf8")).toContain("different-name");
+    expect(await readFile(groupIndex, "utf8")).toBe(contents);
+    expect(await readFile(child, "utf8")).toContain("Child description.");
   });
   test("update and delete of missing groups preserve native existence semantics", async () => {
     const root = await makeManagedRoot();
@@ -725,5 +1210,18 @@ describe("managed skill group storage", () => {
     }
 
     expect(await pathExists(join(root, "missing-group"))).toBe(false);
+  });
+  test("a missing update group reports the intended member path separately from the index path", async () => {
+    const root = await makeManagedRoot();
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    let failure: unknown;
+    try {
+      store.mutate({ group: "engineering/database", action: "update", name: "space-audit", description: "Audit.", body: "Body." });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as ManagedGroupFailure).skillPath).toBe(memberSkillFile(root, "engineering/database", "space-audit"));
   });
 });

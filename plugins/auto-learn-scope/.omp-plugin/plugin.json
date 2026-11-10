@@ -1,6 +1,6 @@
 {
   "name": "auto-learn-scope",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "description": "Manage grouped global and project auto-learn skills with progressive loading",
   "author": {
     "name": "WingedDragonOrg"
