@@ -781,7 +781,8 @@ function parseInline(text: string, inheritedMarks: ProseMirrorMark[] = []): Pros
       text[end] !== "_" &&
       text[end] !== "~" &&
       text[end] !== "<" &&
-      text[end] !== "\n"
+      text[end] !== "\n" &&
+      !(text[end] === "!" && text[end + 1] === "[")
     ) {
       end += 1;
     }

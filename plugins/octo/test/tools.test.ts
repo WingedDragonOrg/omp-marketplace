@@ -1,5 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
+import { ExtensionRuntime, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { registerOctoTools } from "../src/index.ts";
+import { z } from "@oh-my-pi/pi-coding-agent";
 
 type UnknownRecord = Record<string, unknown>;
 type OctoDocument = {
@@ -45,25 +48,50 @@ afterEach(async () => {
 
 function makeHarness(backend: Backend) {
   const tools = new Map<string, ToolDefinition>();
-  const api = {
-    zod: {
-      object: (shape: UnknownRecord) => ({ kind: "object", shape }),
-      string: () => ({
-        kind: "string",
-        optional: () => ({ kind: "optional", inner: { kind: "string" } }),
-      }),
-      boolean: () => ({
-        kind: "boolean",
-        optional: () => ({ kind: "optional", inner: { kind: "boolean" } }),
-      }),
-      enum: (values: string[]) => ({
-        kind: "enum",
-        values,
-        optional: () => ({ kind: "optional", inner: { kind: "enum", values } }),
-      }),
-      array: (element: unknown) => ({ kind: "array", element }),
-      union: (options: unknown[]) => ({ kind: "union", options }),
+  const zod = {
+    object: (shape: UnknownRecord) => ({ kind: "object", shape }),
+    string: () => ({
+      kind: "string",
+      optional: () => ({ kind: "optional", inner: { kind: "string" } }),
+    }),
+    boolean: () => ({
+      kind: "boolean",
+      optional: () => ({ kind: "optional", inner: { kind: "boolean" } }),
+    }),
+    enum: (values: string[]) => ({
+      kind: "enum",
+      values,
+      optional: () => ({ kind: "optional", inner: { kind: "enum", values } }),
+    }),
+    array: (element: unknown) => ({ kind: "array", element }),
+    union: (options: unknown[]) => ({ kind: "union", options }),
+  };
+  const nativeTools = [
+    {
+      name: "read",
+      description: "Native read supports Archives, SQLite, and PDF.",
+      parameters: zod.object({ path: zod.string() }),
+      sourceInfo: { source: "builtin" },
     },
+    {
+      name: "write",
+      description: "Native write supports xd:// and proc://<id>/kill.",
+      parameters: zod.object({
+        path: zod.string(),
+        content: zod.string().optional(),
+      }),
+      sourceInfo: { source: "builtin" },
+    },
+    {
+      name: "edit",
+      description: "Native edit hashline mode.",
+      parameters: zod.object({ input: zod.string() }),
+      sourceInfo: { source: "builtin" },
+    },
+  ];
+  const api = {
+    zod,
+    getAllTools: () => nativeTools,
     registerTool(definition: ToolDefinition) {
       tools.set(definition.name, definition);
     },
@@ -72,6 +100,56 @@ function makeHarness(backend: Backend) {
   cleanups.push(registerOctoTools(api as never, backend));
   return tools;
 }
+
+test("OMP extension loader registers native-schema wrappers and preserves local delegation", async () => {
+  const nativeTools = [
+    {
+      name: "read",
+      description: "Native read description.",
+      parameters: z.object({ path: z.string() }),
+      sourceInfo: { source: "builtin" },
+    },
+    {
+      name: "write",
+      description: "Native write description.",
+      parameters: z.object({ path: z.string(), content: z.string() }),
+      sourceInfo: { source: "builtin" },
+    },
+    {
+      name: "edit",
+      description: "Native hashline edit description.",
+      parameters: z.object({ input: z.string() }),
+      sourceInfo: { source: "builtin" },
+    },
+  ];
+  const runtime = new ExtensionRuntime();
+  runtime.getAllTools = () => nativeTools as never;
+
+  const extensionPath = fileURLToPath(new URL("../src/index.ts", import.meta.url));
+  const loaded = await loadExtensions([extensionPath], process.cwd(), undefined, runtime);
+  expect(loaded.errors).toEqual([]);
+  const extension = loaded.extensions[0];
+  expect(extension).toBeDefined();
+  const sessionStart = extension!.handlers.get("session_start")?.[0];
+  expect(sessionStart).toBeDefined();
+  await sessionStart!({ type: "session_start" }, { cwd: process.cwd() } as never);
+
+  const read = extension!.tools.get("read")?.definition as unknown as ToolDefinition | undefined;
+  expect(read).toBeDefined();
+  expect(read?.parameters).toBe(nativeTools[0]!.parameters);
+  expect(read?.description).toContain(nativeTools[0]!.description);
+
+  const calls: UnknownRecord[] = [];
+  const result = await execute(read, { path: "README.md:2-4" }, {
+    invokeTool: async (params: UnknownRecord) => {
+      calls.push(params);
+      return { content: [{ type: "text", text: "native read completed" }] };
+    },
+  });
+  expect(textOf(result)).toBe("native read completed");
+  expect(calls).toEqual([{ path: "README.md:2-4" }]);
+});
+
 
 function textOf(result: ToolResult): string {
   return result.content
@@ -150,10 +228,10 @@ test("read ranges create native hashline snapshots and edit enforces seen-line a
 
   const ranged = await execute(read, { path: "octo://d_guide:2-3" });
   const displayed = textOf(ranged);
-  expect(displayed).toContain("2: beta");
-  expect(displayed).toContain("3: gamma");
-  expect(displayed).not.toContain("1: alpha");
-  expect(displayed).not.toContain("4: delta");
+  expect(displayed).toMatch(/(?:^|\n)2:\s*beta(?:\n|$)/);
+  expect(displayed).toMatch(/(?:^|\n)3:\s*gamma(?:\n|$)/);
+  expect(displayed).not.toMatch(/(?:^|\n)1:\s*alpha(?:\n|$)/);
+  expect(displayed).not.toMatch(/(?:^|\n)4:\s*delta(?:\n|$)/);
 
   const tag = displayed.match(/\[octo:\/\/d_guide#([0-9a-f]{4})\]/i)?.[1];
   expect(tag, "read must expose the snapshot tag used by native hashline edits").toBeDefined();
@@ -215,7 +293,7 @@ test("native optional write and configured edit-mode parameters reach the built-
   expect(applyPatchResult.isError).not.toBe(true);
   expect(calls).toEqual([writeParams, replaceParams, patchParams, applyPatchParams]);
   expect(write?.parameters).toMatchObject({ shape: { content: { kind: "optional" } } });
-  expect(edit?.parameters).toMatchObject({ kind: "union" });
+  expect(edit?.parameters).toMatchObject({ shape: { input: { kind: "string" } } });
   expect(read?.description).toContain("Archives");
   expect(read?.description).toContain("SQLite");
   expect(read?.description).toContain("PDF");
