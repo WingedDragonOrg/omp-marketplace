@@ -1,8 +1,7 @@
 # auto-learn-scope
 
-`auto-learn-scope` 是 OMP experimental auto-learn 的兼容式 Extension。它保留原生
-`learn`、`manage_skill`、memory backend 和 hidden auto-capture 行为，只为 skill 写入增加显式的
-`global` / `project` 作用域。
+`auto-learn-scope` 为 OMP experimental auto-learn 提供分组 managed skill 和项目作用域。
+全局分组按需展开，`learn` 的 memory 仍由 OMP 原生 backend 保存。
 
 ## 安装
 
@@ -16,26 +15,36 @@ Extension module 在创建 session 时加载；安装后请重启 `omp` 或开�
 
 ## 使用前提
 
-请先在 OMP 配置中将 `autolearn.enabled` 设为 `true`（默认关闭）。未启用时，Extension
-不会提供可执行的写入能力，显式调用也会 fail closed。`learn` 的 memory 仍必须由 OMP
-原生 memory backend 提供；本插件不会自行实现或替代 memory 存储。
+Skill 写入需要在 OMP 配置中将 `autolearn.enabled` 设为 `true`（默认关闭）；关闭时
+`learn` / `manage_skill` 不执行写入。组索引维护随 Skill 发现运行，与此开关独立。
+`learn` 的 memory 由 OMP 原生 memory backend 提供。
 
 ## 作用域
 
-`learn` 和 `manage_skill` 仍使用原来的工具名，并新增可选的 `scope`：
+`learn` 和 `manage_skill` 使用原来的工具名，并支持 `scope`：
 
-- **默认 `global`**：省略 `scope` 或明确传入 `"global"` 时，wrapper 移除这个扩展字段，
-  只委托同名 native tool。原生 global managed skill 路径和结果语义保持不变；hidden
-  auto-capture 未指定作用域时也仍然写入 global。
-- **显式 `project`**：只有传入 `"project"` 才会写当前 repository。目标固定为
-  `<repoRoot>/.omp/skills/<name>/SKILL.md`，使用普通 project skill 的标准 `name`、
-  `description` frontmatter 和正文。
+- **默认 `global`**：Skill 操作必须指定 `group`。目标是
+  `<agentDir>/managed-skills/<group>/<name>/SKILL.md`；创建 Skill 时复用已有分组或创建新分组。
+  `learn` 中的 `group` 位于 `skill` 对象内；`manage_skill` 的 `group` 位于顶层。
+- **显式 `project`**：写入 `<repoRoot>/.omp/skills/<name>/SKILL.md`，不要求 `group`。
 
-`manage_skill(scope="project")` 支持 `create`、`update`、`delete`，按目标是否存在执行确定性
-操作，不会写入 global managed-skill 目录。`learn(scope="project")` 始终先把 memory
-委托给 native `learn`；有可选 `skill` 时，memory 成功后再写入 project skill，没有 `skill`
-时则只是 native memory-only learn。memory 失败不会创建 skill；skill 写入失败会明确报告
-partial/error，而不会把整个操作报告为成功。
+两个作用域的 `learn` 都先委托 native `learn` 保存 memory，再写入可选 Skill；
+仅保存 memory 时不需要 `group`。`manage_skill` 支持 `create`、`update` 和 `delete`。
+memory 已保存而 Skill 或组索引写入失败时，结果分别报告各部分的状态和路径。
+
+全局分组示例，以下是传给 `manage_skill` 的参数：
+
+```json
+{
+  "action": "create",
+  "group": "postgresql",
+  "name": "space-audit",
+  "description": "排查 PostgreSQL 磁盘占用",
+  "body": "1. 检查数据库和表的磁盘占用。"
+}
+```
+
+对应的 `learn` 写法是在 `skill` 对象中添加 `"group": "postgresql"`。
 
 最小的 project skill 示例：
 
@@ -68,10 +77,32 @@ partial/error，而不会把整个操作报告为成功。
 名称、路径、符号链接、硬链接、空内容和文件大小等 project writer 安全边界会在写入时
 校验；project skill 不会自动 commit 或 push。
 
-## 发现与刷新
+## 分组与发现
 
-project skill 使用 OMP 原生 project skill discovery，不建立第二套 loader。文件在当前回合
-写入后，不会回溯修改已经构建的 `<skills>` inventory；在后续 turn 的 system prompt 刷新、
-执行 `/reload-plugins`，或开启新 session 后，native loader 会从
-`<repoRoot>/.omp/skills/<name>/SKILL.md` 重新发现它。同名 skill 仍遵循 OMP 原有的 discovery
-优先级。
+每个分组的顶层 `SKILL.md` 由插件生成，包含组内 Skill 的名称、description 和读取路径。
+模型首先看到组的名称和简短 description；读取组后才看到子 Skill 清单，再按需读取正文。
+组 description 最多 200 个 Unicode 字符，正文索引保留各成员完整 description；较大分组的
+摘要可能不包含靠后的触发词。
+
+用户可手动创建组目录并将 Skill 目录移入，插件在会话加载时生成索引，读取分组前及工具
+修改成员后维护索引。交互或 RPC 会话中新增组后执行 `/refresh-managed-skills`，由 OMP
+原生 `/reload-plugins` 重新发现；ACP 和打印模式请开启新会话。
+已有平铺 Skill 保持原状。移动后旧的 `skill://<name>` 引用需要由用户自行更新为
+`skill://<group>/<child-directory>/SKILL.md`。
+
+组与成员名称采用小写字母、数字和连字符；顶层普通 Skill、指向外部的目录链接和共享硬链接
+不会被插件覆盖。组内符号链接可供读取和索引，插件不会通过链接修改其目标。
+同名 authored Skill 的优先级高于 managed 分组，创建新组时须避免名称冲突。
+
+project skill 继续使用 OMP 原生 project discovery；写入后通过 `/reload-plugins` 或新会话
+重新发现。两类 Skill 的发现均受 OMP 宿主版本与配置影响。
+
+## 验收记录
+
+在 OMP 18.18.3 的隔离会话中，以数据库和网络各两个示例 Skill 比较真实 provider 请求。
+保留相同的其他 Skill 时，初始 Skill 清单从 6,274 降至 6,140 字节；`omp toks` 的
+o200k 计数从 1,509 降至 1,478，Claude v5 计数从 2,399 降至 2,339。
+
+使用生成的组 description 和当前默认模型选择分组：PostgreSQL 锁等待、PostgreSQL
+catalog 膨胀均命中 database；macOS DNS 缓存、Tailscale 路由均命中 network，4 次
+中 0 次未命中。该样本不能代表更大分组或真实 Skill 库的召回率。

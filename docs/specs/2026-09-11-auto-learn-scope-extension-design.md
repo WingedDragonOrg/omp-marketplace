@@ -2,6 +2,8 @@
 
 日期：2026-09-11
 
+> 全局 Skill 写入与发现契约以 [Managed Skill 分组与渐进加载设计](2026-11-09-managed-skill-groups-design.md) 为准；本文保留项目作用域设计背景。
+
 ## 背景与目标
 
 OMP 18.1.16 已内置 experimental auto-learn。内置实现由三部分组成：

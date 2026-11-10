@@ -180,9 +180,9 @@
     },
     {
       "name": "auto-learn-scope",
-      "description": "Add explicit global/project scope to OMP auto-learn tools while preserving native memory and capture behavior",
+      "description": "Manage grouped global and project auto-learn skills with progressive loading",
       "source": "./auto-learn-scope",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "category": "development",
       "keywords": [
         "auto-learn",

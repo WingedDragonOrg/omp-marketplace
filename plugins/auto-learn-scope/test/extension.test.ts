@@ -3,9 +3,11 @@ import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type * as ExtensionExports from "../src/index";
 
 type UnknownRecord = Record<string, unknown>;
 type ToolHandler = (event: UnknownRecord, ctx: UnknownRecord) => unknown | Promise<unknown>;
+type CommandHandler = (args: string, ctx: UnknownRecord) => unknown | Promise<unknown>;
 type ToolDefinition = UnknownRecord & {
   name: string;
   parameters?: SchemaNode;
@@ -18,6 +20,7 @@ type SchemaNode = UnknownRecord & {
   shape?: UnknownRecord;
   optional?: () => SchemaNode;
   describe?: (text: string) => SchemaNode;
+  refine?: (check: (value: unknown) => boolean, message?: string) => SchemaNode;
 };
 type NativeInvoker = (
   params: Record<string, unknown>,
@@ -27,15 +30,10 @@ type RepositoryFixture = {
   root: string;
   cwd: string;
 };
+type ExtensionModule = typeof ExtensionExports;
+type ExtensionHost = Parameters<ExtensionModule["installAutoLearnScope"]>[0];
+const modulePromise: Promise<ExtensionModule> = import("../src/index");
 
-type ExtensionModule = UnknownRecord & {
-  default?: (pi: UnknownRecord) => void | Promise<void>;
-  installAutoLearnScope?: (pi: UnknownRecord) => void | Promise<void>;
-};
-
-const modulePromise: Promise<ExtensionModule> = import("../src/index")
-  .then(module => module as ExtensionModule)
-  .catch(() => ({}));
 const temporaryRoots: string[] = [];
 
 function schemaNode(kind: string, fields: UnknownRecord = {}): SchemaNode {
@@ -43,7 +41,11 @@ function schemaNode(kind: string, fields: UnknownRecord = {}): SchemaNode {
     kind,
     ...fields,
     optional: () => schemaNode("optional", { inner: node }),
-    describe: () => node,
+    describe: text => {
+      node.description = text;
+      return node;
+    },
+    refine: () => node,
   };
   return node;
 }
@@ -63,10 +65,35 @@ const zod = {
   },
 };
 
+class FakeSettings {
+  constructor(private readonly values: Map<string, unknown>) {}
+
+  rawValue(setting: unknown): unknown {
+    if (setting === null || typeof setting !== "object") return undefined;
+    const segments = (setting as UnknownRecord).segments;
+    return Array.isArray(segments) ? this.values.get(segments.join(".")) : undefined;
+  }
+}
+
 class FakePi {
   readonly zod = zod;
   readonly tools: ToolDefinition[] = [];
   readonly handlers = new Map<string, ToolHandler[]>();
+  readonly commands = new Map<string, CommandHandler>();
+  readonly commandDescriptions = new Map<string, string>();
+  readonly pi: { settings: FakeSettings; getActiveSkills: () => unknown[] };
+
+  constructor(options: { autoLearnEnabled?: boolean | null; memoryBackend?: string } = {}) {
+    this.pi = {
+      settings: new FakeSettings(
+        new Map<string, unknown>([
+          ["autolearn.enabled", options.autoLearnEnabled === undefined ? true : options.autoLearnEnabled],
+          ["memory.backend", options.memoryBackend ?? "local"],
+        ]),
+      ),
+      getActiveSkills: () => [],
+    };
+  }
 
   registerTool(definition: ToolDefinition): void {
     this.tools.push(definition);
@@ -77,6 +104,11 @@ class FakePi {
     handlers.push(handler);
     this.handlers.set(event, handlers);
   }
+
+  registerCommand(name: string, definition: { description: string; handler?: CommandHandler }): void {
+    this.commandDescriptions.set(name, definition.description);
+    if (typeof definition.handler === "function") this.commands.set(name, definition.handler);
+  }
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -86,6 +118,12 @@ async function pathExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+async function makeManagedRoot(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "auto-learn-scope-managed-"));
+  temporaryRoots.push(root);
+  return root;
 }
 
 async function makeRepository(): Promise<RepositoryFixture> {
@@ -103,18 +141,14 @@ async function extensionModule(): Promise<ExtensionModule> {
 
 async function install(pi: FakePi): Promise<void> {
   const module = await extensionModule();
-  if (typeof module.installAutoLearnScope !== "function") {
-    throw new Error("src/index.ts must export installAutoLearnScope()");
-  }
-  await module.installAutoLearnScope(pi);
+  await module.installAutoLearnScope(pi as unknown as ExtensionHost, { managedRoot: await makeManagedRoot() });
 }
 
 async function installDefault(pi: FakePi): Promise<void> {
   const module = await extensionModule();
-  if (typeof module.default !== "function") {
-    throw new Error("src/index.ts must export a default extension factory");
-  }
-  await module.default(pi);
+  await module.default(pi as unknown as Parameters<ExtensionModule["default"]>[0], {
+    managedRoot: await makeManagedRoot(),
+  });
 }
 
 function findTool(pi: FakePi, name: string): ToolDefinition {
@@ -178,28 +212,54 @@ afterEach(async () => {
 });
 
 describe("auto-learn-scope extension registration", () => {
-  test("default factory registers the two same-name auto-learn tools and before_agent_start handler", async () => {
+  test("default factory registers wrappers, lifecycle and input handlers, and an accurate refresh command", async () => {
     const pi = new FakePi();
     await installDefault(pi);
 
     expect(pi.tools.map(tool => tool.name).sort()).toEqual(["learn", "manage_skill"]);
     expect(pi.handlers.get("before_agent_start")).toHaveLength(1);
+    expect(pi.handlers.get("tool_call")).toHaveLength(1);
+    expect(pi.handlers.get("input")).toHaveLength(1);
+    expect(pi.commands.has("refresh-managed-skills")).toBe(true);
+    expect(pi.commandDescriptions.get("refresh-managed-skills")).toMatch(/interactive.*rpc|rpc.*interactive/i);
+    expect(pi.commandDescriptions.get("refresh-managed-skills")).toContain("/reload-plugins");
+    expect(findTool(pi, "learn").defaultInactive).toBe(false);
+    expect(findTool(pi, "manage_skill").defaultInactive).toBe(false);
   });
 
-  test("wrappers retain essential strict write metadata and expose an optional global-or-project scope", async () => {
-    const pi = new FakePi();
+  test("schemas expose conditional group fields and retain essential strict write metadata", async () => {
+    const pi = new FakePi({ autoLearnEnabled: false, memoryBackend: "off" });
     await install(pi);
 
     for (const name of ["learn", "manage_skill"]) {
       const tool = findTool(pi, name);
       expect(tool.defaultInactive, `${name} must be default-inactive`).toBe(true);
-      expect(tool.approval, `${name} must require write approval`).toBe("write");
+      const approval = tool.approval as ((params: unknown) => unknown) | string | undefined;
+      expect(approval, `${name} must retain write approval`).toBeDefined();
+      if (typeof approval === "function") {
+        expect(approval({ skill: {} })).toBe("write");
+      } else {
+        expect(approval).toBe("write");
+      }
       expect(tool.loadMode, `${name} must remain essential`).toBe("essential");
       expect(tool.strict, `${name} must retain strict structured output`).toBe(true);
-      const scope = tool.parameters?.shape?.scope;
+      const scope = tool.parameters?.shape?.scope as SchemaNode | undefined;
       expect(scope, `${name} schema must include optional scope`).toMatchObject({ kind: "optional" });
       expect(scope?.inner).toMatchObject({ kind: "enum", values: ["global", "project"] });
     }
+
+    const learn = findTool(pi, "learn").parameters?.shape ?? {};
+    const learnSkill = learn.skill as SchemaNode;
+    const learnGroup = learnSkill.inner?.shape?.group as SchemaNode;
+    expect(learnGroup).toMatchObject({ kind: "optional" });
+    expect(learnGroup.inner).toMatchObject({ kind: "string" });
+    expect(learnGroup.inner?.description).toMatch(/required.*global/i);
+
+    const manageSkill = findTool(pi, "manage_skill").parameters?.shape ?? {};
+    const manageGroup = manageSkill.group as SchemaNode;
+    expect(manageGroup).toMatchObject({ kind: "optional" });
+    expect(manageGroup.inner).toMatchObject({ kind: "string" });
+    expect(manageGroup.inner?.description).toMatch(/required.*global/i);
   });
 
   test("extension registration and factory load through only the public host boundary", async () => {
@@ -209,9 +269,63 @@ describe("auto-learn-scope extension registration", () => {
     expect(pi.tools.every(tool => tool.name === "learn" || tool.name === "manage_skill")).toBe(true);
     expect(pi.handlers.has("before_agent_start")).toBe(true);
   });
+
+  test("disabled OMP settings keep both wrappers inactive and reject execution", async () => {
+    const pi = new FakePi({ autoLearnEnabled: false });
+    await install(pi);
+    expect(findTool(pi, "learn").defaultInactive).toBe(true);
+    expect(findTool(pi, "manage_skill").defaultInactive).toBe(true);
+
+    await expect(
+      executeTool(findTool(pi, "learn"), { memory: "Do not store this." }, makeContext(process.cwd())),
+    ).rejects.toThrow(/disabled/i);
+    await expect(
+      executeTool(
+        findTool(pi, "manage_skill"),
+        {
+          group: "blocked-group",
+          action: "create",
+          name: "blocked-skill",
+          description: "Must not write while disabled.",
+          body: "Body.",
+        },
+        makeContext(process.cwd()),
+      ),
+    ).rejects.toThrow(/disabled/i);
+  });
+
+  test("unavailable OMP settings keep wrappers inactive and reject execution", async () => {
+    const pi = new FakePi({ autoLearnEnabled: null });
+    await install(pi);
+    expect(findTool(pi, "learn").defaultInactive).toBe(true);
+    expect(findTool(pi, "manage_skill").defaultInactive).toBe(true);
+
+    await expect(
+      executeTool(findTool(pi, "learn"), { memory: "Do not store this." }, makeContext(process.cwd())),
+    ).rejects.toThrow(/setting is unavailable/i);
+    await expect(
+      executeTool(
+        findTool(pi, "manage_skill"),
+        {
+          group: "blocked-group",
+          action: "create",
+          name: "blocked-skill",
+          description: "Must not write when settings cannot be read.",
+          body: "Body.",
+        },
+        makeContext(process.cwd()),
+      ),
+    ).rejects.toThrow(/setting is unavailable/i);
+  });
+  test("default root resolution fails closed without host getAgentDir or managedRoot injection", async () => {
+    const module = await extensionModule();
+    const pi = new FakePi();
+
+    expect(() => module.installAutoLearnScope(pi as unknown as ExtensionHost)).toThrow(/getAgentDir|managedRoot/i);
+  });
 });
 
-describe("same-name wrapper delegation", () => {
+describe("native memory-only delegation", () => {
   test("learn with omitted scope delegates native learn once and removes the wrapper-only scope field", async () => {
     const { cwd } = await makeRepository();
     const pi = new FakePi();
@@ -248,51 +362,6 @@ describe("same-name wrapper delegation", () => {
     expect(input.scope).toBe("global");
   });
 
-  test("manage_skill with omitted scope delegates native manage_skill once and removes the wrapper-only scope field", async () => {
-    const { cwd } = await makeRepository();
-    const pi = new FakePi();
-    await install(pi);
-    const calls: UnknownRecord[] = [];
-    const invokeTool: NativeInvoker = async params => {
-      calls.push({ ...params });
-      return nativeResult;
-    };
-    const input = { action: "create", name: "global-skill", description: "Global procedure.", body: "Body." };
-
-    const result = await executeTool(findTool(pi, "manage_skill"), input, makeContext(cwd, invokeTool));
-
-    expect(calls).toEqual([input]);
-    expect(result).toEqual(nativeResult);
-  });
-
-  test("manage_skill with global scope delegates native manage_skill once and strips scope", async () => {
-    const { cwd } = await makeRepository();
-    const pi = new FakePi();
-    await install(pi);
-    const calls: UnknownRecord[] = [];
-    const invokeTool: NativeInvoker = async params => {
-      calls.push({ ...params });
-      return nativeResult;
-    };
-    const input = {
-      scope: "global",
-      action: "update",
-      name: "global-skill",
-      description: "Global procedure.",
-      body: "Updated body.",
-    };
-
-    const result = await executeTool(findTool(pi, "manage_skill"), input, makeContext(cwd, invokeTool));
-
-    expect(calls).toHaveLength(1);
-    expect(calls[0]).toEqual({
-      action: input.action,
-      name: input.name,
-      description: input.description,
-      body: input.body,
-    });
-    expect(result).toEqual(nativeResult);
-  });
 
   test("an unsupported scope is rejected before either native tool is invoked", async () => {
     const { cwd } = await makeRepository();
@@ -478,7 +547,7 @@ describe("project-scope wrapper behavior", () => {
 });
 
 describe("native capability gate", () => {
-  test("manage_skill project and global calls fail closed when native manage_skill is unavailable", async () => {
+  test("manage_skill project calls fail closed when native manage_skill is unavailable", async () => {
     const { root, cwd } = await makeRepository();
     const pi = new FakePi();
     await install(pi);
@@ -497,21 +566,7 @@ describe("native capability gate", () => {
         makeContext(cwd),
       ),
     ).rejects.toThrow(/native|unavailable|manage_skill|capability/i);
-    await expect(
-      executeTool(
-        tool,
-        {
-          scope: "global",
-          action: "create",
-          name: "native-global-gate",
-          description: "Must not delegate without native capability.",
-          body: "Body.",
-        },
-        makeContext(cwd),
-      ),
-    ).rejects.toThrow(/native|unavailable|manage_skill|capability/i);
     expect(await pathExists(projectSkillFile(root, "native-gate"))).toBe(false);
-    expect(await pathExists(projectSkillFile(root, "native-global-gate"))).toBe(false);
   });
 
   test("learn project and global calls fail closed when native learn is unavailable", async () => {
