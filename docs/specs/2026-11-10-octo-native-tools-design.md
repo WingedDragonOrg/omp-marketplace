@@ -14,9 +14,9 @@
 
 提供可安装的 OMP marketplace 插件，让 `read`、`write` 和 `edit` 使用 `octo://<docId>` 或 `https://im.deepminer.com.cn/d/<docId>` 操作已有 Octo 普通文档和 HTML 文档，远端访问通过 `octo-cli` 完成。普通文档以 Markdown 呈现，HTML 文档以 HTML 源码呈现。表格、白板及其他类型返回明确的不支持错误。
 
-不创建或删除文档，不改变身份、共享或权限。已有 CLI 身份选择和网关配置继续生效；身份不明确、权限不足或 CLI 失败时向调用方暴露错误。
+不创建或删除文档，不改变共享或权限。默认使用 CLI 的 `default` profile；设置 `OCTO_BOT_ID`、`OCTO_TOKEN` 或 `OCTO_BOT_TOKEN` 时，沿用 CLI 的身份优先级和网关配置。CLI task 模式保持其原有身份限制；身份不可用、权限不足或 CLI 失败时向调用方暴露错误。
 
-OMP 18.18.6 的插件设置 enum 仅支持 manifest 中的静态选项，无法在设置界面动态列出 `octo-cli` profiles；插件不添加 profile 选择，由调用者通过 CLI 的现有身份配置选择。
+OMP 18.18.6 的插件设置 enum 仅支持 manifest 中的静态选项，无法在设置界面动态列出 `octo-cli` profiles；插件不添加 profile 选择。
 
 ## 工具集成
 

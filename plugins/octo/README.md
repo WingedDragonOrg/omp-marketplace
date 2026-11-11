@@ -7,7 +7,7 @@ omp plugin marketplace add WingedDragonOrg/omp-marketplace
 omp plugin install octo@winged-dragon-org
 ```
 
-需要在运行 OMP 的环境中安装并配置 `octo-cli`。插件直接使用 CLI 的身份与网关配置；存在多个 profile 时，请在启动 OMP 前通过 `OCTO_BOT_ID` 或 CLI 支持的环境凭据选择正确身份。CLI 身份、权限和服务端错误会传给调用方。
+需要在运行 OMP 的环境中安装并配置 `octo-cli`。默认使用 CLI 的 `default` profile；设置 `OCTO_BOT_ID`、`OCTO_TOKEN` 或 `OCTO_BOT_TOKEN` 时，沿用 CLI 的环境凭据优先级。CLI 身份、权限和服务端错误会传给调用方。
 
 插件针对 OMP 18.18.7 的内部协议和原生工具接口实现；升级 OMP 后应先验证兼容性。Octo 文档的 `edit` 使用 OMP 的 hashline 模式，包含按行范围读取和快照校验。某些模型会将 hashline 自动切换为其他编辑模式；如需固定 hashline，可将 `edit.mode` 设为 `hashline` 并在启动 OMP 前设置 `PI_STRICT_EDIT_MODE=1`。
 

@@ -89,7 +89,9 @@ function throwIfAborted(signal?: AbortSignal): void {
 function runOctoCli(args: string[], input?: string, signal?: AbortSignal): Promise<unknown> {
   throwIfAborted(signal);
   return new Promise((resolve, reject) => {
-    const child = spawn("octo-cli", [...args, "--format", "json"], { stdio: ["pipe", "pipe", "pipe"], signal });
+    const identityArgs = process.env.OCTO_BOT_ID || process.env.OCTO_TOKEN || process.env.OCTO_BOT_TOKEN ||
+      process.env.OCTO_CREDENTIAL_MODE === "task" ? [] : ["--profile", "default"];
+    const child = spawn("octo-cli", [...identityArgs, ...args, "--format", "json"], { stdio: ["pipe", "pipe", "pipe"], signal });
     const mutation =
       (args[0] === "docs" && args[1] === "content" && args[2] === "edit") ||
       (args[0] === "html" && args[1] === "publish");
