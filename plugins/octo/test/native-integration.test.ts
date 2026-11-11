@@ -20,14 +20,25 @@ function startGateway() {
     ["d_octouri", { version: "v1", blocks: ["A one", "A two", "A three"] }],
     ["d_https", { version: "v1", blocks: ["H one", "H two", "H three"] }],
     ["d_write", { version: "v1", blocks: ["W original", "Keep me"] }],
+    ["d_https_write", { version: "v1", blocks: ["Original HTTPS"] }],
+    ["d_move", { version: "v1", blocks: ["Remote original"] }],
+    ["d_reverse", { version: "v1", blocks: ["Remote moved", "Remote remains"] }],
     ["d_conflict", { version: "v1", blocks: ["C original", "Untouched"] }],
     ["d_cross", { version: "v1", blocks: ["Cross visible", "Cross hidden"] }],
+    ["d_unseen", { version: "v1", blocks: ["One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight"] }],
+    ["d_cancel", { version: "v1", blocks: ["Cancel original"] }],
+    ["d_reset", { version: "v1", blocks: ["Reset original"] }],
+    ["d_toggle", { version: "v1", blocks: ["Toggle original"] }],
     ["d_device", { version: "v1", blocks: ["Device original"] }],
     ["d_denied", { version: "v1", blocks: ["Denied"] }],
     ["d_plan_write", { version: "v1", blocks: ["Plan write original"] }],
     ["d_plan_edit", { version: "v1", blocks: ["Plan edit original"] }],
   ]);
   let conflictAdvanced = false;
+  const cancellationStarted = Promise.withResolvers<void>();
+  const cancellationGate = Promise.withResolvers<void>();
+  const resetStarted = Promise.withResolvers<void>();
+  const resetGate = Promise.withResolvers<void>();
   const patches: PatchRequest[] = [];
   const unexpected: string[] = [];
   const server = Bun.serve({
@@ -35,8 +46,32 @@ function startGateway() {
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
+      if (url.pathname === "/__cancel_started") {
+        await cancellationStarted.promise;
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === "/__cancel_release" && request.method === "POST") {
+        cancellationGate.resolve();
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === "/__reset_started") {
+        await resetStarted.promise;
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === "/__reset_release" && request.method === "POST") {
+        resetGate.resolve();
+        return new Response(null, { status: 204 });
+      }
       const metadata = url.pathname.match(/^\/v1\/bot\/docs\/(d_[a-z_]+)$/);
       if (request.method === "GET" && metadata) {
+        if (metadata[1] === "d_cancel") {
+          cancellationStarted.resolve();
+          await cancellationGate.promise;
+        }
+        if (metadata[1] === "d_reset") {
+          resetStarted.resolve();
+          await resetGate.promise;
+        }
         if (!documents.has(metadata[1])) return Response.json({ error: "unknown fixture document" }, { status: 404 });
         return Response.json({ docId: metadata[1], docType: "doc", title: "Local fixture", role: "writer" });
       }
@@ -76,7 +111,7 @@ function startGateway() {
         for (const operation of body.ops ?? []) {
           const from = operation.range?.from.path;
           const to = operation.range?.to.path;
-          if (operation.type !== "replace" || !from || !to || from.length !== 1 || to.length !== 1) {
+          if ((operation.type !== "replace" && operation.type !== "delete") || !from || !to || from.length !== 1 || to.length !== 1) {
             return Response.json({ error: "unexpected fixture operation" }, { status: 400 });
           }
           document.blocks.splice(from[0], to[0] - from[0] + 1, ...(operation.content ?? []).map(textOfBlock));
@@ -101,6 +136,8 @@ test("real OMP host keeps native provenance and local/Octo read-write-edit behav
   const runtimeInitPath = resolve(import.meta.dir, "../node_modules/@oh-my-pi/pi-coding-agent/src/modes/runtime-init.ts");
 
   const hostProgram = `
+import * as settingRegistry from ${JSON.stringify(resolve(import.meta.dir, "../node_modules/@oh-my-pi/pi-coding-agent/src/config/registry.ts"))};
+import * as settingsUi from ${JSON.stringify(resolve(import.meta.dir, "../node_modules/@oh-my-pi/pi-coding-agent/src/config/settings-ui.ts"))};
 const sdk = await import(${JSON.stringify(sdkPath)});
 const runtime = await import(${JSON.stringify(runtimeInitPath)});
 const { AgentRegistry, Settings, SessionManager, createAgentSession } = sdk;
@@ -115,6 +152,7 @@ globalThis.fetch = (input, init) => {
   return realFetch(input, init);
 };
 const settings = Settings.isolated({
+  "edit.enforceSeenLines": false,
   "tools.approvalMode": "write",
   "tools.xdev": true,
   "edit.mode": "hashline",
@@ -195,11 +233,11 @@ try {
       text: (result.content || []).filter(block => typeof block.text === "string").map(block => block.text).join("\\n"),
     };
   }
-  async function invoke(name, args, callId, target = session) {
+  async function invoke(name, args, callId, target = session, signal) {
     const tool = target.getToolByName(name);
     if (!tool || typeof tool.execute !== "function") return { missing: true, isError: true, text: name + " is not registered" };
     try {
-      return flatten(await tool.execute(callId, args));
+      return flatten(await tool.execute(callId, args, signal));
     } catch (error) {
       return { isError: true, thrown: true, text: error instanceof Error ? error.message : String(error) };
     }
@@ -227,6 +265,7 @@ try {
   const editTool = session.agent.state.tools.find(candidate => candidate.name === "edit") || session.getToolByName("edit");
   const customFormat = editTool && editTool.customFormat;
   const editFormat = {
+    mode: editTool && editTool.mode || null,
     syntax: customFormat && customFormat.syntax || null,
     hasPutGrammar: !!(customFormat && typeof customFormat.definition === "string" && customFormat.definition.includes("PUT")),
   };
@@ -234,6 +273,10 @@ try {
   const result = { provenance, editFormat, local: {}, octo: {}, https: {}, xd: {} };
   result.xd.mounted = session.getMountedXdevToolNames();
   result.xd.listing = await invoke("read", { path: "xd://" }, "xd-list");
+  result.xd.device = result.xd.mounted[0] || null;
+  result.xd.deviceDocs = result.xd.device
+    ? await invoke("read", { path: "xd://" + result.xd.device }, "xd-docs")
+    : null;
 
   result.local.write = await invoke("write", { path: cwd + "/ordinary.md", content: "local first\\nlocal second\\nlocal third\\n" }, "local-write");
   result.local.read = await invoke("read", { path: cwd + "/ordinary.md" }, "local-read");
@@ -241,18 +284,35 @@ try {
 
   result.octo.path = "octo://d_octouri";
   result.octo.read = await invoke("read", { path: result.octo.path }, "octo-read");
-  const octoEditInput = patch(header(result.octo.read.text), 2, "A changed");
+  const octoEditInput = patch(header(result.octo.read.text), 3, "A changed");
   result.octo.editApproval = tier("edit", { input: octoEditInput });
   result.octo.edit = await invoke("edit", { input: octoEditInput }, "octo-edit");
-  result.octo.writeApproval = tier("write", { path: "octo://d_write", content: "Whole replacement\\nKeep me" });
-  result.octo.write = await invoke("write", { path: "octo://d_write", content: "Whole replacement\\nKeep me" }, "octo-write");
+  result.octo.writeApproval = tier("write", { path: "octo://d_write", content: "Whole replacement\\n\\nKeep me" });
+  result.octo.write = await invoke("write", { path: "octo://d_write", content: "Whole replacement\\n\\nKeep me" }, "octo-write");
 
   result.https.path = "https://im.deepminer.com.cn/d/d_https";
   result.https.read = await invoke("read", { path: result.https.path }, "https-read");
-  const httpsEditInput = patch(header(result.https.read.text), 2, "H changed");
+  const httpsEditInput = patch(header(result.https.read.text), 3, "H changed");
   result.https.readApproval = tier("read", { path: result.https.path });
   result.https.editApproval = tier("edit", { input: httpsEditInput });
   result.https.edit = await invoke("edit", { input: httpsEditInput }, "https-edit");
+  result.https.write = await invoke("write", { path: "https://im.deepminer.com.cn/d/d_https_write", content: "Updated HTTPS" }, "https-write");
+  result.move = {};
+  result.move.path = cwd + "/move.md";
+  result.move.write = await invoke("write", { path: result.move.path, content: "Moved line\\nLocal remains\\n" }, "move-write");
+  result.move.local = await invoke("read", { path: result.move.path }, "move-read-local");
+  result.move.remote = await invoke("read", { path: "octo://d_move" }, "move-read-remote");
+  const moveInput = "*** Begin Patch\\n" + header(result.move.local.text) + "\\nCUT 1.=1 @moving\\n" +
+    header(result.move.remote.text) + "\\nPUT 1.=1 @moving\\n*** End Patch";
+  result.move.edit = await invoke("edit", { input: moveInput }, "move-edit");
+  result.reverse = {};
+  result.reverse.path = cwd + "/reverse.md";
+  result.reverse.write = await invoke("write", { path: result.reverse.path, content: "Local original\\n" }, "reverse-write");
+  result.reverse.remote = await invoke("read", { path: "octo://d_reverse" }, "reverse-read-remote");
+  result.reverse.local = await invoke("read", { path: result.reverse.path }, "reverse-read-local");
+  const reverseInput = "*** Begin Patch\\n" + header(result.reverse.remote.text) + "\\nCUT 1.=1 @reverse\\n" +
+    header(result.reverse.local.text) + "\\nPUT 1.=1 @reverse\\n*** End Patch";
+  result.reverse.edit = await invoke("edit", { input: reverseInput }, "reverse-edit");
   session.setPlanModeState({ enabled: true, planFilePath: cwd + "/PLAN.md" });
   result.plan = {};
   result.plan.write = await invoke("write", { path: "octo://d_plan_write", content: "Plan write bypass" }, "plan-write");
@@ -262,8 +322,22 @@ try {
   result.conflict = {};
   result.conflict.read = await invoke("read", { path: "octo://d_conflict" }, "conflict-read");
   result.conflict.edit = await invoke("edit", { input: patch(header(result.conflict.read.text), 1, "Client stale") }, "conflict-edit");
+  result.unseen = {};
+  result.unseen.read = await invoke("read", { path: "octo://d_unseen:1-1" }, "unseen-read");
+  result.unseen.edit = await invoke("edit", { input: patch(header(result.unseen.read.text), 13, "Unseen bypass") }, "unseen-edit");
+  const cancelController = new AbortController();
+  const cancelWrite = invoke("write", { path: "octo://d_cancel", content: "Cancel bypass" }, "cancel-write", session, cancelController.signal);
+  await fetch(gateway + "/__cancel_started");
+  cancelController.abort();
+  await fetch(gateway + "/__cancel_release", { method: "POST" });
+  result.cancel = await cancelWrite;
 
   const second = await openAdditionalSession("second");
+  const resetWrite = invoke("write", { path: "octo://d_reset", content: "Reset bypass" }, "reset-write", second);
+  await fetch(gateway + "/__reset_started");
+  await second.extensionRunner.emit({ type: "session_switch", reason: "new" });
+  await fetch(gateway + "/__reset_release", { method: "POST" });
+  result.reset = await resetWrite;
   result.crossSession = {};
   result.crossSession.read = await invoke("read", { path: "octo://d_cross:1" }, "cross-session-read");
   result.crossSession.edit = await invoke(
@@ -286,12 +360,25 @@ try {
     write: await invoke("write", { path: "octo://d_device", content: "Device-only bypass" }, "device-only-write", deviceOnly),
     writeBuiltin: deviceOnly.hasBuiltInTool("write"),
   };
+  const octoSetting = settingRegistry.lookup("octo.enabled");
+  result.toggle = { entry: settingsUi.createSettingsHost().entries.find(entry => entry.path === "octo.enabled") || null };
+  if (octoSetting) {
+    result.toggle.before = await invoke("read", { path: "octo://d_toggle" }, "toggle-before");
+    octoSetting.set(settings, false);
+    result.toggle.readOff = await invoke("read", { path: "octo://d_toggle" }, "toggle-read-off");
+    result.toggle.writeOff = await invoke("write", { path: "octo://d_toggle", content: "Disabled bypass" }, "toggle-write-off");
+    result.toggle.editOff = await invoke("edit", { input: patch(header(result.toggle.before.text), 1, "Disabled edit bypass") }, "toggle-edit-off");
+    result.toggle.localOff = await invoke("read", { path: cwd + "/ordinary.md" }, "toggle-local-off");
+    octoSetting.set(settings, true);
+    result.toggle.readOn = await invoke("read", { path: "octo://d_toggle" }, "toggle-read-on");
+  }
 
 
 
   console.log("OCTO_NATIVE_HOST_RESULT " + JSON.stringify(result));
 } finally {
   for (const current of sessions.reverse()) await current.dispose();
+}
 `;
 
   try {
@@ -299,6 +386,8 @@ try {
       cwd,
       env: {
         ...process.env,
+        PI_EDIT_VARIANT: "hashline",
+        PI_STRICT_EDIT_MODE: "1",
         OCTO_NATIVE_CWD: cwd,
         OCTO_NATIVE_GATEWAY: `http://127.0.0.1:${gateway.server.port}`,
         OCTO_NATIVE_PLUGIN: pluginPath,
@@ -329,10 +418,10 @@ try {
       write: { source: "builtin", builtIn: true },
       edit: { source: "builtin", builtIn: true },
     });
-    expect(result.editFormat).toEqual({ syntax: "lark", hasPutGrammar: true });
-    expect(result.xd.mounted).toContain("ast_grep");
+    expect(result.editFormat).toEqual({ mode: "hashline", syntax: "lark", hasPutGrammar: true });
     expect(result.xd.listing.isError).toBe(false);
-    expect(result.xd.listing.text).toContain("ast_grep");
+    expect(result.xd.listing.text).toContain("xd://" + result.xd.mounted[0]);
+    expect(result.xd.deviceDocs.isError).toBe(false);
 
     expect(result.local.write.isError).toBe(false);
     expect(result.local.read.isError).toBe(false);
@@ -354,6 +443,12 @@ try {
     expect(result.https.editApproval).toBe("write");
     expect(result.https.edit.isError).toBe(false);
     expect(result.https.edit.text).toContain(result.https.path);
+    expect(result.https.write.isError).toBe(false);
+    expect(result.https.write.text).toContain("https://im.deepminer.com.cn/d/d_https_write");
+    expect(result.move.edit.isError).toBe(false);
+    expect(await readFile(join(cwd, "move.md"), "utf8")).toBe("Local remains\n");
+    expect(result.reverse.edit.isError).toBe(false);
+    expect(await readFile(join(cwd, "reverse.md"), "utf8")).toBe("Remote moved\n");
     expect(result.plan.write.isError).toBe(true);
     expect(result.plan.write.text).toMatch(/plan mode/i);
     expect(result.plan.edit.isError).toBe(true);
@@ -362,23 +457,42 @@ try {
     expect(result.conflict.edit.text).toMatch(/stale|version|base_version/i);
     expect(result.crossSession.edit.isError).toBe(true);
     expect(result.crossSession.edit.text).toMatch(/snapshot|read/i);
-    expect(result.denied.write.isError).toBe(true);
-    expect(result.denied.write.text).toMatch(/denied|deny|approval/i);
+    expect(result.cancel.isError).toBe(true);
+    expect(gateway.documents.get("d_cancel")?.blocks).toEqual(["Cancel original"]);
+    expect(gateway.patches.some(patch => patch.id === "d_cancel")).toBe(false);
+    expect(result.reset.isError).toBe(true);
+    expect(gateway.documents.get("d_reset")?.blocks).toEqual(["Reset original"]);
+    expect(gateway.patches.some(patch => patch.id === "d_reset")).toBe(false);
+    expect(result.unseen.read.text).not.toContain("Seven");
+    expect(result.unseen.edit.isError).toBe(true);
+    expect(result.unseen.edit.text).toMatch(/seen|read/i);
+    expect(result.denied.isError).toBe(true);
+    expect(result.denied.text).toMatch(/denied|deny|approval/i);
     expect(result.deviceOnly.write.isError).toBe(true);
     expect(result.deviceOnly.writeBuiltin).toBe(true);
+    expect(result.toggle.entry).toMatchObject({ type: "boolean", ui: { tab: "tools", group: "Available Tools", label: "Octo" } });
+    expect(result.toggle.readOff.isError).toBe(true);
+    expect(result.toggle.writeOff.isError).toBe(true);
+    expect(result.toggle.editOff.isError).toBe(true);
+    expect(result.toggle.localOff.isError).toBe(false);
+    expect(result.toggle.readOn.isError).toBe(false);
+    expect(gateway.documents.get("d_toggle")?.blocks).toEqual(["Toggle original"]);
 
 
 
     expect(gateway.documents.get("d_octouri")?.blocks).toEqual(["A one", "A changed", "A three"]);
     expect(gateway.documents.get("d_https")?.blocks).toEqual(["H one", "H changed", "H three"]);
     expect(gateway.documents.get("d_write")?.blocks).toEqual(["Whole replacement", "Keep me"]);
+    expect(gateway.documents.get("d_https_write")?.blocks).toEqual(["Updated HTTPS"]);
+    expect(gateway.documents.get("d_move")?.blocks).toEqual(["Moved line"]);
+    expect(gateway.documents.get("d_reverse")?.blocks).toEqual(["Remote remains"]);
     expect(gateway.documents.get("d_plan_write")?.blocks).toEqual(["Plan write original"]);
     expect(gateway.documents.get("d_plan_edit")?.blocks).toEqual(["Plan edit original"]);
     expect(gateway.documents.get("d_conflict")?.blocks).toEqual(["Remote changed", "Untouched"]);
     expect(gateway.documents.get("d_cross")?.blocks).toEqual(["Cross visible", "Cross hidden"]);
+    expect(gateway.documents.get("d_unseen")?.blocks).toEqual(["One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight"]);
     expect(gateway.documents.get("d_device")?.blocks).toEqual(["Device original"]);
     expect(gateway.documents.get("d_denied")?.blocks).toEqual(["Denied"]);
-    expect(gateway.patches.length).toBeGreaterThanOrEqual(3);
     expect(gateway.patches.some(patch => patch.id === "d_plan_write" || patch.id === "d_plan_edit")).toBe(false);
     expect(gateway.patches.some(patch => patch.id === "d_conflict" && patch.ifMatch === "v1")).toBe(true);
     expect(gateway.patches.some(patch => patch.id === "d_cross")).toBe(false);

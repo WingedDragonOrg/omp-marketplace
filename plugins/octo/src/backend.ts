@@ -72,9 +72,31 @@ const REPLACEABLE_NODE_TYPES = [
   "hardBreak",
 ];
 
-function runOctoCli(args: string[], input?: string): Promise<unknown> {
+function canceledError(signal: AbortSignal, mutationStarted = false): Error {
+  const reason = signal.reason instanceof Error ? signal.reason : new Error("The operation was aborted.");
+  if (!mutationStarted) return reason;
+  const error = new Error(
+    `${reason.message}; the write may have been written; re-read the document to verify its current state.`,
+  );
+  error.name = "AbortError";
+  return error;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw canceledError(signal);
+}
+
+function runOctoCli(args: string[], input?: string, signal?: AbortSignal): Promise<unknown> {
+  throwIfAborted(signal);
   return new Promise((resolve, reject) => {
-    const child = spawn("octo-cli", [...args, "--format", "json"], { stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn("octo-cli", [...args, "--format", "json"], { stdio: ["pipe", "pipe", "pipe"], signal });
+    const mutation =
+      (args[0] === "docs" && args[1] === "content" && args[2] === "edit") ||
+      (args[0] === "html" && args[1] === "publish");
+    let childStarted = false;
+    child.once("spawn", () => {
+      childStarted = true;
+    });
     const { stdin, stdout, stderr } = child;
     if (!stdin || !stdout || !stderr) {
       child.kill();
@@ -91,15 +113,21 @@ function runOctoCli(args: string[], input?: string): Promise<unknown> {
     stdin.on("error", (error) => {
       if ((error as NodeJS.ErrnoException).code === "EPIPE") return;
       child.kill();
-      reject(error);
+      reject(signal?.aborted ? canceledError(signal, mutation && childStarted) : error);
     });
-    child.on("error", reject);
-    child.on("close", (code, signal) => {
+    child.on("error", (error) =>
+      reject(signal?.aborted ? canceledError(signal, mutation && childStarted) : error),
+    );
+    child.on("close", (code, exitSignal) => {
       const output = stdoutParts.join("");
+      if (signal?.aborted) {
+        reject(canceledError(signal, mutation && childStarted));
+        return;
+      }
       const errors = stderrParts.join("");
       if (code !== 0) {
         const diagnostic = [output, errors].filter(Boolean).join("\n");
-        reject(new Error(diagnostic || `octo-cli exited with ${code ?? signal}`));
+        reject(new Error(diagnostic || `octo-cli exited with ${code ?? exitSignal}`));
         return;
       }
 
@@ -162,12 +190,12 @@ function snapshot(
   return immutable({ id, type, text, version, backend });
 }
 
-export async function readDocument(id: string): Promise<OctoDocument> {
-  const metadata = requireRecord(await runOctoCli(["docs", "get", id]), "document metadata");
+export async function readDocument(id: string, signal?: AbortSignal): Promise<OctoDocument> {
+  const metadata = requireRecord(await runOctoCli(["docs", "get", id], undefined, signal), "document metadata");
   const docType = metadata.docType;
 
   if (docType === "doc") {
-    const content = requireRecord(await runOctoCli(["docs", "content", "get", id]), "document content");
+    const content = requireRecord(await runOctoCli(["docs", "content", "get", id], undefined, signal), "document content");
     const version = requireString(content.baseVersion, "document baseVersion");
     const sourceDocument = asProseMirrorNode(content.doc, "document body");
     if (sourceDocument.type !== "doc") throw new Error("Octo docs.content.get returned a body that is not a ProseMirror doc");
@@ -177,7 +205,7 @@ export async function readDocument(id: string): Promise<OctoDocument> {
 
   if (docType === "html") {
     const slug = requireString(metadata.octoDocSlug, "HTML document slug from docs.get metadata");
-    const source = requireRecord(await runOctoCli(["html", "source", slug]), "HTML source");
+    const source = requireRecord(await runOctoCli(["html", "source", slug], undefined, signal), "HTML source");
     const sourceSlug = requireString(source.slug, "HTML source slug");
     if (sourceSlug !== slug) throw new Error(`Octo HTML source returned slug ${sourceSlug} for metadata slug ${slug}`);
     const version = requirePositiveInteger(source.version, "HTML source version");
@@ -186,6 +214,14 @@ export async function readDocument(id: string): Promise<OctoDocument> {
   }
 
   throw new Error(`Unsupported Octo document type "${String(docType)}"; only doc and html documents are supported.`);
+}
+
+async function assertCurrentSnapshot(document: OctoDocument, signal?: AbortSignal): Promise<void> {
+  const current = await readDocument(document.id, signal);
+  throwIfAborted(signal);
+  if (current.type !== document.type || current.version !== document.version || current.text !== document.text) {
+    throw new Error("The Octo document snapshot is stale; read the latest version before writing.");
+  }
 }
 
 function requireStringAllowEmpty(value: unknown, description: string): string {
@@ -215,8 +251,9 @@ function asProseMirrorNode(value: unknown, description: string): ProseMirrorNode
   return node;
 }
 
-export async function writeDocument(document: OctoDocument, text: string): Promise<OctoDocument> {
-  if (document.type === "html") return writeHtmlDocument(document, text);
+export async function writeDocument(document: OctoDocument, text: string, signal?: AbortSignal): Promise<OctoDocument> {
+  throwIfAborted(signal);
+  if (document.type === "html") return writeHtmlDocument(document, text, signal);
   if (document.type !== "doc") throw new Error(`Unsupported Octo document type "${String(document.type)}"`);
 
   const sourceDocument = document.backend.sourceDocument;
@@ -226,17 +263,24 @@ export async function writeDocument(document: OctoDocument, text: string): Promi
   if (typeof document.version !== "string" || document.version.length === 0) {
     throw new Error("The Octo document snapshot is missing its docs baseVersion.");
   }
-  if (text === document.text) return document;
+  if (text === document.text) {
+    await assertCurrentSnapshot(document, signal);
+    return document;
+  }
 
   const sourceBlocks = contentOf(sourceDocument);
   const targetBlocks = parseMarkdown(text);
   const patches = calculatePatches(sourceBlocks, targetBlocks);
-  if (patches.length === 0) return document;
+  if (patches.length === 0) {
+    await assertCurrentSnapshot(document, signal);
+    return document;
+  }
 
   const operations = patches
     .slice()
     .sort((left, right) => right.oldStart - left.oldStart)
     .map((patch) => blockOperation(patch, sourceBlocks, targetBlocks));
+  throwIfAborted(signal);
   const response = requireRecord(
     await runOctoCli([
       "docs",
@@ -247,7 +291,7 @@ export async function writeDocument(document: OctoDocument, text: string): Promi
       document.version,
       "--data",
       "@-",
-    ], JSON.stringify({ ops: operations })),
+    ], JSON.stringify({ ops: operations }), signal),
     "document edit response",
   );
   const version = requireString(response.baseVersion, "updated document baseVersion");
@@ -258,7 +302,7 @@ export async function writeDocument(document: OctoDocument, text: string): Promi
   });
 }
 
-async function writeHtmlDocument(document: OctoDocument, text: string): Promise<OctoDocument> {
+async function writeHtmlDocument(document: OctoDocument, text: string, signal?: AbortSignal): Promise<OctoDocument> {
   const slug = document.backend.slug;
   if (typeof slug !== "string" || slug.length === 0) {
     throw new Error("The Octo HTML snapshot is missing its metadata-provided document slug.");
@@ -266,16 +310,20 @@ async function writeHtmlDocument(document: OctoDocument, text: string): Promise<
   if (typeof document.version !== "number" || !Number.isInteger(document.version) || document.version < 1) {
     throw new Error("The Octo HTML snapshot is missing its source version.");
   }
-  if (text === document.text) return document;
+  if (text === document.text) {
+    await assertCurrentSnapshot(document, signal);
+    return document;
+  }
 
   const version = document.version + 1;
+  throwIfAborted(signal);
   const response = requireRecord(
     await runOctoCli([
       "html",
       "publish",
       "--data",
       "@-",
-    ], JSON.stringify({ html: text, slug, version })),
+    ], JSON.stringify({ html: text, slug, version }), signal),
     "HTML publish response",
   );
   const responseSlug = requireString(response.slug, "HTML publish slug");
@@ -750,6 +798,20 @@ function parseInline(text: string, inheritedMarks: ProseMirrorMark[] = []): Pros
       }
     }
 
+    if (text.startsWith("***", index) || text.startsWith("___", index)) {
+      const delimiter = text.slice(index, index + 3);
+      const close = findUnescaped(text, delimiter, index + delimiter.length);
+      if (close > index + delimiter.length) {
+        nodes.push(...parseInline(text.slice(index + delimiter.length, close), [
+          ...inheritedMarks,
+          { type: "strong" },
+          { type: "em" },
+        ]));
+        index = close + delimiter.length;
+        continue;
+      }
+    }
+
     let delimiter: string | undefined;
     let mark: ProseMirrorMark | undefined;
     if (text.startsWith("**", index) || text.startsWith("__", index)) {
@@ -969,7 +1031,7 @@ function assertReplaceable(node: ProseMirrorNode): void {
   }
 
   const allowed = REPLACEABLE_NODE_ATTRS[node.type] ?? [];
-  if (node.attrs && Object.keys(node.attrs).some((key) => !allowed.includes(key))) {
+  if (node.attrs && Object.entries(node.attrs).some(([key, value]) => value !== null && !allowed.includes(key))) {
     throw new Error(`Changing ProseMirror ${node.type} would discard formatting not representable in Markdown.`);
   }
   if (node.type === "text") {
