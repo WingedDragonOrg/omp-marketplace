@@ -18,6 +18,7 @@ function textOfBlock(value: { type?: string; content?: Array<{ text?: string }> 
 function startGateway() {
   const documents = new Map<string, FixtureDocument>([
     ["d_octouri", { version: "v1", blocks: ["A one", "A two", "A three"] }],
+    ["d_legacy", { version: "v1", blocks: ["Legacy path must stay closed"] }],
     ["d_https", { version: "v1", blocks: ["H one", "H two", "H three"] }],
     ["d_write", { version: "v1", blocks: ["W original", "Keep me"] }],
     ["d_https_write", { version: "v1", blocks: ["Original HTTPS"] }],
@@ -41,11 +42,13 @@ function startGateway() {
   const resetGate = Promise.withResolvers<void>();
   const patches: PatchRequest[] = [];
   const unexpected: string[] = [];
+  const docsRequests: string[] = [];
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
+      if (url.pathname.startsWith("/v1/bot/docs/")) docsRequests.push(`${request.method} ${url.pathname}`);
       if (url.pathname === "/__cancel_started") {
         await cancellationStarted.promise;
         return new Response(null, { status: 204 });
@@ -124,7 +127,7 @@ function startGateway() {
       return new Response("unexpected local gateway request", { status: 404 });
     },
   });
-  return { server, documents, patches, unexpected };
+  return { server, documents, patches, unexpected, docsRequests };
 }
 
 test("real OMP host keeps native provenance and local/Octo read-write-edit behavior", async () => {
@@ -270,7 +273,7 @@ try {
     hasPutGrammar: !!(customFormat && typeof customFormat.definition === "string" && customFormat.definition.includes("PUT")),
   };
 
-  const result = { provenance, editFormat, local: {}, octo: {}, https: {}, xd: {} };
+  const result = { provenance, editFormat, local: {}, octo: {}, https: {}, legacy: {}, loop: {}, xd: {} };
   result.xd.mounted = session.getMountedXdevToolNames();
   result.xd.listing = await invoke("read", { path: "xd://" }, "xd-list");
   result.xd.device = result.xd.mounted[0] || null;
@@ -282,13 +285,22 @@ try {
   result.local.read = await invoke("read", { path: cwd + "/ordinary.md" }, "local-read");
   result.local.edit = await invoke("edit", { input: patch(header(result.local.read.text), 2, "local changed") }, "local-edit");
 
-  result.octo.path = "octo://d_octouri";
+  result.octo.path = "octo://docs/d_octouri";
   result.octo.read = await invoke("read", { path: result.octo.path }, "octo-read");
+  if (result.octo.read.isError) throw new Error("Docs URI read failed (" + result.octo.path + "): " + result.octo.read.text);
+  result.octo.readApproval = tier("read", { path: result.octo.path });
+  result.octo.httpsRead = await invoke("read", { path: "https://im.deepminer.com.cn/d/d_octouri" }, "octo-https-read");
   const octoEditInput = patch(header(result.octo.read.text), 3, "A changed");
   result.octo.editApproval = tier("edit", { input: octoEditInput });
   result.octo.edit = await invoke("edit", { input: octoEditInput }, "octo-edit");
-  result.octo.writeApproval = tier("write", { path: "octo://d_write", content: "Whole replacement\\n\\nKeep me" });
-  result.octo.write = await invoke("write", { path: "octo://d_write", content: "Whole replacement\\n\\nKeep me" }, "octo-write");
+  result.octo.httpsAfterEdit = await invoke("read", { path: "https://im.deepminer.com.cn/d/d_octouri" }, "octo-https-after-edit");
+  result.octo.writeApproval = tier("write", { path: "octo://docs/d_write", content: "Whole replacement\\n\\nKeep me" });
+  result.octo.write = await invoke("write", { path: "octo://docs/d_write", content: "Whole replacement\\n\\nKeep me" }, "octo-write");
+  result.legacy = { path: "octo://d_legacy" };
+  result.legacy.read = await invoke("read", { path: result.legacy.path }, "legacy-read");
+  result.legacy.write = await invoke("write", { path: result.legacy.path, content: "Legacy write must stay closed" }, "legacy-write");
+  result.legacy.edit = await invoke("edit", { input: patch("[octo://d_legacy#0000]", 1, "Legacy edit must stay closed") }, "legacy-edit");
+  result.loop = await invoke("read", { path: "octo://loop/d_loop" }, "loop-not-doc");
 
   result.https.path = "https://im.deepminer.com.cn/d/d_https";
   result.https.read = await invoke("read", { path: result.https.path }, "https-read");
@@ -301,45 +313,45 @@ try {
   result.move.path = cwd + "/move.md";
   result.move.write = await invoke("write", { path: result.move.path, content: "Moved line\\nLocal remains\\n" }, "move-write");
   result.move.local = await invoke("read", { path: result.move.path }, "move-read-local");
-  result.move.remote = await invoke("read", { path: "octo://d_move" }, "move-read-remote");
+  result.move.remote = await invoke("read", { path: "octo://docs/d_move" }, "move-read-remote");
   const moveInput = "*** Begin Patch\\n" + header(result.move.local.text) + "\\nCUT 1.=1 @moving\\n" +
     header(result.move.remote.text) + "\\nPUT 1.=1 @moving\\n*** End Patch";
   result.move.edit = await invoke("edit", { input: moveInput }, "move-edit");
   result.reverse = {};
   result.reverse.path = cwd + "/reverse.md";
   result.reverse.write = await invoke("write", { path: result.reverse.path, content: "Local original\\n" }, "reverse-write");
-  result.reverse.remote = await invoke("read", { path: "octo://d_reverse" }, "reverse-read-remote");
+  result.reverse.remote = await invoke("read", { path: "octo://docs/d_reverse" }, "reverse-read-remote");
   result.reverse.local = await invoke("read", { path: result.reverse.path }, "reverse-read-local");
   const reverseInput = "*** Begin Patch\\n" + header(result.reverse.remote.text) + "\\nCUT 1.=1 @reverse\\n" +
     header(result.reverse.local.text) + "\\nPUT 1.=1 @reverse\\n*** End Patch";
   result.reverse.edit = await invoke("edit", { input: reverseInput }, "reverse-edit");
   session.setPlanModeState({ enabled: true, planFilePath: cwd + "/PLAN.md" });
   result.plan = {};
-  result.plan.write = await invoke("write", { path: "octo://d_plan_write", content: "Plan write bypass" }, "plan-write");
-  result.plan.read = await invoke("read", { path: "octo://d_plan_edit" }, "plan-edit-read");
+  result.plan.write = await invoke("write", { path: "octo://docs/d_plan_write", content: "Plan write bypass" }, "plan-write");
+  result.plan.read = await invoke("read", { path: "octo://docs/d_plan_edit" }, "plan-edit-read");
   result.plan.edit = await invoke("edit", { input: patch(header(result.plan.read.text), 1, "Plan edit bypass") }, "plan-edit");
   session.setPlanModeState(undefined);
   result.conflict = {};
-  result.conflict.read = await invoke("read", { path: "octo://d_conflict" }, "conflict-read");
+  result.conflict.read = await invoke("read", { path: "octo://docs/d_conflict" }, "conflict-read");
   result.conflict.edit = await invoke("edit", { input: patch(header(result.conflict.read.text), 1, "Client stale") }, "conflict-edit");
   result.unseen = {};
-  result.unseen.read = await invoke("read", { path: "octo://d_unseen:1-1" }, "unseen-read");
+  result.unseen.read = await invoke("read", { path: "octo://docs/d_unseen:1-1" }, "unseen-read");
   result.unseen.edit = await invoke("edit", { input: patch(header(result.unseen.read.text), 13, "Unseen bypass") }, "unseen-edit");
   const cancelController = new AbortController();
-  const cancelWrite = invoke("write", { path: "octo://d_cancel", content: "Cancel bypass" }, "cancel-write", session, cancelController.signal);
+  const cancelWrite = invoke("write", { path: "octo://docs/d_cancel", content: "Cancel bypass" }, "cancel-write", session, cancelController.signal);
   await fetch(gateway + "/__cancel_started");
   cancelController.abort();
   await fetch(gateway + "/__cancel_release", { method: "POST" });
   result.cancel = await cancelWrite;
 
   const second = await openAdditionalSession("second");
-  const resetWrite = invoke("write", { path: "octo://d_reset", content: "Reset bypass" }, "reset-write", second);
+  const resetWrite = invoke("write", { path: "octo://docs/d_reset", content: "Reset bypass" }, "reset-write", second);
   await fetch(gateway + "/__reset_started");
   await second.extensionRunner.emit({ type: "session_switch", reason: "new" });
   await fetch(gateway + "/__reset_release", { method: "POST" });
   result.reset = await resetWrite;
   result.crossSession = {};
-  result.crossSession.read = await invoke("read", { path: "octo://d_cross:1" }, "cross-session-read");
+  result.crossSession.read = await invoke("read", { path: "octo://docs/d_cross:1" }, "cross-session-read");
   result.crossSession.edit = await invoke(
     "edit",
     { input: patch(header(result.crossSession.read.text), 1, "Cross-session write") },
@@ -353,24 +365,24 @@ try {
     xdev: false,
     toolNames: ["read", "write", "edit"],
   });
-  result.denied = await invoke("write", { path: "octo://d_denied", content: "Permission bypass" }, "denied-write", denied);
+  result.denied = await invoke("write", { path: "octo://docs/d_denied", content: "Permission bypass" }, "denied-write", denied);
 
   const deviceOnly = await openAdditionalSession("device-only", { toolNames: ["read"], xdev: true });
   result.deviceOnly = {
-    write: await invoke("write", { path: "octo://d_device", content: "Device-only bypass" }, "device-only-write", deviceOnly),
+    write: await invoke("write", { path: "octo://docs/d_device", content: "Device-only bypass" }, "device-only-write", deviceOnly),
     writeBuiltin: deviceOnly.hasBuiltInTool("write"),
   };
   const octoSetting = settingRegistry.lookup("octo.enabled");
   result.toggle = { entry: settingsUi.createSettingsHost().entries.find(entry => entry.path === "octo.enabled") || null };
   if (octoSetting) {
-    result.toggle.before = await invoke("read", { path: "octo://d_toggle" }, "toggle-before");
+    result.toggle.before = await invoke("read", { path: "octo://docs/d_toggle" }, "toggle-before");
     octoSetting.set(settings, false);
-    result.toggle.readOff = await invoke("read", { path: "octo://d_toggle" }, "toggle-read-off");
-    result.toggle.writeOff = await invoke("write", { path: "octo://d_toggle", content: "Disabled bypass" }, "toggle-write-off");
+    result.toggle.readOff = await invoke("read", { path: "octo://docs/d_toggle" }, "toggle-read-off");
+    result.toggle.writeOff = await invoke("write", { path: "octo://docs/d_toggle", content: "Disabled bypass" }, "toggle-write-off");
     result.toggle.editOff = await invoke("edit", { input: patch(header(result.toggle.before.text), 1, "Disabled edit bypass") }, "toggle-edit-off");
     result.toggle.localOff = await invoke("read", { path: cwd + "/ordinary.md" }, "toggle-local-off");
     octoSetting.set(settings, true);
-    result.toggle.readOn = await invoke("read", { path: "octo://d_toggle" }, "toggle-read-on");
+    result.toggle.readOn = await invoke("read", { path: "octo://docs/d_toggle" }, "toggle-read-on");
   }
 
 
@@ -429,13 +441,28 @@ try {
     expect(await readFile(localFile, "utf8")).toBe("local first\nlocal changed\nlocal third\n");
 
     expect(result.octo.read.isError).toBe(false);
+    expect(result.octo.readApproval).toBe("read");
+    expect(result.octo.read.text).toContain("A one");
+    expect(result.octo.httpsRead.isError).toBe(false);
+    expect(result.octo.httpsRead.text).toContain("A one");
+    expect(result.octo.httpsAfterEdit.isError).toBe(false);
+    expect(result.octo.httpsAfterEdit.text).toContain("A changed");
     expect(result.octo.read.text).toContain(result.octo.path);
     expect(result.octo.editApproval).toBe("write");
     expect(result.octo.edit.isError).toBe(false);
     expect(result.octo.edit.text).toContain(result.octo.path);
     expect(result.octo.writeApproval).toBe("write");
     expect(result.octo.write.isError).toBe(false);
-    expect(result.octo.write.text).toContain("octo://d_write");
+    expect(result.octo.write.text).toContain("octo://docs/d_write");
+    expect(result.legacy.read.isError).toBe(true);
+    expect(result.legacy.read.text).toMatch(/octo:\/\/d_legacy|unsupported|not supported|invalid/i);
+    expect(result.legacy.write.isError).toBe(true);
+    expect(result.legacy.write.text).toMatch(/octo:\/\/d_legacy|octo:\/\/docs|unsupported|invalid/i);
+    expect(result.legacy.edit.isError).toBe(true);
+    expect(result.legacy.edit.text).toMatch(/octo:\/\/d_legacy|octo:\/\/docs|unsupported|invalid/i);
+    expect(result.loop.isError).toBe(true);
+    expect(gateway.docsRequests.some(request => /d_legacy|d_loop|\/docs\/loop|not-a-doc/.test(request))).toBe(false);
+    expect(gateway.docsRequests.some(request => request.includes("d_octouri"))).toBe(true);
 
     expect(result.https.read.isError).toBe(false);
     expect(result.https.read.text).toContain(result.https.path);

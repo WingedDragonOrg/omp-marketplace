@@ -21,7 +21,7 @@ test("Octo reads use default profile unless an environment identity is configure
       return new Response("unexpected request", { status: 404 });
     },
   });
-  const env = { ...process.env, HOME: home, OCTO_API_BASE_URL: `http://127.0.0.1:${server.port}` };
+  const env: Record<string, string | undefined> = { ...process.env, HOME: home, OCTO_API_BASE_URL: `http://127.0.0.1:${server.port}` };
   delete env.OCTO_TOKEN;
   delete env.OCTO_BOT_TOKEN;
   delete env.OCTO_BOT_ID;

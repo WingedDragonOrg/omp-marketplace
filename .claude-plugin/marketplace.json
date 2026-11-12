@@ -234,11 +234,11 @@
     },
     {
       "name": "octo",
-      "description": "Read and edit Octo documents using native Oh My Pi tools",
+      "description": "Read and edit Octo documents and Loop comments using native Oh My Pi tools",
       "source": "./octo",
       "version": "1.0.0",
       "category": "development",
-      "keywords": ["octo", "documents", "read", "edit"],
+      "keywords": ["octo", "documents", "loop", "read", "edit"],
       "author": {
         "name": "WingedDragonOrg"
       },

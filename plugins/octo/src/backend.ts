@@ -72,86 +72,241 @@ const REPLACEABLE_NODE_TYPES = [
   "hardBreak",
 ];
 
-function canceledError(signal: AbortSignal, mutationStarted = false): Error {
+export type OctoCliFailureCertainty = "rejected" | "unknown";
+
+export interface OctoCliEnvelope<T = unknown> {
+  readonly ok: true;
+  readonly data: T;
+  readonly identity?: unknown;
+  readonly _pagination?: unknown;
+  readonly [key: string]: unknown;
+}
+
+export interface OctoCliEnvironment {
+  readonly values: Readonly<Record<string, string | undefined>>;
+  readonly replaceOcto?: boolean;
+}
+
+export class OctoCliError extends Error {
+  readonly certainty: OctoCliFailureCertainty;
+  readonly errorType?: string;
+  readonly diagnostics: string;
+
+  constructor(
+    diagnostics: string,
+    certainty: OctoCliFailureCertainty,
+    errorType?: string,
+    name = "OctoCliError",
+  ) {
+    super(diagnostics);
+    this.name = name;
+    this.certainty = certainty;
+    this.errorType = errorType;
+    this.diagnostics = diagnostics;
+  }
+}
+
+function mutationResource(args: readonly string[]): "document" | "comment" | undefined {
+  if (
+    (args[0] === "docs" && args[1] === "content" && args[2] === "edit") ||
+    (args[0] === "html" && args[1] === "publish")
+  ) {
+    return "document";
+  }
+  if (
+    (args[0] === "loop" && args[1] === "task" && args[2] === "comment" && args[3] === "create") ||
+    (args[0] === "loop" && args[1] === "comment" && args[2] === "update")
+  ) {
+    return "comment";
+  }
+  return undefined;
+}
+
+function canceledError(
+  signal: AbortSignal,
+  mutationStarted = false,
+  resource?: "document" | "comment",
+  diagnostics = "",
+): Error {
   const reason = signal.reason instanceof Error ? signal.reason : new Error("The operation was aborted.");
-  if (!mutationStarted) return reason;
-  const error = new Error(
-    `${reason.message}; the write may have been written; re-read the document to verify its current state.`,
+  if (!resource) return reason;
+  if (!mutationStarted) {
+    return new OctoCliError(`${reason.message}; the write was not started.`, "rejected", undefined, "AbortError");
+  }
+  const detail = diagnostics ? ` CLI diagnostics: ${diagnostics}` : "";
+  if (resource === "document") {
+    return new OctoCliError(
+      `${reason.message}${detail}; the write may have been written; re-read the document to verify its current state.`,
+      "unknown",
+      undefined,
+      "AbortError",
+    );
+  }
+  return new OctoCliError(
+    `${reason.message}${detail}; the comment write may have been submitted; re-read the comment to verify its current state.`,
+    "unknown",
+    undefined,
+    "AbortError",
   );
-  error.name = "AbortError";
-  return error;
 }
 
-function throwIfAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) throw canceledError(signal);
+function throwIfAborted(signal?: AbortSignal, resource?: "document" | "comment"): void {
+  if (signal?.aborted) throw canceledError(signal, false, resource);
 }
 
-function runOctoCli(args: string[], input?: string, signal?: AbortSignal): Promise<unknown> {
-  throwIfAborted(signal);
-  return new Promise((resolve, reject) => {
-    const identityArgs = process.env.OCTO_BOT_ID || process.env.OCTO_TOKEN || process.env.OCTO_BOT_TOKEN ||
-      process.env.OCTO_CREDENTIAL_MODE === "task" ? [] : ["--profile", "default"];
-    const child = spawn("octo-cli", [...identityArgs, ...args, "--format", "json"], { stdio: ["pipe", "pipe", "pipe"], signal });
-    const mutation =
-      (args[0] === "docs" && args[1] === "content" && args[2] === "edit") ||
-      (args[0] === "html" && args[1] === "publish");
-    let childStarted = false;
-    child.once("spawn", () => {
-      childStarted = true;
-    });
-    const { stdin, stdout, stderr } = child;
-    if (!stdin || !stdout || !stderr) {
-      child.kill();
-      reject(new Error("Could not open octo-cli process streams."));
+function errorTypeFromEnvelope(value: unknown): string | undefined {
+  if (!isRecord(value) || !isRecord(value.error)) return undefined;
+  return typeof value.error.type === "string" ? value.error.type : undefined;
+}
+
+function outputErrorDiagnostic(output: string): string {
+  try {
+    const value: unknown = JSON.parse(output);
+    if (isRecord(value) && "error" in value) return JSON.stringify(value.error);
+    return typeof value === "string" ? value : "";
+  } catch {
+    return output;
+  }
+}
+
+
+function cliFailure(
+  diagnostics: string,
+  errorType: string | undefined,
+  mutation: boolean,
+): OctoCliError {
+  const confirmedRejection =
+    errorType === "auth_error" || errorType === "permission" || errorType === "validation";
+  return new OctoCliError(diagnostics, mutation && !confirmedRejection ? "unknown" : "rejected", errorType);
+}
+
+export function runOctoCliEnvelope(
+  args: string[],
+  input?: string,
+  signal?: AbortSignal,
+  environment?: OctoCliEnvironment,
+): Promise<OctoCliEnvelope> {
+  const resource = mutationResource(args);
+  throwIfAborted(signal, resource);
+  const mutation = resource !== undefined;
+  const { promise, resolve, reject } = Promise.withResolvers<OctoCliEnvelope>();
+  const childEnv = environment ? { ...process.env } : undefined;
+  if (childEnv && environment?.replaceOcto) {
+    for (const key of Object.keys(childEnv)) {
+      if (key.startsWith("OCTO_")) delete childEnv[key];
+    }
+  }
+  if (childEnv && environment) {
+    for (const [key, value] of Object.entries(environment.values)) {
+      if (value === undefined) delete childEnv[key];
+      else childEnv[key] = value;
+    }
+  }
+  const cliEnv = childEnv ?? process.env;
+  const identityArgs = cliEnv.OCTO_BOT_ID || cliEnv.OCTO_TOKEN || cliEnv.OCTO_BOT_TOKEN ||
+    cliEnv.OCTO_CREDENTIAL_MODE === "task" ? [] : ["--profile", "default"];
+  const retryArgs = args[0] === "loop" && mutation ? ["--no-retry"] : [];
+  const child = spawn("octo-cli", [...identityArgs, ...args, ...retryArgs, "--format", "json"], {
+    stdio: ["pipe", "pipe", "pipe"],
+    signal,
+    env: childEnv,
+  });
+  let childStarted = false;
+  child.once("spawn", () => {
+    childStarted = true;
+  });
+  const { stdin, stdout, stderr } = child;
+  if (!stdin || !stdout || !stderr) {
+    child.kill();
+    reject(new OctoCliError("Could not open octo-cli process streams.", "rejected"));
+    return promise;
+  }
+
+  const stdoutParts: string[] = [];
+  const stderrParts: string[] = [];
+  stdout.setEncoding("utf8");
+  stderr.setEncoding("utf8");
+  stdout.on("data", (chunk: string) => stdoutParts.push(chunk));
+  stderr.on("data", (chunk: string) => stderrParts.push(chunk));
+  stdin.on("error", (error) => {
+    if ((error as NodeJS.ErrnoException).code === "EPIPE") return;
+    child.kill();
+    reject(
+      signal?.aborted
+        ? canceledError(
+          signal,
+          mutation && childStarted,
+          resource,
+          [outputErrorDiagnostic(stdoutParts.join("")), stderrParts.join("")].filter(Boolean).join("\n"),
+        )
+        : cliFailure(error.message, undefined, mutation && childStarted),
+    );
+  });
+  child.on("error", (error) =>
+    reject(
+      signal?.aborted
+        ? canceledError(
+          signal,
+          mutation && childStarted,
+          resource,
+          [outputErrorDiagnostic(stdoutParts.join("")), stderrParts.join("")].filter(Boolean).join("\n"),
+        )
+        : cliFailure(error.message, undefined, mutation && childStarted),
+    ),
+  );
+  child.on("close", (code, exitSignal) => {
+    const output = stdoutParts.join("");
+    if (signal?.aborted) {
+      reject(canceledError(
+        signal,
+        mutation && childStarted,
+        resource,
+        [outputErrorDiagnostic(output), stderrParts.join("")].filter(Boolean).join("\n"),
+      ));
+      return;
+    }
+    const errors = stderrParts.join("");
+    let envelope: unknown;
+    try {
+      envelope = JSON.parse(output);
+    } catch {
+      const diagnostic = code === 0
+        ? [`octo-cli returned invalid JSON: ${output}`, errors].filter(Boolean).join("\n")
+        : [output, errors].filter(Boolean).join("\n") || `octo-cli exited with ${code ?? exitSignal}`;
+      reject(cliFailure(diagnostic, undefined, mutation && childStarted));
       return;
     }
 
-    const stdoutParts: string[] = [];
-    const stderrParts: string[] = [];
-    stdout.setEncoding("utf8");
-    stderr.setEncoding("utf8");
-    stdout.on("data", (chunk: string) => stdoutParts.push(chunk));
-    stderr.on("data", (chunk: string) => stderrParts.push(chunk));
-    stdin.on("error", (error) => {
-      if ((error as NodeJS.ErrnoException).code === "EPIPE") return;
-      child.kill();
-      reject(signal?.aborted ? canceledError(signal, mutation && childStarted) : error);
-    });
-    child.on("error", (error) =>
-      reject(signal?.aborted ? canceledError(signal, mutation && childStarted) : error),
-    );
-    child.on("close", (code, exitSignal) => {
-      const output = stdoutParts.join("");
-      if (signal?.aborted) {
-        reject(canceledError(signal, mutation && childStarted));
-        return;
-      }
-      const errors = stderrParts.join("");
-      if (code !== 0) {
-        const diagnostic = [output, errors].filter(Boolean).join("\n");
-        reject(new Error(diagnostic || `octo-cli exited with ${code ?? exitSignal}`));
-        return;
-      }
-
-      let envelope: unknown;
-      try {
-        envelope = JSON.parse(output);
-      } catch {
-        const diagnostic = [`octo-cli returned invalid JSON: ${output}`, errors].filter(Boolean).join("\n");
-        reject(new Error(diagnostic));
-        return;
-      }
-      if (!isRecord(envelope) || envelope.ok !== true || !("data" in envelope)) {
-        reject(new Error([JSON.stringify(envelope), errors].filter(Boolean).join("\n")));
-        return;
-      }
-      resolve(envelope.data);
-    });
-    stdin.end(input ?? "");
+    const errorDiagnostic = isRecord(envelope)
+      ? "error" in envelope ? JSON.stringify(envelope.error) : "octo-cli returned an error without diagnostics"
+      : typeof envelope === "string" ? envelope : JSON.stringify(envelope);
+    if (code !== 0) {
+      const diagnostic = [errorDiagnostic, errors].filter(Boolean).join("\n") ||
+        `octo-cli exited with ${code ?? exitSignal}`;
+      reject(cliFailure(diagnostic, errorTypeFromEnvelope(envelope), mutation && childStarted));
+      return;
+    }
+    if (!isRecord(envelope) || envelope.ok !== true || !("data" in envelope)) {
+      const diagnostic = [
+        isRecord(envelope) && "error" in envelope
+          ? JSON.stringify(envelope.error)
+          : "octo-cli returned an invalid response envelope",
+        errors,
+      ].filter(Boolean).join("\n");
+      reject(cliFailure(diagnostic, errorTypeFromEnvelope(envelope), mutation && childStarted));
+      return;
+    }
+    resolve(envelope as OctoCliEnvelope);
   });
+  stdin.end(input ?? "");
+  return promise;
 }
 
-function isRecord(value: unknown): value is JsonRecord {
+function runOctoCli(args: string[], input?: string, signal?: AbortSignal): Promise<unknown> {
+  return runOctoCliEnvelope(args, input, signal).then((envelope) => envelope.data);
+}
+
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 

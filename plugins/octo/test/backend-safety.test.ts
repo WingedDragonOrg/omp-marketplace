@@ -18,7 +18,7 @@ const savedEnv = new Map<string, string | undefined>([
 const temporaryRoots: string[] = [];
 
 const fakeCli = `
-import { appendFileSync, existsSync, readFileSync, watch, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, renameSync, watch, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 
 const args = process.argv.slice(2);
@@ -81,7 +81,8 @@ async function main() {
     respond(state.htmlSource);
   } else if (hasSequence("docs", "content", "edit")) {
     const request = await requestBody();
-    writeFileSync(process.env.OMP_OCTO_BACKEND_SAFETY_REQUEST, JSON.stringify(request));
+    writeFileSync(process.env.OMP_OCTO_BACKEND_SAFETY_REQUEST + ".tmp", JSON.stringify(request));
+    renameSync(process.env.OMP_OCTO_BACKEND_SAFETY_REQUEST + ".tmp", process.env.OMP_OCTO_BACKEND_SAFETY_REQUEST);
     if (flagValue("--base-version") !== state.content.baseVersion) {
       process.stderr.write("base_version_stale: remote body changed after this snapshot\\n");
       process.exitCode = 2;
@@ -91,7 +92,8 @@ async function main() {
     respond(state.editResult);
   } else if (hasSequence("html", "publish")) {
     const request = await requestBody();
-    writeFileSync(process.env.OMP_OCTO_BACKEND_SAFETY_REQUEST, JSON.stringify(request));
+    writeFileSync(process.env.OMP_OCTO_BACKEND_SAFETY_REQUEST + ".tmp", JSON.stringify(request));
+    renameSync(process.env.OMP_OCTO_BACKEND_SAFETY_REQUEST + ".tmp", process.env.OMP_OCTO_BACKEND_SAFETY_REQUEST);
     if (request.version !== state.htmlSource.version + 1) {
       process.stderr.write("html_version_stale: remote source changed after this snapshot\\n");
       process.exitCode = 2;

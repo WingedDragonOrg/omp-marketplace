@@ -1,10 +1,12 @@
+import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolArgStream, AgentToolArgStreamInit } from "@oh-my-pi/pi-agent-core";
+import type { AgentToolArgStream, AgentToolArgStreamInit, AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import {
   EditSession,
+  EditStore,
   type EditApplyOutcome,
   type EditPolicy,
   type EditPreviewBatch,
@@ -12,6 +14,7 @@ import {
   type EditWriteRequest,
 } from "@oh-my-pi/pi-natives";
 import { DEFAULT_MAX_COLUMN } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import type { EditToolDetails } from "@oh-my-pi/pi-tui/tools/edit";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { orderedSettings } from "@oh-my-pi/pi-coding-agent/config/all-settings";
 import { lookup, register } from "@oh-my-pi/pi-coding-agent/config/registry";
@@ -22,14 +25,33 @@ import {
   cfgEditFuzzyThreshold,
 } from "@oh-my-pi/pi-coding-agent/edit/settings";
 import { getEditStore } from "@oh-my-pi/pi-coding-agent/edit/store";
-import { InternalUrlRouter, type InternalResource, type InternalUrl, type ProtocolHandler, type ResolveContext, type WriteContext } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { InternalUrlRouter, type InternalResource, type InternalUrl, type InternalWriteResult, type ProtocolHandler, type ResolveContext, type WriteContext } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { sessionResolveContext } from "@oh-my-pi/pi-coding-agent/internal-urls/context";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
+import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { enforcePlanModeWrite } from "@oh-my-pi/pi-coding-agent/tools/plan-mode-guard";
 import { resolveOutputMaxColumns } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 
-import { readDocument, writeDocument, type OctoDocument } from "./backend.ts";
+import {
+  createLoopComment,
+  currentLoopIdentity,
+  LoopMutationConfirmedCleanupError,
+  LoopMutationConfirmedResponseError,
+  LoopMutationOutcomeUnknownError,
+  previewLoopComment,
+  readLoopComment,
+  readLoopComments,
+  readLoopTask,
+  readLoopTasks,
+  readLoopWorkspaces,
+  sameLoopIdentity,
+  updateLoopComment,
+  type LoopCommentPreview,
+  type LoopCommentPreviewInput,
+  type LoopCommentSnapshot,
+} from "./loop-backend.ts";
+import { isRecord, readDocument, writeDocument, type OctoDocument } from "./backend.ts";
 
 const octoEnabled = lookup("octo.enabled") ?? register({
   id: "octo.enabled",
@@ -66,13 +88,200 @@ type OctoTarget = {
   source: "octo" | "https";
   selector?: string;
 };
+type LoopRoute =
+  | { kind: "workspaces"; canonicalPath: string }
+  | { kind: "tasks"; workspaceId: string; canonicalPath: string }
+  | { kind: "task"; workspaceId: string; taskId: string; canonicalPath: string }
+  | { kind: "comments"; workspaceId: string; taskId: string; canonicalPath: string }
+  | { kind: "comment"; workspaceId: string; taskId: string; commentId: string; canonicalPath: string; selector?: string }
+  | { kind: "create"; workspaceId: string; taskId: string; canonicalPath: string }
+  | { kind: "reply"; workspaceId: string; taskId: string; parentCommentId: string; canonicalPath: string };
+type ParsedLoopPath =
+  | { kind: "loop"; route: LoopRoute }
+  | { kind: "other" }
+  | { kind: "invalid"; message: string };
+type LoopPreparedCall = {
+  session: ToolSession;
+  route: LoopRoute;
+  operation: "create" | "reply" | "update";
+  content: string;
+  requestContent: string;
+  preview: LoopCommentPreview;
+  snapshot?: LoopCommentSnapshot;
+  requestFingerprint: string;
+};
+type LoopCallerRequest = {
+  generation: number;
+  session: ToolSession;
+  toolName: string;
+  operation: LoopPreparedCall["operation"];
+  canonicalPath: string;
+  identity: LoopPreparedCall["preview"]["identity"];
+  callerArgs: Record<string, unknown>;
+  callerFingerprint: string;
+  effectiveArgs: Record<string, unknown>;
+};
+type LoopApprovalCandidate = {
+  generation: number;
+  session: ToolSession;
+  toolName: "write" | "edit";
+  callId?: string;
+  args: Record<string, unknown>;
+  eventArgs: Record<string, unknown>;
+  fingerprint: string;
+};
+type LoopCallerRequestRegistry = {
+  requests: WeakMap<object, Map<string, Map<number, LoopCallerRequest[]>>>;
+  approvalCandidates: WeakMap<object, Map<number, LoopApprovalCandidate[]>>;
+};
+const LOOP_CALLER_REQUESTS_GLOBAL_KEY = Symbol.for("@oh-my-pi/octo/native-tools/loop-caller-requests/v1");
 
+function sharedLoopCallerRequestRegistry(): LoopCallerRequestRegistry {
+  const existing: unknown = Reflect.get(globalThis, LOOP_CALLER_REQUESTS_GLOBAL_KEY);
+  if (existing !== null && typeof existing === "object") {
+    const record = existing as Record<string, unknown>;
+    if (!(record.requests instanceof WeakMap)) {
+      throw new Error("Octo Loop caller request registry has an incompatible process-global shape");
+    }
+    if (record.approvalCandidates === undefined) {
+      Object.defineProperty(existing, "approvalCandidates", {
+        value: new WeakMap<object, Map<number, LoopApprovalCandidate[]>>(),
+        configurable: false,
+        enumerable: false,
+        writable: false,
+      });
+    }
+    if (record.approvalCandidates instanceof WeakMap) return existing as LoopCallerRequestRegistry;
+    throw new Error("Octo Loop approval candidate registry has an incompatible process-global shape");
+  }
+  const registry: LoopCallerRequestRegistry = {
+    requests: new WeakMap<object, Map<string, Map<number, LoopCallerRequest[]>>>(),
+    approvalCandidates: new WeakMap<object, Map<number, LoopApprovalCandidate[]>>(),
+  };
+  Object.defineProperty(globalThis, LOOP_CALLER_REQUESTS_GLOBAL_KEY, {
+    value: registry,
+    configurable: false,
+    enumerable: false,
+    writable: false,
+  });
+  return registry;
+}
+
+const loopCallerRequestRegistry = sharedLoopCallerRequestRegistry();
+
+function setLoopCallerRequest(manager: object, callId: string, request: LoopCallerRequest): void {
+  let calls = loopCallerRequestRegistry.requests.get(manager);
+  if (!calls) {
+    calls = new Map();
+    loopCallerRequestRegistry.requests.set(manager, calls);
+  }
+  let generations = calls.get(callId);
+  if (!generations) {
+    generations = new Map();
+    calls.set(callId, generations);
+  }
+  let requests = generations.get(request.generation);
+  if (!requests) {
+    requests = [];
+    generations.set(request.generation, requests);
+  }
+  const existingIndex = requests.findIndex(existing =>
+    existing.session === request.session &&
+    existing.toolName === request.toolName &&
+    existing.operation === request.operation &&
+    existing.canonicalPath === request.canonicalPath &&
+    sameLoopIdentity(existing.identity, request.identity)
+  );
+  if (existingIndex >= 0) requests[existingIndex] = request;
+  else requests.push(request);
+  if (requests.length > 4) requests.shift();
+  while (calls.size > SESSION_MANAGER_CALL_LIMIT) {
+    const oldest = calls.keys().next().value;
+    if (oldest === undefined) break;
+    calls.delete(oldest);
+  }
+}
+
+function clearLoopCallerRequest(
+  manager: object,
+  callId: string,
+  generation: number,
+  session: ToolSession,
+  identity: LoopCallerRequest["identity"],
+): void {
+  const calls = loopCallerRequestRegistry.requests.get(manager);
+  const generations = calls?.get(callId);
+  const requests = generations?.get(generation);
+  if (!calls || !generations || !requests) return;
+  const remaining = requests.filter(
+    request => request.session !== session || !sameLoopIdentity(request.identity, identity),
+  );
+  if (remaining.length > 0) generations.set(generation, remaining);
+  else generations.delete(generation);
+  if (generations.size === 0) calls.delete(callId);
+  if (calls.size === 0) loopCallerRequestRegistry.requests.delete(manager);
+}
+function clearLoopCallerRequestsForGeneration(manager: object, generation: number): void {
+  const calls = loopCallerRequestRegistry.requests.get(manager);
+  if (calls) {
+    for (const [callId, generations] of calls) {
+      generations.delete(generation);
+      if (generations.size === 0) calls.delete(callId);
+    }
+    if (calls.size === 0) loopCallerRequestRegistry.requests.delete(manager);
+  }
+  const approvalCandidates = loopCallerRequestRegistry.approvalCandidates.get(manager);
+  approvalCandidates?.delete(generation);
+  if (approvalCandidates?.size === 0) loopCallerRequestRegistry.approvalCandidates.delete(manager);
+}
+
+function clearLoopApprovalCandidatesForCall(manager: object, callId: string): void {
+  const generations = loopCallerRequestRegistry.approvalCandidates.get(manager);
+  if (!generations) return;
+  for (const [generation, candidates] of generations) {
+    const remaining = candidates.filter(candidate => candidate.callId !== callId);
+    if (remaining.length > 0) generations.set(generation, remaining);
+    else generations.delete(generation);
+  }
+  if (generations.size === 0) loopCallerRequestRegistry.approvalCandidates.delete(manager);
+}
+function getLoopCallerRequest(
+  manager: object | undefined,
+  callId: string,
+  generation: number | undefined,
+  prepared: LoopPreparedCall,
+  toolName: string,
+): LoopCallerRequest | undefined {
+  if (!manager || generation === undefined) return undefined;
+  const requests = loopCallerRequestRegistry.requests.get(manager)?.get(callId)?.get(generation);
+  if (!requests) return undefined;
+  const matching = requests.filter(request =>
+    request.session === prepared.session &&
+    request.toolName === toolName &&
+    request.operation === prepared.operation &&
+    request.canonicalPath === prepared.route.canonicalPath &&
+    sameLoopIdentity(request.identity, prepared.preview.identity)
+  );
+  return matching.length === 1 ? matching[0] : undefined;
+}
+
+ 
+ 
 type HashlineSection = { path: string; tag: string; lines: string[] };
 type HashlineSections = { prefix: string[]; suffix: string[]; sections: HashlineSection[] };
-type DisplayCall = { aliases: Map<string, string>; writeTag?: string; managerState: ManagerState; generation: number };
+type LoopApprovalState = {
+  toolName: "write" | "edit";
+  loop: LoopPreparedCall;
+  managerState: ManagerState;
+  generation: number;
+  displayed: boolean;
+  approved: boolean;
+  consumed: boolean;
+};
+type DisplayCall = { aliases: Map<string, string>; writeTag?: string; loop?: LoopPreparedCall; managerState: ManagerState; generation: number };
 type ManagerRef = {
   getSessionId?: () => string;
-  getSessionFile?: () => string | null;
+  getSessionFile?: () => string | undefined;
 };
 type ManagerState = {
   identity: string | null;
@@ -82,6 +291,7 @@ type ManagerState = {
   cleanup?: Promise<void>;
   sessions: Set<OctoSessionState>;
   calls: Map<string, DisplayCall>;
+  approvalCalls: Map<string, LoopApprovalState>;
 };
 type ManagerGeneration = { manager: object; managerState: ManagerState; generation: number };
 type GenerationRef = {
@@ -104,6 +314,8 @@ type OctoSessionState = {
   readDocuments: Map<string, OctoDocument>;
   filesById: Map<string, string>;
   idsByFile: Map<string, string>;
+  loopComments: Map<string, LoopCommentSnapshot>;
+  loopFiles: Map<string, string>;
   pendingWrites: Set<Promise<void>>;
   rootPromise?: Promise<string>;
 };
@@ -120,9 +332,32 @@ type EditStreamState = {
   argsJson?: string;
 };
 
-type EditInstance = EditTool & { session: ToolSession };
-type ReadInstance = ReadTool & { session: ToolSession };
 type NativeResult = ToolResult;
+type MixedEditDetails = EditToolDetails & {
+  completedTargets: string[];
+  uncertainTargets: string[];
+  failedTarget?: string;
+  operations: Array<{
+    target: string;
+    domain: "local" | "octo";
+    isError: boolean;
+    details: unknown;
+  }>;
+};
+
+function editResultDiff(result: NativeResult): string {
+  if (!isRecord(result.details)) return "";
+  if (typeof result.details.diff === "string") return result.details.diff;
+  if (!Array.isArray(result.details.files)) return "";
+  return result.details.files
+    .flatMap(file => isRecord(file) && typeof file.diff === "string" ? [file.diff] : [])
+    .join("\n");
+}
+
+function mixedEditDiff(results: readonly { result: NativeResult }[]): string {
+  return results.map(entry => editResultDiff(entry.result)).filter(Boolean).join("\n");
+}
+
 
 const HTTP_OCTO_PREFIX = /^https:\/\/im\.deepminer\.com\.cn\/d\//i;
 const OCTO_SCHEME_PREFIX = /^octo:/i;
@@ -132,14 +367,41 @@ const PATCH_FILE_HEADER = /^(\*\*\*\s+(?:Update|Add|Delete) File:\s*)([^\r\n]+)$
 const PATCH_MOVE_HEADER = /^(\*\*\*\s+Move to:\s*)([^\r\n]+)$/i;
 const SESSION_MANAGER_CALL_LIMIT = 128;
 const EXTENSION_SESSION_PROMPT =
-  "Octo documents are available through the native read, write, and edit tools: use octo://<docId> (or the im.deepminer.com.cn /d/<docId> link). Read before hashline editing. Writes use the current octo-cli identity and reject version conflicts.";
+  "Octo documents and Loop tasks/comments are available through the native read, write, and edit tools. Use octo://docs/<docId> for documents and octo://loop/workspaces/<workspaceId>/tasks/<taskId>/comments/... for Loop. Read before hashline editing. Loop comment mutations require explicit approval and preview.";
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+function isLoopCommentSnapshot(value: unknown): value is LoopCommentSnapshot {
+  if (!isRecord(value) || !isRecord(value.identity) || !isRecord(value.comment)) return false;
+  const comment = value.comment;
+  return (
+    typeof value.workspaceId === "string" &&
+    typeof value.taskId === "string" &&
+    typeof value.commentId === "string" &&
+    typeof comment.comment_id === "string" &&
+    typeof comment.task_id === "string" &&
+    (comment.parent_id === null || typeof comment.parent_id === "string") &&
+    typeof comment.content === "string" &&
+    Array.isArray(comment.attachments) &&
+    comment.attachments.every(attachment => isRecord(attachment) && typeof attachment.id === "string")
+  );
+}
 
 function toolError(message: string): NativeResult {
   return { content: [{ type: "text", text: message }], isError: true };
+}
+function protocolWriteError(message: string): InternalWriteResult {
+  return { content: [{ type: "text", text: message }], isError: true };
+}
+
+function protocolWriteResult(result: NativeResult): InternalWriteResult {
+  const content = result.content.flatMap(block =>
+    block.type === "text" && typeof block.text === "string"
+      ? [{ type: "text" as const, text: block.text }]
+      : [],
+  );
+  return { content, ...(result.isError === true ? { isError: true } : {}) };
 }
 
 function isRangeSelector(value: string): boolean {
@@ -181,22 +443,45 @@ function decodeDocumentId(id: string): string | undefined {
 }
 
 function parseDocumentPath(rawPath: string): ParsedDocumentPath {
-  const source: OctoTarget["source"] = /^octo:/i.test(rawPath) ? "octo" : HTTP_OCTO_PREFIX.test(rawPath) ? "https" : "octo";
-  const isOcto = source === "octo";
-  if (isOcto && !OCTO_SCHEME_PREFIX.test(rawPath)) return { kind: "other" };
-  if (isOcto && !/^octo:\/\//i.test(rawPath)) {
-    return { kind: "invalid", source, message: `Unsupported Octo path '${rawPath}'; use octo://<docId>` };
-  }
   const httpPrefix = HTTP_OCTO_PREFIX.exec(rawPath);
+  const isOcto = OCTO_SCHEME_PREFIX.test(rawPath);
   if (!isOcto && !httpPrefix) return { kind: "other" };
-  const prefixLength = isOcto ? "octo://".length : httpPrefix![0].length;
+  const source: OctoTarget["source"] = isOcto ? "octo" : "https";
+  let prefixLength: number;
+
+  if (isOcto) {
+    if (!/^octo:\/\//i.test(rawPath)) {
+      return { kind: "invalid", source, message: `Unsupported Octo path '${rawPath}'; use octo://docs/<docId>` };
+    }
+    const rest = rawPath.slice("octo://".length);
+    const separator = rest.indexOf("/");
+    const authority = separator < 0 ? rest : rest.slice(0, separator);
+    if (!authority) return { kind: "invalid", source, message: `Invalid Octo Docs path '${rawPath}'; use octo://docs/<docId>` };
+
+    const namespace = authority.toLowerCase();
+    if (namespace !== "docs") {
+      if (namespace === "loop" || namespace === "drive" || separator >= 0) return { kind: "other" };
+      return {
+        kind: "invalid",
+        source,
+        message: `Legacy Octo document path '${rawPath}' is unsupported; use octo://docs/${authority}`,
+      };
+    }
+    if (separator < 0 || separator === rest.length - 1) {
+      return { kind: "invalid", source, message: `Invalid Octo Docs path '${rawPath}'; expected octo://docs/<docId>` };
+    }
+    prefixLength = "octo://".length + separator + 1;
+  } else {
+    prefixLength = httpPrefix![0].length;
+  }
+
   const part = rawPath.slice(prefixLength);
   const split = splitIdSelector(part);
   if ("error" in split) return { kind: "invalid", source, message: `${split.error}: '${rawPath}'` };
   const id = decodeDocumentId(split.id);
   if (!id) return { kind: "invalid", source, message: `Invalid Octo document ID in '${rawPath}'` };
   const originalBasePath = rawPath.slice(0, prefixLength + split.id.length);
-  const canonicalBasePath = `octo://${encodeURIComponent(id)}`;
+  const canonicalBasePath = `octo://docs/${encodeURIComponent(id)}`;
   return {
     kind: "octo",
     target: {
@@ -210,30 +495,220 @@ function parseDocumentPath(rawPath: string): ParsedDocumentPath {
     },
   };
 }
+const LOOP_UUID_PATTERN = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+
+function parseLoopPath(rawPath: string): ParsedLoopPath {
+  if (!/^octo:\/\/loop(?=\/|$)/i.test(rawPath)) return { kind: "other" };
+  const prefix = /^octo:\/\/loop/i.exec(rawPath)![0];
+  const rest = rawPath.slice(prefix.length);
+  if (rest.includes("?") || rest.includes("#")) {
+    return { kind: "invalid", message: `Loop paths do not support query or fragment components: '${rawPath}'` };
+  }
+  if (!rest.startsWith("/") || rest.length === 1) {
+    return { kind: "invalid", message: `Invalid Loop URI '${rawPath}'` };
+  }
+  const rawSegments = rest.slice(1).split("/");
+  if (rawSegments.some(segment => segment.length === 0)) {
+    return { kind: "invalid", message: `Invalid Loop URI '${rawPath}': empty path segment` };
+  }
+  const segments: string[] = [];
+  for (const rawSegment of rawSegments) {
+    let segment: string;
+    try {
+      segment = decodeURIComponent(rawSegment);
+    } catch {
+      return { kind: "invalid", message: `Invalid URI-encoded Loop path segment in '${rawPath}'` };
+    }
+    if (!segment || /[/?#\\]/.test(segment)) {
+      return { kind: "invalid", message: `Invalid Loop path segment in '${rawPath}'` };
+    }
+    segments.push(segment);
+  }
+
+  const fail = (): ParsedLoopPath => ({
+    kind: "invalid",
+    message: `Unsupported Loop URI '${rawPath}'; use an explicit workspace, task, and supported resource path`,
+  });
+  if (segments.length === 1 && segments[0] === "workspaces") {
+    return { kind: "loop", route: { kind: "workspaces", canonicalPath: "octo://loop/workspaces" } };
+  }
+  if (segments[0] !== "workspaces" || !LOOP_UUID_PATTERN.test(segments[1] ?? "")) return fail();
+  const workspaceId = segments[1]!;
+  const workspacePath = `octo://loop/workspaces/${encodeURIComponent(workspaceId)}`;
+  if (segments.length === 3 && segments[2] === "tasks") {
+    return { kind: "loop", route: { kind: "tasks", workspaceId, canonicalPath: `${workspacePath}/tasks` } };
+  }
+  if (segments[2] !== "tasks" || !LOOP_UUID_PATTERN.test(segments[3] ?? "")) return fail();
+  const taskId = segments[3]!;
+  const taskPath = `${workspacePath}/tasks/${encodeURIComponent(taskId)}`;
+  if (segments.length === 4) {
+    return { kind: "loop", route: { kind: "task", workspaceId, taskId, canonicalPath: taskPath } };
+  }
+  if (segments[4] !== "comments") return fail();
+  const commentsPath = `${taskPath}/comments`;
+  if (segments.length === 5) {
+    return { kind: "loop", route: { kind: "comments", workspaceId, taskId, canonicalPath: commentsPath } };
+  }
+  if (segments.length === 6 && segments[5] === "new") {
+    return { kind: "loop", route: { kind: "create", workspaceId, taskId, canonicalPath: `${commentsPath}/new` } };
+  }
+  if (segments.length === 6 || segments.length === 7 && segments[6] === "replies" ||
+      segments.length === 8 && segments[6] === "replies" && segments[7] === "new") {
+    const split = splitIdSelector(segments[5]!);
+    if ("error" in split || !LOOP_UUID_PATTERN.test(split.id)) return fail();
+    if (split.selector && !isRangeSelector(split.selector)) return fail();
+    const commentId = split.id;
+    const commentPath = `${commentsPath}/${encodeURIComponent(commentId)}`;
+    if (segments.length === 6) {
+      return {
+        kind: "loop",
+        route: {
+          kind: "comment",
+          workspaceId,
+          taskId,
+          commentId,
+          canonicalPath: commentPath,
+          ...(split.selector ? { selector: split.selector } : {}),
+        },
+      };
+    }
+    if (segments.length === 8) {
+      return {
+        kind: "loop",
+        route: { kind: "reply", workspaceId, taskId, parentCommentId: commentId, canonicalPath: `${commentPath}/replies/new` },
+      };
+    }
+  }
+  return fail();
+}
+
+function loopCommentKey(workspaceId: string, taskId: string, commentId: string): string {
+  return `${workspaceId}\0${taskId}\0${commentId}`;
+}
+
+const LOOP_ACP_PROMPT_MARKER = "__ompLoopAcpPrompt";
+
+const loopAcpPreResolvedSnapshots = new WeakMap<object, WeakSet<object>>();
+const loopApprovalInputs = new WeakSet<object>();
+
+function forceAcpLoopPrompt(args: unknown, context: NativeApprovalContext | undefined): boolean {
+  if (
+    !context ||
+    !Object.hasOwn(context, "acpApprovedArgs") ||
+    !Bun.deepEquals(args, context.acpApprovedArgs)
+  ) {
+    return true;
+  }
+  if (!isRecord(args)) return false;
+  if (!loopApprovalInputs.has(args)) {
+    // The SDK resolves policy once before emitting tool_call. Allow that
+    // pre-resolution without mutating caller/ACP arguments, then require the
+    // post-hook resolution to use this plugin's isolated input.
+    const approvedArgs = context.acpApprovedArgs;
+    if (!isRecord(approvedArgs)) return false;
+    let snapshots = loopAcpPreResolvedSnapshots.get(context);
+    if (!snapshots) {
+      snapshots = new WeakSet<object>();
+      loopAcpPreResolvedSnapshots.set(context, snapshots);
+    }
+    if (snapshots.has(approvedArgs)) return false;
+    snapshots.add(approvedArgs);
+    return true;
+  }
+  const markerKey = `${LOOP_ACP_PROMPT_MARKER}_${randomUUID()}`;
+  const markerValue = randomUUID();
+  if (Object.hasOwn(args, markerKey)) return false;
+  try {
+    Object.defineProperty(args, markerKey, {
+      value: markerValue,
+      writable: true,
+      configurable: true,
+      enumerable: true,
+    });
+  } catch {
+    return false;
+  }
+  // The SDK checks acpApprovedArgs synchronously after this approval function
+  // returns. Clear the temporary difference before its next async boundary so
+  // previews, execution, cancellation, and results never see the marker.
+  queueMicrotask(() => {
+    if (args[markerKey] === markerValue) Reflect.deleteProperty(args, markerKey);
+  });
+  return true;
+}
+
+
+function stableToolValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(entry => stableToolValue(entry));
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return Object.fromEntries(Object.keys(record).sort().map(key => [key, stableToolValue(record[key])]));
+  }
+  return value;
+}
+
+function toolArgsFingerprint(value: unknown): string {
+  try {
+    return JSON.stringify(stableToolValue(value)) ?? "undefined";
+  } catch {
+    return "unserializable";
+  }
+}
+
+function loopCallerRequestStatus(
+  manager: object | undefined,
+  callId: string,
+  prepared: LoopPreparedCall,
+  toolName: string,
+) {
+  const generation = runtime.generationForCall(prepared.session, callId);
+  const request =
+    generation !== undefined && generation.manager === manager && generation.session === prepared.session
+      ? getLoopCallerRequest(manager, callId, generation.generation, prepared, toolName)
+      : undefined;
+  return {
+    hasRequest: request !== undefined,
+    callerUnchanged: request !== undefined && toolArgsFingerprint(request.callerArgs) === request.callerFingerprint,
+    effectiveMatchesPreview:
+      request !== undefined && toolArgsFingerprint(request.effectiveArgs) === prepared.requestFingerprint,
+  };
+}
+
+function loopCallerRequestUnchanged(
+  manager: object | undefined,
+  callId: string,
+  prepared: LoopPreparedCall,
+  toolName: "write" | "edit",
+): boolean {
+  const status = loopCallerRequestStatus(manager, callId, prepared, toolName);
+  return status.hasRequest && status.callerUnchanged && status.effectiveMatchesPreview;
+}
+
+function isLoopMutation(route: LoopRoute): route is Extract<LoopRoute, { kind: "comment" | "create" | "reply" }> {
+  return route.kind === "comment" || route.kind === "create" || route.kind === "reply";
+}
 
 function isOctoLikePath(value: string): boolean {
   return OCTO_SCHEME_PREFIX.test(value) || HTTP_OCTO_PREFIX.test(value);
 }
 
-function decodedHostId(url: InternalUrl): string | undefined {
-  const id = url.rawHost || url.hostname;
-  if (!id || /[/:?#\\]/.test(id) || id.trim() !== id) return undefined;
-  return id;
+function isDocsPathLike(value: string): boolean {
+  return parseDocumentPath(value).kind !== "other";
+}
+function isLoopPathLike(value: string): boolean {
+  return parseLoopPath(value).kind !== "other";
 }
 
+function isRemoteOctoPathLike(value: string): boolean {
+  return isDocsPathLike(value) || isLoopPathLike(value);
+}
+
+
+
+
 function targetFromInternalUrl(url: InternalUrl): OctoTarget | undefined {
-  if ((url.rawPathname && url.rawPathname !== "") || url.pathname !== "" || url.search || url.hash) return undefined;
-  const id = decodedHostId(url);
-  if (!id) return undefined;
-  const canonicalBasePath = `octo://${encodeURIComponent(id)}`;
-  return {
-    id,
-    canonicalBasePath,
-    canonicalPath: canonicalBasePath,
-    originalPath: url.rawHref ?? url.href,
-    originalBasePath: canonicalBasePath,
-    source: "octo",
-  };
+  const parsed = parseDocumentPath(url.rawHref ?? url.href);
+  return parsed.kind === "octo" && parsed.target.source === "octo" ? parsed.target : undefined;
 }
 
 function sessionManagerOf(session: ToolSession): ManagerRef | undefined {
@@ -301,15 +776,26 @@ function hashlineSections(input: string): HashlineSections | undefined {
 function hasNonHashlineOctoFileTarget(input: string): boolean {
   return input.split(/\r?\n/).some(line => {
     const match = PATCH_FILE_HEADER.exec(line) ?? PATCH_MOVE_HEADER.exec(line);
-    return !!match && isOctoLikePath(match[2]!.trim());
+    return !!match && isRemoteOctoPathLike(match[2]!.trim());
   });
 }
+function hasNonHashlineLoopFileTarget(input: string): boolean {
+  return input.split(/\r?\n/).some(line => {
+    const match = PATCH_FILE_HEADER.exec(line) ?? PATCH_MOVE_HEADER.exec(line);
+    return !!match && parseLoopPath(match[2]!.trim()).kind !== "other";
+  });
+}
+function hasNonHashlinePatchTarget(input: string): boolean {
+  return input.split(/\r?\n/).some(line => PATCH_FILE_HEADER.test(line) || PATCH_MOVE_HEADER.test(line));
+}
+
 
 function hasRemoteTargetInInput(input: string): boolean {
   const sections = hashlineSections(input);
-  if (sections?.sections.some(section => isOctoLikePath(section.path))) return true;
+  if (sections?.sections.some(section => isRemoteOctoPathLike(section.path))) return true;
   return hasNonHashlineOctoFileTarget(input);
 }
+
 
 
 function inputString(params: unknown): string {
@@ -386,23 +872,48 @@ function remoteStreamTarget(chunks: readonly string[], args?: unknown): boolean 
     const jsonPath = /"(?:_?path)"\s*:\s*"([^"]+)"/i.exec(line);
     return jsonPath ? [jsonPath[1]!] : [];
   });
-  if (paths.some(isOctoLikePath)) return true;
+  if (paths.some(isRemoteOctoPathLike)) return true;
   if (args !== undefined) {
     const direct = pathString(args);
-    if (direct && isOctoLikePath(unwrapWritePath(direct).path)) return true;
+    if (direct && isRemoteOctoPathLike(unwrapWritePath(direct).path)) return true;
     const input = inputString(args);
     if (input && hasRemoteTargetInInput(input)) return true;
   }
   return false;
 }
 
+function isToolSession(value: unknown): value is ToolSession {
+  return (
+    isRecord(value) &&
+    typeof value.cwd === "string" &&
+    typeof value.hasUI === "boolean" &&
+    isRecord(value.settings)
+  );
+}
+
+function toolSessionFromNativeTool(instance: object): ToolSession | undefined {
+  const value: unknown = Reflect.get(instance, "session");
+  return isToolSession(value) ? value : undefined;
+}
+
+function requireToolSession(instance: object): ToolSession {
+  const session = toolSessionFromNativeTool(instance);
+  if (!session) throw new Error("Octo cannot access the native tool session");
+  return session;
+}
+
 function toolSessionOfRead(tool: ReadTool): ToolSession {
-  return (tool as unknown as ReadInstance).session;
+  return requireToolSession(tool);
 }
 
 function toolSessionOfEdit(tool: EditTool): ToolSession {
-  return (tool as unknown as EditInstance).session;
+  return requireToolSession(tool);
 }
+
+function toolSessionOfWrite(tool: WriteTool): ToolSession {
+  return requireToolSession(tool);
+}
+
 
 class OctoNativeRuntime {
   #managerStates = new WeakMap<object, ManagerState>();
@@ -423,6 +934,7 @@ class OctoNativeRuntime {
         controller: new AbortController(),
         sessions: new Set(),
         calls: new Map(),
+        approvalCalls: new Map(),
       };
       this.#managerStates.set(key, state);
       this.#liveManagers.add(key);
@@ -431,7 +943,7 @@ class OctoNativeRuntime {
     if (state.identity !== identity) {
       state.active = false;
       state.identity = identity;
-      const cleanup = this.#advanceGeneration(state);
+      const cleanup = this.#advanceGeneration(state, key);
       state.cleanup = cleanup;
       await cleanup;
       if (state.cleanup === cleanup) {
@@ -459,7 +971,7 @@ class OctoNativeRuntime {
     const identity = sessionIdentity(manager);
     state.active = false;
     state.identity = identity;
-    const cleanup = this.#advanceGeneration(state);
+    const cleanup = this.#advanceGeneration(state, key);
     state.cleanup = cleanup;
     await cleanup;
     if (state.cleanup === cleanup) {
@@ -473,7 +985,7 @@ class OctoNativeRuntime {
     const state = this.#managerStates.get(key);
     if (!state) return;
     state.active = false;
-    const cleanup = this.#advanceGeneration(state);
+    const cleanup = this.#advanceGeneration(state, key);
     this.#managerStates.delete(key);
     this.#liveManagers.delete(key);
     await cleanup;
@@ -485,7 +997,7 @@ class OctoNativeRuntime {
       const state = this.#managerStates.get(manager);
       if (state) {
         state.active = false;
-        cleanups.push(this.#advanceGeneration(state));
+        cleanups.push(this.#advanceGeneration(state, manager));
       }
       this.#managerStates.delete(manager);
     }
@@ -640,6 +1152,8 @@ class OctoNativeRuntime {
         readDocuments: new Map(),
         filesById: new Map(),
         idsByFile: new Map(),
+        loopComments: new Map(),
+        loopFiles: new Map(),
         pendingWrites: new Set(),
       };
       this.#toolStates.set(session, state);
@@ -662,6 +1176,49 @@ class OctoNativeRuntime {
     for (const alias of filePathAliases(filePath)) state.idsByFile.set(alias, document.id);
     return filePath;
   }
+  async recordLoopComment(
+    state: OctoSessionState,
+    snapshot: LoopCommentSnapshot,
+    lease: OperationLease,
+  ): Promise<string> {
+    this.assertCurrent(lease);
+    const key = loopCommentKey(snapshot.workspaceId, snapshot.taskId, snapshot.commentId);
+    let filePath = state.loopFiles.get(key);
+    if (!filePath) {
+      state.rootPromise ??= mkdtemp(path.join(os.tmpdir(), "omp-octo-native-")).then(root => realpath(root).catch(() => root));
+      const root = await state.rootPromise;
+      this.assertCurrent(lease);
+      filePath = canonicalExistingPath(path.join(root, `loop-${snapshot.workspaceId}-${snapshot.taskId}-${snapshot.commentId}.md`));
+      state.loopFiles.set(key, filePath);
+    }
+    await this.#writeFile(state, filePath, snapshot.comment.content, lease);
+    this.assertCurrent(lease);
+    state.loopComments.set(key, snapshot);
+    getEditStore(state.session).recordSnapshot(filePath, snapshot.comment.content);
+    return filePath;
+  }
+
+  loopSnapshotFor(session: ToolSession, workspaceId: string, taskId: string, commentId: string): LoopCommentSnapshot | undefined {
+    const state = this.#toolStates.get(session);
+    const key = loopCommentKey(workspaceId, taskId, commentId);
+    const snapshot = state?.loopComments.get(key);
+    return snapshot;
+  }
+
+  async loopFileFor(
+    session: ToolSession,
+    workspaceId: string,
+    taskId: string,
+    commentId: string,
+    ref: GenerationRef,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> {
+    const state = await this.sessionState(session, ref, signal);
+    const key = loopCommentKey(workspaceId, taskId, commentId);
+    const filePath = state.loopFiles.get(key);
+    return filePath;
+  }
+
 
   async recordRead(state: OctoSessionState, document: OctoDocument, lease: OperationLease): Promise<string> {
     const filePath = await this.pathFor(state, document, lease, lease.signal);
@@ -752,37 +1309,179 @@ class OctoNativeRuntime {
     aliases: Map<string, string>,
     writeTag?: string,
     trackGeneration = false,
+    loop?: LoopPreparedCall,
   ): void {
     const state = this.#managerStates.get(manager as object);
     if (!state || !state.active || state.cleanup) return;
-    if (aliases.size === 0 && !writeTag && !trackGeneration) return;
+    const previous = state.calls.get(callId);
+    if (previous?.loop) {
+      clearLoopCallerRequest(manager as object, callId, previous.generation, previous.loop.session, previous.loop.preview.identity);
+    }
     state.calls.delete(callId);
+    state.approvalCalls.delete(callId);
+    if (aliases.size === 0 && !writeTag && !trackGeneration && !loop) return;
     state.calls.set(callId, {
       aliases,
       ...(writeTag ? { writeTag } : {}),
+      ...(loop ? { loop } : {}),
       managerState: state,
       generation: state.generation,
     });
     while (state.calls.size > SESSION_MANAGER_CALL_LIMIT) {
       const oldest = state.calls.keys().next().value;
       if (oldest === undefined) break;
+      const oldestCall = state.calls.get(oldest);
       state.calls.delete(oldest);
+      state.approvalCalls.delete(oldest);
+      if (oldestCall?.loop) {
+        clearLoopCallerRequest(manager as object, oldest, oldestCall.generation, oldestCall.loop.session, oldestCall.loop.preview.identity);
+      }
     }
   }
 
-  finishCall(manager: ManagerRef, callId: string): void {
-    this.#managerStates.get(manager as object)?.calls.delete(callId);
+  loopCallFor(session: ToolSession, callId: string): LoopPreparedCall | undefined {
+    const manager = sessionManagerOf(session);
+    const state = manager ? this.#managerStates.get(manager as object) : undefined;
+    const call = state?.calls.get(callId);
+    if (!state || !call || call.managerState !== state || call.generation !== state.generation || call.loop?.session !== session) {
+      return undefined;
+    }
+    return call.loop;
   }
+
+  approvalCallFor(
+    manager: ManagerRef,
+    toolName: "write" | "edit",
+    args: unknown,
+  ): LoopPreparedCall | null | undefined {
+    const state = this.#managerStateFor(manager);
+    if (!state) return undefined;
+    const fingerprint = toolArgsFingerprint(args);
+    let candidate: LoopApprovalState | undefined;
+    let matches = 0;
+    let pending = 0;
+    for (const [callId, approval] of state.approvalCalls) {
+      if (approval.toolName !== toolName) continue;
+      const call: DisplayCall | undefined = state.calls.get(callId);
+      if (
+        approval.managerState !== state ||
+        approval.generation !== state.generation ||
+        !call ||
+        call.managerState !== state ||
+        call.generation !== state.generation ||
+        call.loop !== approval.loop
+      ) {
+        state.approvalCalls.delete(callId);
+        continue;
+      }
+      pending += 1;
+      if (approval.loop.requestFingerprint === fingerprint) {
+        candidate = approval;
+        matches += 1;
+      }
+    }
+    if (matches !== 1 || !candidate) return pending > 0 ? null : undefined;
+    candidate.displayed = true;
+    return candidate.loop;
+  }
+
+  setApprovalCall(manager: ManagerRef, toolName: "write" | "edit", callId: string): void {
+    const state = this.#managerStateFor(manager);
+    const call = state?.calls.get(callId);
+    if (!state || !call?.loop || call.managerState !== state || call.generation !== state.generation) return;
+    state.approvalCalls.set(callId, {
+      toolName,
+      loop: call.loop,
+      managerState: state,
+      generation: state.generation,
+      displayed: false,
+      approved: false,
+      consumed: false,
+    });
+  }
+
+  resolveApprovalCall(manager: ManagerRef, toolName: "write" | "edit", callId: string, approved: boolean): void {
+    const state = this.#managerStateFor(manager);
+    const approval = state?.approvalCalls.get(callId);
+    if (!state || !approval || approval.toolName !== toolName) return;
+    const call: DisplayCall | undefined = state.calls.get(callId);
+    if (
+      !call ||
+      call.managerState !== state ||
+      call.generation !== state.generation ||
+      approval.managerState !== state ||
+      approval.generation !== state.generation ||
+      call.loop !== approval.loop
+    ) {
+      state.approvalCalls.delete(callId);
+      return;
+    }
+    approval.approved = approved && approval.displayed;
+  }
+
+
+  consumeLoopApproval(
+    session: ToolSession,
+    callId: string,
+    prepared: LoopPreparedCall,
+    toolName: "write" | "edit",
+  ): boolean {
+    const manager = sessionManagerOf(session);
+    const state = manager ? this.#managerStates.get(manager as object) : undefined;
+    const call = state?.calls.get(callId);
+    const approval = state?.approvalCalls.get(callId);
+    if (
+      !manager ||
+      !state ||
+      !state.active ||
+      !!state.cleanup ||
+      state.identity !== sessionIdentity(manager) ||
+      !approval ||
+      approval.toolName !== toolName ||
+      approval.managerState !== state ||
+      approval.generation !== state.generation ||
+      !approval.displayed ||
+      !approval.approved ||
+      approval.consumed ||
+      approval.loop !== prepared ||
+      !call ||
+      call.loop !== prepared ||
+      call.managerState !== state ||
+      call.generation !== state.generation ||
+      prepared.session !== session
+    ) {
+      return false;
+    }
+    approval.consumed = true;
+    return true;
+  }
+
+
+  finishCall(manager: ManagerRef, callId: string): void {
+    clearLoopApprovalCandidatesForCall(manager as object, callId);
+    const state = this.#managerStates.get(manager as object);
+    const call = state?.calls.get(callId);
+    if (call?.loop) {
+      clearLoopCallerRequest(manager as object, callId, call.generation, call.loop.session, call.loop.preview.identity);
+    }
+    state?.calls.delete(callId);
+    state?.approvalCalls.delete(callId);
+  }
+
 
   #managerStateFor(manager: ManagerRef): ManagerState | undefined {
     const state = this.#managerStates.get(manager as object);
     return state?.identity === sessionIdentity(manager) ? state : undefined;
   }
 
-  #advanceGeneration(state: ManagerState): Promise<void> {
+  #advanceGeneration(state: ManagerState, manager: object): Promise<void> {
+    const previousGeneration = state.generation;
     state.generation += 1;
+    clearLoopCallerRequestsForGeneration(manager, previousGeneration);
     state.controller.abort(new Error("Octo session changed; operation cancelled"));
     state.controller = new AbortController();
+    state.calls.clear();
+    state.approvalCalls.clear();
     const sessions = [...state.sessions];
     state.sessions.clear();
     return Promise.all(sessions.map(session => this.#disposeSession(session))).then(() => undefined);
@@ -791,11 +1490,14 @@ class OctoNativeRuntime {
   async #disposeSession(state: OctoSessionState): Promise<void> {
     clearEditStreamsForSession(state.session);
     for (const filePath of state.idsByFile.keys()) getEditStore(state.session).invalidate(filePath);
+    for (const filePath of state.loopFiles.values()) getEditStore(state.session).invalidate(filePath);
     if (this.#toolStates.get(state.session) === state) this.#toolStates.delete(state.session);
     state.documents.clear();
     state.readDocuments.clear();
     state.filesById.clear();
     state.idsByFile.clear();
+    state.loopComments.clear();
+    state.loopFiles.clear();
     await Promise.allSettled([...state.pendingWrites]);
     if (state.rootPromise) {
       try {
@@ -813,6 +1515,56 @@ const runtimeHost = globalThis as unknown as Record<PropertyKey, unknown>;
 const runtime = (runtimeHost[runtimeSlot] as OctoNativeRuntime | undefined) ?? new OctoNativeRuntime();
 if (!runtimeHost[runtimeSlot]) Object.defineProperty(runtimeHost, runtimeSlot, { value: runtime });
 
+async function resolveLoopResource(
+  route: LoopRoute,
+  session: ToolSession,
+  lease: OperationLease,
+): Promise<InternalResource> {
+  switch (route.kind) {
+    case "workspaces": {
+      const result = await readLoopWorkspaces(lease.signal);
+      runtime.assertCurrent(lease);
+      const content = JSON.stringify(result.data, null, 2);
+      return { url: route.canonicalPath, content, contentType: "application/json", size: Buffer.byteLength(content), immutable: false };
+    }
+    case "tasks": {
+      const result = await readLoopTasks(route.workspaceId, lease.signal);
+      runtime.assertCurrent(lease);
+      const content = JSON.stringify(result.data, null, 2);
+      return { url: route.canonicalPath, content, contentType: "application/json", size: Buffer.byteLength(content), immutable: false };
+    }
+    case "task": {
+      const result = await readLoopTask(route.workspaceId, route.taskId, lease.signal);
+      runtime.assertCurrent(lease);
+      const content = JSON.stringify(result.data, null, 2);
+      return { url: route.canonicalPath, content, contentType: "application/json", size: Buffer.byteLength(content), immutable: false };
+    }
+    case "comments": {
+      const result = await readLoopComments(route.workspaceId, route.taskId, lease.signal);
+      runtime.assertCurrent(lease);
+      const content = JSON.stringify(result.data, null, 2);
+      return { url: route.canonicalPath, content, contentType: "application/json", size: Buffer.byteLength(content), immutable: false };
+    }
+    case "comment": {
+      const snapshot = await readLoopComment(route.workspaceId, route.taskId, route.commentId, lease.signal);
+      runtime.assertCurrent(lease);
+      const state = await runtime.sessionState(session, lease);
+      const sourcePath = await runtime.recordLoopComment(state, snapshot, lease);
+      return {
+        url: route.canonicalPath,
+        content: snapshot.comment.content,
+        contentType: "text/plain",
+        size: Buffer.byteLength(snapshot.comment.content, "utf8"),
+        sourcePath,
+        immutable: false,
+      };
+    }
+    case "create":
+    case "reply":
+      throw new Error(`Loop comment mutation path '${route.canonicalPath}' is write-only`);
+  }
+}
+
 const octoProtocol: ProtocolHandler = {
   scheme: "octo",
   spec: {
@@ -823,10 +1575,23 @@ const octoProtocol: ProtocolHandler = {
       via: "handler",
       payload: "text",
       scope: "workspace",
-      tier: (_url, _content, session) =>
-        session && runtime.isActive(session)
+      tier: (url, _content, session) => {
+        const parsed = parseLoopPath(url.rawHref ?? url.href);
+        if (parsed.kind === "invalid") {
+          return { tier: "write", policy: "deny", reason: parsed.message };
+        }
+        if (parsed.kind === "loop") {
+          if (!isLoopMutation(parsed.route) || parsed.route.kind === "comment" && parsed.route.selector) {
+            return { tier: "write", policy: "deny", reason: "Only Loop comment creation, replies, and whole-body updates are writable" };
+          }
+          return session && runtime.isActive(session)
+            ? { tier: "write", policy: "prompt", reason: "Loop comment changes can trigger notifications or expert activity and require explicit approval" }
+            : { tier: "write", policy: "deny", reason: "Octo tools are not active for this session" };
+        }
+        return session && runtime.isActive(session)
           ? "write"
-          : { tier: "write", policy: "deny", reason: "Octo tools are not active for this session" },
+          : { tier: "write", policy: "deny", reason: "Octo tools are not active for this session" };
+      },
     },
   },
   async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
@@ -838,6 +1603,9 @@ const octoProtocol: ProtocolHandler = {
     try {
       runtime.assertCurrent(lease);
       const state = await runtime.sessionState(session, lease);
+      const loop = parseLoopPath(url.rawHref ?? url.href);
+      if (loop.kind === "invalid") throw new Error(loop.message);
+      if (loop.kind === "loop") return await resolveLoopResource(loop.route, session, lease);
       const target = targetFromInternalUrl(url);
       if (!target) throw new Error(`Invalid Octo document URL '${url.rawHref ?? url.href}'`);
       const document = await readDocument(target.id, lease.signal);
@@ -855,8 +1623,9 @@ const octoProtocol: ProtocolHandler = {
       if (ownedLease) lease.release();
     }
   },
-  async write(url: InternalUrl, content: string, context?: WriteContext) {
+  async write(url: InternalUrl, content: string, context?: WriteContext): Promise<InternalWriteResult> {
     const session = context?.session;
+    if (!session) return protocolWriteError("Octo write requires an active tool session");
     const callId = context?.toolCall?.id ?? "";
     const expected = runtime.generationForCall(session, callId);
     let lease = runtime.operationForSignal(session, context?.signal);
@@ -865,6 +1634,39 @@ const octoProtocol: ProtocolHandler = {
     try {
       runtime.assertCurrent(lease);
       const state = await runtime.sessionState(session, lease);
+      const loop = parseLoopPath(url.rawHref ?? url.href);
+      if (loop.kind === "invalid") throw new Error(loop.message);
+      if (loop.kind === "loop") {
+        const prepared = runtime.loopCallFor(session, callId);
+        if (!prepared || !isLoopMutation(prepared.route)) {
+          return protocolWriteError("Loop comment mutation has no matching preview and approval; invoke the write again");
+        }
+        if (
+          prepared.route.canonicalPath !== loop.route.canonicalPath ||
+          prepared.requestContent !== content ||
+          prepared.operation !== (loop.route.kind === "comment" ? "update" : loop.route.kind)
+        ) {
+          return protocolWriteError("Loop comment request changed after preview; no mutation was submitted");
+        }
+        if (!isLoopMutation(loop.route)) {
+          return protocolWriteError(`Loop URI '${loop.route.canonicalPath}' is read-only`);
+        }
+        const tag = runtime.writeTagFor(session, callId);
+        if (tag && loop.route.kind === "comment") {
+          const filePath = await runtime.loopFileFor(
+            session,
+            loop.route.workspaceId,
+            loop.route.taskId,
+            loop.route.commentId,
+            lease,
+            lease.signal,
+          );
+          if (!filePath || getEditStore(session).headHash(filePath) !== tag) {
+            return protocolWriteError(`Stale or unseen Loop hashline snapshot for '${loop.route.canonicalPath}'; read the comment again before writing`);
+          }
+        }
+        return protocolWriteResult(await submitPreparedLoopMutation(prepared, state, lease, callId, "write"));
+      }
       const target = targetFromInternalUrl(url);
       if (!target) throw new Error(`Invalid Octo document URL '${url.rawHref ?? url.href}'`);
       const displayPath = runtime.displayPathFor(session, context?.toolCall?.id ?? "", target.canonicalBasePath);
@@ -903,10 +1705,54 @@ const octoProtocol: ProtocolHandler = {
 };
 
 const nativeReadExecute = ReadTool.prototype.execute;
+const nativeWriteExecute = WriteTool.prototype.execute;
 const nativeEditExecute = EditTool.prototype.execute;
 const nativeEditOpenArgStream = EditTool.prototype.openArgStream;
 const editStreams = new WeakMap<EditTool, Map<string, EditStreamState>>();
 const editStreamTools = new Set<EditTool>();
+const patchedWriteExecute: typeof WriteTool.prototype.execute = async function (
+  this: WriteTool,
+  toolCallId,
+  params,
+  signal,
+  onUpdate,
+  context,
+) {
+  const session = toolSessionOfWrite(this);
+  const loopPrepared = runtime.loopCallFor(session, toolCallId);
+  if (
+    loopPrepared &&
+    (loopPrepared.requestFingerprint !== toolArgsFingerprint(params) ||
+      !loopCallerRequestUnchanged(sessionManagerOf(session), toolCallId, loopPrepared, "write"))
+  ) {
+    return toolError("Loop caller or effective arguments changed after preview; no mutation was submitted. Invoke the write again for a new preview and approval") as Awaited<ReturnType<typeof nativeWriteExecute>>;
+  }
+  const rawPath = pathString(params);
+  const loop = parseLoopPath(unwrapWritePath(rawPath).path);
+  if (loop.kind === "other") {
+    if (loopPrepared) {
+      return toolError("Loop write target changed after preview; no mutation was submitted") as Awaited<ReturnType<typeof nativeWriteExecute>>;
+    }
+    return nativeWriteExecute.call(this, toolCallId, params, signal, onUpdate, context);
+  }
+  if (loop.kind === "invalid") return toolError(loop.message) as Awaited<ReturnType<typeof nativeWriteExecute>>;
+  if (!runtime.isActive(session)) {
+    return toolError("Octo tools are not active for this session") as Awaited<ReturnType<typeof nativeWriteExecute>>;
+  }
+  if (!isLoopMutation(loop.route)) {
+    return toolError(`Loop URI '${loop.route.canonicalPath}' is read-only`) as Awaited<ReturnType<typeof nativeWriteExecute>>;
+  }
+  const prepared = loopPrepared;
+  if (
+    !prepared ||
+    prepared.route.canonicalPath !== loop.route.canonicalPath ||
+    prepared.requestFingerprint !== toolArgsFingerprint(params)
+  ) {
+    return toolError("Loop comment arguments changed after preview; no mutation was submitted. Invoke the write again for a new preview and approval") as Awaited<ReturnType<typeof nativeWriteExecute>>;
+  }
+  return nativeWriteExecute.call(this, toolCallId, params, signal, onUpdate, context);
+};
+
 
 function currentEditStreams(tool: EditTool): Map<string, EditStreamState> {
   let streams = editStreams.get(tool);
@@ -991,6 +1837,40 @@ function openRemoteEdit(
     remoteEditPolicy(tool, rawInput, signal),
     onPreview,
     async (_error, url): Promise<EditUrlResolution> => {
+      const loop = parseLoopPath(url);
+      if (loop.kind === "invalid") return { error: loop.message, planWritable: false };
+      if (loop.kind === "loop") {
+        if (loop.route.kind !== "comment") {
+          return { error: `Hashline edits can target only a Loop comment body: '${url}'`, planWritable: false };
+        }
+        if (loop.route.selector) {
+          return { error: `Hashline edits must target the whole Loop comment: '${url}'`, planWritable: false };
+        }
+        try {
+          runtime.assertRefCurrent(ref, signal);
+          const snapshot = runtime.loopSnapshotFor(session, loop.route.workspaceId, loop.route.taskId, loop.route.commentId);
+          const filePath = await runtime.loopFileFor(
+            session,
+            loop.route.workspaceId,
+            loop.route.taskId,
+            loop.route.commentId,
+            ref,
+            signal,
+          );
+          if (!snapshot || !filePath) return { error: `Read Loop comment '${url}' before editing it`, planWritable: false };
+          if (
+            snapshot.workspaceId !== loop.route.workspaceId ||
+            snapshot.taskId !== loop.route.taskId ||
+            snapshot.commentId !== loop.route.commentId
+          ) {
+            return { error: `The Loop comment snapshot does not match '${url}'`, planWritable: false };
+          }
+          runtime.assertRefCurrent(ref, signal);
+          return { path: filePath, planWritable: true };
+        } catch (error) {
+          return { error: errorText(error), planWritable: false };
+        }
+      }
       const parsed = parseDocumentPath(url);
       if (parsed.kind === "invalid") return { error: parsed.message, planWritable: false };
       if (parsed.kind !== "octo") return { error: `Not an Octo document path: '${url}'`, planWritable: false };
@@ -1014,6 +1894,319 @@ function openRemoteEdit(
   return state;
 }
 
+function loopCommentBody(content: string): {
+  content: string;
+  attachmentIds: string[];
+  suppressExpertIds: string[];
+} {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    throw new Error("New Loop comments and replies require a JSON object with content");
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("New Loop comments and replies require a JSON object with content");
+  }
+  const body = parsed as Record<string, unknown>;
+  const allowed = new Set(["content", "attachment_ids", "suppress_expert_ids"]);
+  const unexpected = Object.keys(body).find(key => !allowed.has(key));
+  if (unexpected) throw new Error(`Unsupported Loop comment field '${unexpected}'`);
+  if (typeof body.content !== "string" || body.content.trim().length === 0) {
+    throw new Error("Loop comment content must be a non-empty string");
+  }
+  const attachmentIds = body.attachment_ids ?? [];
+  const suppressExpertIds = body.suppress_expert_ids ?? [];
+  if (!Array.isArray(attachmentIds) || attachmentIds.some(id => typeof id !== "string")) {
+    throw new Error("Loop comment attachment_ids must be an array of UUID strings");
+  }
+  if (!Array.isArray(suppressExpertIds) || suppressExpertIds.some(id => typeof id !== "string")) {
+    throw new Error("Loop comment suppress_expert_ids must be an array of UUID strings");
+  }
+  return {
+    content: body.content,
+    attachmentIds: [...attachmentIds],
+    suppressExpertIds: [...suppressExpertIds],
+  };
+}
+
+async function prepareLoopMutation(
+  session: ToolSession,
+  route: Extract<LoopRoute, { kind: "comment" | "create" | "reply" }>,
+  content: string,
+  requestFingerprint: string,
+  signal?: AbortSignal,
+  fixedSnapshot?: LoopCommentSnapshot,
+  attachmentIds: readonly string[] = [],
+  suppressExpertIds: readonly string[] = [],
+  writeTag?: string,
+  requestContent = content,
+): Promise<LoopPreparedCall> {
+  if (route.kind === "comment" && route.selector) {
+    throw new Error(`Loop comment writes must target the whole comment: '${route.canonicalPath}'`);
+  }
+  let snapshot = fixedSnapshot;
+  if (route.kind === "comment") snapshot ??= runtime.loopSnapshotFor(session, route.workspaceId, route.taskId, route.commentId);
+  const lease = runtime.beginOperation(session, signal);
+  try {
+    await enforcePlanModeWrite(session, route.canonicalPath, {
+      op: route.kind === "comment" ? "update" : "create",
+      signal: lease.signal,
+    });
+    runtime.assertCurrent(lease);
+    if (route.kind === "comment") {
+      if (
+        !snapshot ||
+        snapshot.workspaceId !== route.workspaceId ||
+        snapshot.taskId !== route.taskId ||
+        snapshot.commentId !== route.commentId
+      ) {
+        throw new Error(`Read Loop comment '${route.canonicalPath}' before writing it`);
+      }
+      const filePath = await runtime.loopFileFor(
+        session,
+        route.workspaceId,
+        route.taskId,
+        route.commentId,
+        lease,
+        lease.signal,
+      );
+      if (!filePath) throw new Error(`Read Loop comment '${route.canonicalPath}' before writing it`);
+      if (writeTag && getEditStore(session).headHash(filePath) !== writeTag) {
+        throw new Error(`Stale or unseen hashline snapshot for '${route.canonicalPath}'; read the comment again before writing`);
+      }
+    }
+    const previewInput: LoopCommentPreviewInput = route.kind === "comment"
+      ? {
+          workspaceId: route.workspaceId,
+          taskId: route.taskId,
+          editingCommentId: route.commentId,
+          content,
+        }
+      : {
+          workspaceId: route.workspaceId,
+          taskId: route.taskId,
+          ...(route.kind === "reply" ? { parentCommentId: route.parentCommentId } : {}),
+          content,
+          attachmentIds,
+          suppressExpertIds,
+        };
+    const expectedIdentity = snapshot?.identity ?? await currentLoopIdentity(lease.signal);
+    const preview = await previewLoopComment(previewInput, expectedIdentity, lease.signal);
+    runtime.assertCurrent(lease);
+    if (!sameLoopIdentity(expectedIdentity, preview.identity)) {
+      throw new Error("Octo Loop identity changed while previewing the comment; no mutation was submitted");
+    }
+    if (toolArgsFingerprint(preview.input) !== toolArgsFingerprint(previewInput)) {
+      throw new Error("Loop preview parameters changed unexpectedly; no mutation was submitted");
+    }
+    return {
+      session,
+      route,
+      operation: route.kind === "comment" ? "update" : route.kind,
+      content,
+      requestContent,
+      preview,
+      ...(snapshot ? { snapshot } : {}),
+      requestFingerprint,
+    };
+  } finally {
+    lease.release();
+  }
+}
+
+async function prepareLoopEditCandidate(
+  tool: EditTool,
+  route: Extract<LoopRoute, { kind: "comment" }>,
+  input: string,
+  signal?: AbortSignal,
+): Promise<{ snapshot: LoopCommentSnapshot; content: string }> {
+  const session = toolSessionOfEdit(tool);
+  const parsed = hashlineSections(input);
+  if (!parsed || parsed.sections.length !== 1 || route.selector) {
+    throw new Error("Loop comment edits require one whole-body hashline target");
+  }
+  const sectionRoute = parseLoopPath(parsed.sections[0]!.path);
+  if (
+    sectionRoute.kind !== "loop" ||
+    sectionRoute.route.kind !== "comment" ||
+    sectionRoute.route.canonicalPath !== route.canonicalPath ||
+    sectionRoute.route.selector
+  ) {
+    throw new Error("Loop comment edits require one whole-body hashline target");
+  }
+  const key = loopCommentKey(route.workspaceId, route.taskId, route.commentId);
+  const fixedSnapshot = runtime.loopSnapshotFor(session, route.workspaceId, route.taskId, route.commentId);
+  const lease = runtime.beginOperation(session, signal);
+  let native: EditSession | undefined;
+  try {
+    const state = await runtime.sessionState(session, lease);
+    const snapshot = fixedSnapshot;
+    const filePath = state.loopFiles.get(key);
+    if (!snapshot || !filePath) throw new Error(`Read Loop comment '${route.canonicalPath}' before editing it`);
+    if (
+      snapshot.workspaceId !== route.workspaceId ||
+      snapshot.taskId !== route.taskId ||
+      snapshot.commentId !== route.commentId
+    ) {
+      throw new Error(`The Loop comment snapshot does not match '${route.canonicalPath}'`);
+    }
+    const store = getEditStore(session);
+    const tag = parsed.sections[0]!.tag;
+    const headTag = store.headHash(filePath);
+    const taggedText = store.byHashText(filePath, tag);
+    if (tag !== headTag || taggedText !== snapshot.comment.content) {
+      throw new Error(`Stale Loop hashline snapshot for '${route.canonicalPath}'; re-read the latest comment before editing`);
+    }
+    const seenLines = store.seenLines(filePath, tag);
+    if (!seenLines) throw new Error(`Loop hashline provenance is missing for '${route.canonicalPath}'; re-read before editing`);
+    const stagedStore = new EditStore();
+    const stagedTag = stagedStore.recordSnapshot(filePath, snapshot.comment.content);
+    stagedStore.recordSeenLines(filePath, stagedTag, seenLines);
+    const policy = remoteEditPolicy(tool, false, lease.signal);
+    native = new EditSession(
+      stagedStore,
+      policy,
+      undefined,
+      async (_error, url): Promise<EditUrlResolution> => {
+        const resolved = parseLoopPath(url);
+        if (
+          resolved.kind !== "loop" ||
+          resolved.route.kind !== "comment" ||
+          resolved.route.canonicalPath !== route.canonicalPath ||
+          resolved.route.selector
+        ) {
+          return { error: `Loop edit target changed while preparing '${url}'`, planWritable: false };
+        }
+        return { path: filePath, planWritable: true };
+      },
+    );
+    native.setArgsJson(JSON.stringify({ input }));
+    native.finish();
+    let candidate: string | undefined;
+    const outcome = await native.apply({ lspFlush: false }, async (error, request: EditWriteRequest) => {
+      if (error) throw error;
+      runtime.assertCurrent(lease);
+      if (request.op !== "update" || request.content === undefined) {
+        throw new Error(`Loop comments cannot be ${request.op === "delete" ? "deleted" : request.op === "move" ? "renamed" : "created"}`);
+      }
+      candidate = request.content;
+      return { written: request.content };
+    });
+    if (outcome.isError) throw new Error(outcome.text || "Loop hashline edit preview failed");
+    runtime.assertCurrent(lease);
+    return { snapshot, content: candidate ?? snapshot.comment.content };
+  } finally {
+    native?.close();
+    lease.release();
+  }
+}
+function loopEditRoute(
+  input: string,
+  directPath: string,
+): Extract<LoopRoute, { kind: "comment" }> | undefined {
+  const direct = directPath
+    ? parseLoopPath(unwrapWritePath(directPath).path)
+    : { kind: "other" as const };
+  const sections = hashlineSections(input);
+  const loopSections = sections?.sections.flatMap(section => {
+    const parsed = parseLoopPath(section.path);
+    return parsed.kind === "other" ? [] : [{ parsed }];
+  }) ?? [];
+  const onlyLoopSection = loopSections.length === 1 ? loopSections[0] : undefined;
+  const hasLoopTarget = direct.kind !== "other" || loopSections.length > 0 || hasNonHashlineLoopFileTarget(input);
+  if (!hasLoopTarget) return undefined;
+  const remoteSections = input ? remoteSectionsFor(input) : undefined;
+  if (
+    directPath.length > 0 ||
+    hasNonHashlinePatchTarget(input) ||
+    !sections ||
+    sections.sections.length !== 1 ||
+    !remoteSections ||
+    remoteSections.remote.length !== 1 ||
+    remoteSections.local.length !== 0 ||
+    !onlyLoopSection ||
+    onlyLoopSection.parsed.kind !== "loop" ||
+    onlyLoopSection.parsed.route.kind !== "comment" ||
+    onlyLoopSection.parsed.route.selector
+  ) {
+    throw new Error("Loop edits require exactly one whole-comment hashline target; mixed or multi-target patches are not supported");
+  }
+  return onlyLoopSection.parsed.route;
+}
+
+function isLoopEditApprovalArgs(args: unknown): boolean {
+  try {
+    return loopEditRoute(inputString(args), pathString(args)) !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+function isLoopWriteApprovalArgs(args: unknown): boolean {
+  try {
+    const rawPath = pathString(args);
+    if (!rawPath) return false;
+    const parsed = parseLoopPath(unwrapWritePath(rawPath).path);
+    return parsed.kind === "loop" &&
+      isLoopMutation(parsed.route) &&
+      !(parsed.route.kind === "comment" && parsed.route.selector !== undefined);
+  } catch {
+    return false;
+  }
+}
+
+async function prepareLoopWriteCall(
+  session: ToolSession,
+  params: unknown,
+  requestFingerprint: string,
+  writeTag?: string,
+): Promise<LoopPreparedCall | undefined> {
+  const rawPath = pathString(params);
+  const parsed = parseLoopPath(unwrapWritePath(rawPath).path);
+  if (parsed.kind === "other") return undefined;
+  if (parsed.kind === "invalid") throw new Error(parsed.message);
+  if (!isLoopMutation(parsed.route)) throw new Error(`Loop URI '${parsed.route.canonicalPath}' is read-only`);
+  const values = typeof params === "object" && params !== null ? params as Record<string, unknown> : {};
+  if (typeof values.content !== "string") throw new Error("Loop comment writes require string content");
+  if (parsed.route.kind === "comment") {
+    return prepareLoopMutation(session, parsed.route, values.content, requestFingerprint, undefined, undefined, [], [], writeTag);
+  }
+  const body = loopCommentBody(values.content);
+  return prepareLoopMutation(
+    session,
+    parsed.route,
+    body.content,
+    requestFingerprint,
+    undefined,
+    undefined,
+    body.attachmentIds,
+    body.suppressExpertIds,
+    writeTag,
+    values.content,
+  );
+}
+
+async function prepareLoopEditCall(
+  tool: EditTool,
+  params: unknown,
+  requestFingerprint: string,
+): Promise<LoopPreparedCall | undefined> {
+  const input = inputString(params);
+  const route = loopEditRoute(input, pathString(params));
+  if (!route) return undefined;
+  const candidate = await prepareLoopEditCandidate(tool, route, input);
+  return prepareLoopMutation(
+    toolSessionOfEdit(tool),
+    route,
+    candidate.content,
+    requestFingerprint,
+    undefined,
+    candidate.snapshot,
+  );
+}
+
+
 function readOutputForOcto(result: NativeResult, filePath: string | undefined, displayPath: string, cwd: string): NativeResult {
   const content = result.content.map(block => ({ ...block }));
   const first = content.find(block => block.type === "text" && typeof block.text === "string");
@@ -1036,6 +2229,39 @@ function readOutputForOcto(result: NativeResult, filePath: string | undefined, d
   details.resolvedPath = displayPath;
   return { ...result, content, details };
 }
+function readOutputForLoop(
+  result: NativeResult,
+  displayPath: string,
+  filePath: string | undefined,
+  cwd: string,
+): NativeResult {
+  const canonicalRoute = parseLoopPath(displayPath);
+  if (canonicalRoute.kind !== "loop" || canonicalRoute.route.canonicalPath !== displayPath) {
+    return toolError("Loop hashline output requires a canonical Loop URI");
+  }
+  const content = result.content.map(block => ({ ...block }));
+  const first = content.find(block => block.type === "text" && typeof block.text === "string");
+  if (first && typeof first.text === "string") {
+    const newline = first.text.indexOf("\n");
+    const headerLine = newline < 0 ? first.text : first.text.slice(0, newline);
+    const header = /^\[([^\]]+)#([0-9a-f]{4})\]$/i.exec(headerLine);
+    if (header) {
+      const headerPath = header[1]!;
+      if (filePath && sameFilesystemPath(headerPath, filePath, cwd)) {
+        first.text = `[${displayPath}#${header[2]}]${newline < 0 ? "" : first.text.slice(newline)}`;
+      } else if (headerPath !== displayPath) {
+        return toolError("Loop hashline snapshot header did not match its canonical URI; re-read the comment before editing");
+      }
+    }
+    if (result.isError && !first.text.includes(displayPath)) {
+      first.text = `Unable to read Loop resource '${displayPath}': ${first.text}`;
+    }
+  }
+  const details = result.details && typeof result.details === "object" ? { ...(result.details as Record<string, unknown>) } : {};
+  details.resolvedPath = displayPath;
+  return { ...result, content, details };
+}
+
 
 function recordOctoReadSeenLines(session: ToolSession, filePath: string | undefined, result: NativeResult): void {
   if (!filePath || result.isError) return;
@@ -1076,6 +2302,31 @@ const patchedReadExecute: typeof ReadTool.prototype.execute = async function (
 ) {
   const session = toolSessionOfRead(this);
   const rawPath = typeof params.path === "string" ? params.path : "";
+  const loop = parseLoopPath(rawPath);
+  if (loop.kind === "invalid") return toolError(loop.message) as Awaited<ReturnType<typeof nativeReadExecute>>;
+  if (loop.kind === "loop") {
+    if (!runtime.isActive(session)) {
+      return toolError("Octo tools are not active for this session") as Awaited<ReturnType<typeof nativeReadExecute>>;
+    }
+    let lease: OperationLease | undefined;
+    try {
+      lease = runtime.beginOperation(session, signal, runtime.generationForCall(session, toolCallId));
+      const result = await nativeReadExecute.call(this, toolCallId, params, lease.signal, onUpdate, context) as NativeResult;
+      runtime.assertCurrent(lease);
+      const filePath = loop.route.kind === "comment"
+        ? await runtime.loopFileFor(session, loop.route.workspaceId, loop.route.taskId, loop.route.commentId, lease, lease.signal)
+        : undefined;
+      if (loop.route.kind === "comment" && !filePath && !result.isError) {
+        return toolError(`Loop comment snapshot for '${loop.route.canonicalPath}' is unavailable in this session; re-read before editing`) as Awaited<ReturnType<typeof nativeReadExecute>>;
+      }
+      recordOctoReadSeenLines(session, filePath, result);
+      return readOutputForLoop(result, loop.route.canonicalPath, filePath, session.cwd) as Awaited<ReturnType<typeof nativeReadExecute>>;
+    } catch (error) {
+      return toolError(`Unable to read Loop resource '${loop.route.canonicalPath}': ${errorText(error)}`) as Awaited<ReturnType<typeof nativeReadExecute>>;
+    } finally {
+      lease?.release();
+    }
+  }
   const parsed = parseDocumentPath(rawPath);
   if (parsed.kind === "other") {
     return nativeReadExecute.call(this, toolCallId, params, signal, onUpdate, context);
@@ -1205,8 +2456,7 @@ function remoteSectionsFor(input: string): { parsed: HashlineSections; local: Ha
   const local: HashlineSection[] = [];
   const remote: HashlineSection[] = [];
   for (const section of parsed.sections) {
-    const target = parseDocumentPath(section.path);
-    if (target.kind === "octo" || target.kind === "invalid" && isOctoLikePath(section.path)) remote.push(section);
+    if (isRemoteOctoPathLike(section.path)) remote.push(section);
     else local.push(section);
   }
   return { parsed, local, remote };
@@ -1215,7 +2465,7 @@ function remoteSectionsFor(input: string): { parsed: HashlineSections; local: Ha
 function mapTempPaths(text: string, state: OctoSessionState, session: ToolSession, toolCallId: string): string {
   let result = text;
   for (const [id, filePath] of state.filesById) {
-    const canonical = `octo://${encodeURIComponent(id)}`;
+    const canonical = `octo://docs/${encodeURIComponent(id)}`;
     const displayPath = runtime.displayPathFor(session, toolCallId, canonical);
     for (const alias of filePathAliases(filePath)) result = result.replaceAll(alias, displayPath);
     result = result.replaceAll(canonical, displayPath);
@@ -1305,7 +2555,7 @@ async function applyRemoteEdit(
       const id = runtime.idForFile(session, request.path);
       const document = id ? state.readDocuments.get(id) : undefined;
       if (!id || !document) throw new Error(`No read snapshot is available for '${request.displayPath}'`);
-      const canonicalPath = `octo://${encodeURIComponent(id)}`;
+      const canonicalPath = `octo://docs/${encodeURIComponent(id)}`;
       await enforcePlanModeWrite(session, canonicalPath, { op: "update", signal: lease.signal });
       runtime.assertCurrent(lease);
       let written: OctoDocument;
@@ -1321,10 +2571,10 @@ async function applyRemoteEdit(
     });
   } catch (error) {
     const committedPaths = [...committed.keys()].map(id =>
-      runtime.displayPathFor(session, toolCallId, `octo://${encodeURIComponent(id)}`),
+      runtime.displayPathFor(session, toolCallId, `octo://docs/${encodeURIComponent(id)}`),
     );
     const uncertainPaths = [...uncertain.keys()].map(id =>
-      runtime.displayPathFor(session, toolCallId, `octo://${encodeURIComponent(id)}`),
+      runtime.displayPathFor(session, toolCallId, `octo://docs/${encodeURIComponent(id)}`),
     );
     const failure = mapTempPaths(errorText(error), state, session, toolCallId);
     const statuses = [
@@ -1360,7 +2610,7 @@ async function applyRemoteEdit(
   const details = {
     files: outcome.files.map(file => {
       const id = runtime.idForFile(session, file.path);
-      const canonical = id ? `octo://${encodeURIComponent(id)}` : file.displayPath;
+      const canonical = id ? `octo://docs/${encodeURIComponent(id)}` : file.displayPath;
       return {
         path: runtime.displayPathFor(session, toolCallId, canonical),
         operation: file.op,
@@ -1380,6 +2630,165 @@ async function applyRemoteEdit(
 function nativeToolParamsForSections(params: Record<string, unknown>, input: string): Record<string, unknown> {
   return { ...params, input };
 }
+async function submitPreparedLoopMutation(
+  prepared: LoopPreparedCall,
+  state: OctoSessionState,
+  lease: OperationLease,
+  callId: string,
+  toolName: "write" | "edit",
+): Promise<NativeResult> {
+  if (!runtime.consumeLoopApproval(prepared.session, callId, prepared, toolName)) {
+    return toolError("Loop comment mutation requires this call's explicitly displayed preview and approval; no mutation was submitted");
+  }
+  try {
+    runtime.assertCurrent(lease);
+    await enforcePlanModeWrite(prepared.session, prepared.route.canonicalPath, {
+      op: prepared.operation === "update" ? "update" : "create",
+      signal: lease.signal,
+    });
+    runtime.assertCurrent(lease);
+    if (prepared.operation === "update") {
+      const snapshot = prepared.snapshot;
+      if (!snapshot || !sameLoopIdentity(snapshot.identity, prepared.preview.identity)) {
+        return toolError("Loop comment identity or read snapshot changed after preview; re-read and request approval again");
+      }
+    }
+    const currentIdentity = await currentLoopIdentity(lease.signal);
+    runtime.assertCurrent(lease);
+    if (!sameLoopIdentity(prepared.preview.identity, currentIdentity)) {
+      return toolError("Octo Loop identity changed after preview; no mutation was submitted");
+    }
+    if (!loopCallerRequestUnchanged(sessionManagerOf(prepared.session), callId, prepared, toolName)) {
+      return toolError("Loop caller or effective arguments changed after preview; no mutation was submitted. Invoke the tool again for a new preview and approval");
+    }
+    if (prepared.operation === "update") {
+      const updated = await updateLoopComment(prepared.snapshot!, prepared.content, prepared.preview, lease.signal);
+      try {
+        runtime.assertCurrent(lease);
+        await runtime.recordLoopComment(state, updated, lease);
+      } catch (error) {
+        return toolError(
+          `Loop comment '${prepared.route.canonicalPath}' was successfully updated on the server, but the local snapshot could not be refreshed; do not retry the mutation: ${errorText(error)}`,
+        );
+      }
+      return { content: [{ type: "text", text: `Updated Loop comment '${prepared.route.canonicalPath}'` }] };
+    }
+    await createLoopComment(prepared.preview, lease.signal);
+    try {
+      runtime.assertCurrent(lease);
+    } catch (error) {
+      return toolError(
+        `Loop comment creation at '${prepared.route.canonicalPath}' was confirmed by the server, but post-submission session validation failed; do not retry the mutation: ${errorText(error)}`,
+      );
+    }
+    return { content: [{ type: "text", text: `Created Loop comment at '${prepared.route.canonicalPath}'` }] };
+  } catch (error) {
+    if (error instanceof LoopMutationConfirmedCleanupError) {
+      let refreshWarning = "";
+      if (error.operation === "update" && prepared.operation === "update") {
+        try {
+          const route = prepared.route;
+          if (route.kind !== "comment") {
+            throw new Error("The prepared update target is not a Loop comment");
+          }
+          const updated = error.result;
+          if (
+            !isLoopCommentSnapshot(updated) ||
+            updated.workspaceId !== route.workspaceId ||
+            updated.taskId !== route.taskId ||
+            updated.commentId !== route.commentId ||
+            updated.comment.comment_id !== route.commentId ||
+            updated.comment.task_id !== route.taskId ||
+            updated.comment.content !== prepared.content ||
+            !sameLoopIdentity(updated.identity, prepared.preview.identity)
+          ) {
+            throw new Error("The confirmed update result did not match the approved Loop comment snapshot");
+          }
+          runtime.assertCurrent(lease);
+          await runtime.recordLoopComment(state, updated, lease);
+        } catch (refreshError) {
+          refreshWarning = ` Local snapshot refresh also failed: ${errorText(refreshError)}.`;
+        }
+      }
+      let createdCommentId = "";
+      if (error.operation === "create" && isRecord(error.result) && isRecord(error.result.data)) {
+        const id = error.result.data.comment_id;
+        if (typeof id === "string") createdCommentId = ` Created comment ID: ${id}.`;
+      }
+      const committedOperation = error.operation === "update"
+        ? "update"
+        : prepared.operation === "reply" ? "reply" : "creation";
+      return {
+        content: [{
+          type: "text",
+          text:
+            `Loop comment ${committedOperation} at '${prepared.route.canonicalPath}' was successfully committed and confirmed by the server. Temporary credential cleanup failed: ${error.diagnostics}.${refreshWarning}${createdCommentId} Do not retry the mutation.`,
+        }],
+        details: {
+          outcome: "confirmed",
+          operation: error.operation,
+          target: prepared.route.canonicalPath,
+          credentialCleanup: "failed",
+          cleanupDiagnostics: error.diagnostics,
+          ...(refreshWarning ? { snapshotRefreshWarning: refreshWarning.trim() } : {}),
+          ...(createdCommentId ? { createdCommentId: createdCommentId.trim() } : {}),
+        },
+      };
+    }
+    if (error instanceof LoopMutationConfirmedResponseError) {
+      const committedOperation = error.operation === "update"
+        ? "update"
+        : prepared.operation === "reply" ? "reply" : "creation";
+      let createdCommentId = "";
+      if (error.operation === "create" && isRecord(error.result) && isRecord(error.result.data)) {
+        const id = error.result.data.comment_id;
+        if (typeof id === "string") createdCommentId = ` Created comment ID: ${id}.`;
+      }
+      return toolError(
+        `Loop comment ${committedOperation} at '${prepared.route.canonicalPath}' was confirmed by the server, but its response identity could not be validated: ${error.diagnostics}.${createdCommentId} Do not retry the mutation.`,
+      );
+    }
+    const operation = prepared.operation === "update" ? "update" : "creation";
+    const outcome = error instanceof LoopMutationOutcomeUnknownError
+      ? `Loop comment ${operation} outcome is unknown`
+      : `Unable to ${prepared.operation === "update" ? "update" : "create"} Loop comment`;
+    return toolError(`${outcome} at '${prepared.route.canonicalPath}': ${errorText(error)}`);
+  }
+}
+function formatLoopApprovalDetails(prepared: LoopPreparedCall, args: unknown): string[] {
+  const input = prepared.preview.input;
+  const lines = [
+    `Loop operation: ${prepared.operation}`,
+    `Target: ${prepared.route.canonicalPath}`,
+    `Workspace ID: ${input.workspaceId}`,
+    `Task ID: ${input.taskId}`,
+  ];
+  if (input.parentCommentId) lines.push(`Parent comment ID: ${input.parentCommentId}`);
+  if (input.editingCommentId) lines.push(`Editing comment ID: ${input.editingCommentId}`);
+  lines.push(`Comment body:\n${prepared.content}`);
+  if (prepared.operation === "update") {
+    const attachments = prepared.snapshot?.comment.attachments.map(attachment => attachment.id) ?? [];
+    const suppressIds = Array.isArray(prepared.snapshot?.comment.suppress_expert_ids)
+      ? prepared.snapshot.comment.suppress_expert_ids.filter((id): id is string => typeof id === "string")
+      : [];
+    lines.push(`Attachment IDs retained (not changed by update): ${JSON.stringify(attachments)}`);
+    lines.push(`Suppressed expert IDs retained (not changed by update): ${JSON.stringify(suppressIds)}`);
+  } else {
+    lines.push(`Attachment IDs: ${JSON.stringify(input.attachmentIds ?? [])}`);
+    lines.push(`Suppressed expert IDs: ${JSON.stringify(input.suppressExpertIds ?? [])}`);
+  }
+  lines.push(`Trigger preview candidates (${prepared.preview.experts.length}):`);
+  if (prepared.preview.experts.length === 0) lines.push("(none)");
+  for (const expert of prepared.preview.experts) {
+    lines.push(`- ${expert.name} (${expert.expert_id}); source: ${expert.source}; reason: ${expert.reason}`);
+  }
+  if (toolArgsFingerprint(args) !== prepared.requestFingerprint) {
+    lines.unshift("BLOCKED: effective tool arguments differ from the previewed request; execution will be rejected");
+  }
+  return lines;
+}
+
+
 
 const patchedEditExecute: typeof EditTool.prototype.execute = async function (
   this: EditTool,
@@ -1392,14 +2801,75 @@ const patchedEditExecute: typeof EditTool.prototype.execute = async function (
   const session = toolSessionOfEdit(this);
   const streamed = editStreams.get(this)?.get(toolCallId);
   const input = inputString(params);
+  const loopPrepared = runtime.loopCallFor(session, toolCallId);
+  if (
+    loopPrepared &&
+    (loopPrepared.requestFingerprint !== toolArgsFingerprint(params) || !loopCallerRequestUnchanged(sessionManagerOf(session), toolCallId, loopPrepared, "edit"))
+  ) {
+    if (streamed) discardEditStream(this, toolCallId, streamed);
+    return toolError("Loop caller or effective arguments changed after preview; no mutation was submitted. Invoke the edit again for a new preview and approval") as Awaited<ReturnType<typeof nativeEditExecute>>;
+  }
   const directPath = pathString(params);
-  const directTarget = directPath ? parseDocumentPath(unwrapWritePath(directPath).path) : { kind: "other" as const };
+  const unwrappedPath = directPath ? unwrapWritePath(directPath).path : "";
+  const directTarget = directPath ? parseDocumentPath(unwrappedPath) : { kind: "other" as const };
+  const directLoop = directPath ? parseLoopPath(unwrappedPath) : { kind: "other" as const };
   const parsedSections = input ? remoteSectionsFor(input) : undefined;
   const hasRemoteSections = !!parsedSections?.remote.length;
   const nonHashlineTarget = input ? hasNonHashlineOctoFileTarget(input) : false;
-  const hasRemoteDirectPath = directTarget.kind === "octo" || directTarget.kind === "invalid" && isOctoLikePath(directPath);
-  const hasRemoteTarget = hasRemoteSections || nonHashlineTarget || hasRemoteDirectPath;
-
+  const hasRemoteDirectPath = directTarget.kind === "octo" || directTarget.kind === "invalid" && isDocsPathLike(directPath);
+  const loopSections = parsedSections?.parsed.sections.flatMap(section => {
+    const parsed = parseLoopPath(section.path);
+    return parsed.kind === "other" ? [] : [{ section, parsed }];
+  }) ?? [];
+  const nonHashlineLoopTarget = input ? hasNonHashlineLoopFileTarget(input) : false;
+  const hasLoopTarget = directLoop.kind !== "other" || loopSections.length > 0 || nonHashlineLoopTarget;
+  const hasRemoteTarget = hasRemoteSections || nonHashlineTarget || hasRemoteDirectPath || hasLoopTarget;
+  if (hasLoopTarget) {
+    if (streamed) discardEditStream(this, toolCallId, streamed);
+    if (!runtime.isActive(session)) return toolError("Octo tools are not active for this session") as Awaited<ReturnType<typeof nativeEditExecute>>;
+    if (this.mode !== "hashline") return toolError("Loop comment edits require hashline mode") as Awaited<ReturnType<typeof nativeEditExecute>>;
+    const onlySection = loopSections.length === 1 ? loopSections[0] : undefined;
+    if (
+      directLoop.kind !== "other" ||
+      nonHashlineTarget ||
+      hasNonHashlinePatchTarget(input) ||
+      !parsedSections ||
+      parsedSections.parsed.sections.length !== 1 ||
+      parsedSections.local.length !== 0 ||
+      parsedSections.remote.length !== 1 ||
+      !onlySection ||
+      onlySection.parsed.kind !== "loop" ||
+      onlySection.parsed.route.kind !== "comment" ||
+      onlySection.parsed.route.selector
+    ) {
+      return toolError("Loop edits require exactly one whole-comment hashline target; mixed or multi-target Loop patches are rejected before any write") as Awaited<ReturnType<typeof nativeEditExecute>>;
+    }
+    const route = onlySection.parsed.route;
+    const prepared = runtime.loopCallFor(session, toolCallId);
+    if (
+      !prepared ||
+      prepared.operation !== "update" ||
+      prepared.route.canonicalPath !== route.canonicalPath ||
+      prepared.requestFingerprint !== toolArgsFingerprint(params) ||
+      !loopCallerRequestUnchanged(sessionManagerOf(session), toolCallId, prepared, "edit")
+    ) {
+      return toolError("Loop caller or effective arguments changed after preview; no mutation was submitted. Invoke the edit again for a new preview and approval") as Awaited<ReturnType<typeof nativeEditExecute>>;
+    }
+    let lease: OperationLease;
+    try {
+      lease = runtime.beginOperation(session, signal, streamed?.generation ?? runtime.generationForCall(session, toolCallId));
+    } catch (error) {
+      return toolError(`Loop edit is unavailable for this session: ${errorText(error)}`) as Awaited<ReturnType<typeof nativeEditExecute>>;
+    }
+    try {
+      const state = await runtime.sessionState(session, lease);
+      return await submitPreparedLoopMutation(prepared, state, lease, toolCallId, "edit") as Awaited<ReturnType<typeof nativeEditExecute>>;
+    } catch (error) {
+      return toolError(`Loop edit failed: ${errorText(error)}`) as Awaited<ReturnType<typeof nativeEditExecute>>;
+    } finally {
+      lease.release();
+    }
+  }
   if (!hasRemoteTarget) {
     if (streamed) {
       if (streamed.branch === "remote" || streamed.branch === "unsupported") discardEditStream(this, toolCallId, streamed);
@@ -1460,7 +2930,7 @@ const patchedEditExecute: typeof EditTool.prototype.execute = async function (
 
     for (const section of parsedSections.parsed.sections) {
       const target = parseDocumentPath(section.path);
-      const isRemote = target.kind === "octo" || target.kind === "invalid" && isOctoLikePath(section.path);
+      const isRemote = target.kind === "octo" || target.kind === "invalid" && isDocsPathLike(section.path);
       const displayPath = target.kind === "octo"
         ? runtime.displayPathFor(session, toolCallId, target.target.canonicalBasePath)
         : section.path;
@@ -1477,13 +2947,11 @@ const patchedEditExecute: typeof EditTool.prototype.execute = async function (
         result = toolError(`Mixed edit was cancelled before submission: ${operationError}`);
       } else if (isRemote) {
         result = await applyRemoteEdit(this, toolCallId, sectionInput, lease, undefined);
-        const details = typeof result.details === "object" && result.details !== null
-          ? result.details as { committedDocuments?: unknown; uncertainPaths?: unknown }
-          : undefined;
+        const details = isRecord(result.details) ? result.details : undefined;
         if (Array.isArray(details?.committedDocuments)) {
           for (const id of details.committedDocuments) {
             if (typeof id !== "string") continue;
-            addCompletedTarget(runtime.displayPathFor(session, toolCallId, `octo://${encodeURIComponent(id)}`));
+            addCompletedTarget(runtime.displayPathFor(session, toolCallId, `octo://docs/${encodeURIComponent(id)}`));
           }
         }
         if (Array.isArray(details?.uncertainPaths)) {
@@ -1529,6 +2997,7 @@ const patchedEditExecute: typeof EditTool.prototype.execute = async function (
             ...results.slice(0, -1).flatMap(entry => entry.result.content),
           ],
           details: {
+            diff: mixedEditDiff(results),
             completedTargets,
             uncertainTargets,
             failedTarget: displayPath,
@@ -1538,7 +3007,7 @@ const patchedEditExecute: typeof EditTool.prototype.execute = async function (
               isError: !!operationResult.isError,
               details: operationResult.details,
             })),
-          },
+          } satisfies MixedEditDetails,
           isError: true,
         } as Awaited<ReturnType<typeof nativeEditExecute>>;
       }
@@ -1550,6 +3019,7 @@ const patchedEditExecute: typeof EditTool.prototype.execute = async function (
         ...results.flatMap(entry => entry.result.content),
       ],
       details: {
+        diff: mixedEditDiff(results),
         completedTargets,
         uncertainTargets,
         operations: results.map(({ target: operationTarget, domain, result: operationResult }) => ({
@@ -1558,7 +3028,7 @@ const patchedEditExecute: typeof EditTool.prototype.execute = async function (
           isError: !!operationResult.isError,
           details: operationResult.details,
         })),
-      },
+      } satisfies MixedEditDetails,
     } as Awaited<ReturnType<typeof nativeEditExecute>>;
   } finally {
     lease.release();
@@ -1612,13 +3082,263 @@ function normalizedInputForToolCall(event: { toolName: string; input: unknown },
 
 const UNWRAPPED_EXECUTE = "OutputMeta.UnwrappedExecute";
 
+type ApprovalDetailsFormatter = (args: unknown) => string[];
+type ApprovalDetailsDescriptor = PropertyDescriptor & { value: ApprovalDetailsFormatter };
+type NativeApprovalContext = AgentToolContext & { acpApprovedArgs?: unknown };
+type NativeEditApproval = (args: unknown, context?: NativeApprovalContext) => ReturnType<EditTool["approval"]>;
+type NativeEditApprovalDescriptor = PropertyDescriptor & { value: NativeEditApproval };
+type NativeWriteApproval = (args: unknown, context?: NativeApprovalContext) => ReturnType<WriteTool["approval"]>;
+type NativeWriteApprovalDescriptor = PropertyDescriptor & { value: NativeWriteApproval };
+type LoopApprovalClaim =
+  | { kind: "none" }
+  | { kind: "matched"; candidate: LoopApprovalCandidate }
+  | { kind: "rejected" };
+
+function approvalCallId(context: NativeApprovalContext | undefined, toolName: "write" | "edit"): string | undefined | null {
+  if (!context || !Object.hasOwn(context, "toolCall")) return undefined;
+  const toolCall: unknown = Reflect.get(context, "toolCall");
+  if (!isRecord(toolCall) || !Array.isArray(toolCall.toolCalls) || typeof toolCall.index !== "number") return null;
+  const entry: unknown = toolCall.toolCalls[toolCall.index];
+  if (!isRecord(entry) || typeof entry.id !== "string" || entry.id.length === 0) return null;
+  if (entry.name !== toolName && !(toolName === "edit" && entry.name === "apply_patch")) return null;
+  return entry.id;
+}
+
+function approvalEventArgs(instance: object, toolName: "write" | "edit", args: Record<string, unknown>): Record<string, unknown> | undefined {
+  let resolved: Record<string, unknown> = args;
+  if (toolName === "edit") {
+    const resolver: unknown = Reflect.get(instance, "resolveEventInput");
+    if (typeof resolver === "function") {
+      for (const key of ["input", "_input"] as const) {
+        const value = resolved[key];
+        if (typeof value !== "string" || value.length === 0) continue;
+        const next: unknown = Reflect.apply(resolver, instance, [value]);
+        if (typeof next !== "string") return undefined;
+        if (next === value) continue;
+        if (resolved === args) resolved = { ...args };
+        resolved[key] = next;
+      }
+    }
+  }
+  return { ...resolved };
+}
+
+function hasLoopCallerRequestForCall(
+  manager: object,
+  session: ToolSession,
+  callId: string,
+  toolName: "write" | "edit",
+): boolean {
+  const generation = runtime.generationForCall(session, callId);
+  if (!generation || generation.manager !== manager) return false;
+  return loopCallerRequestRegistry.requests.get(manager)?.get(callId)?.get(generation.generation)
+    ?.some(request => request.session === session && request.toolName === toolName) ?? false;
+}
+function hasLoopCallerRequestForArgs(
+  manager: object,
+  session: ToolSession,
+  toolName: "write" | "edit",
+  args: Record<string, unknown>,
+): boolean {
+  const generation = runtime.captureManagerGeneration(manager as ManagerRef);
+  if (!generation || generation.manager !== manager) return false;
+  const calls = loopCallerRequestRegistry.requests.get(manager);
+  if (!calls) return false;
+  for (const callGenerations of calls.values()) {
+    const requests = callGenerations.get(generation.generation);
+    if (requests?.some(request =>
+      request.session === session &&
+      request.toolName === toolName &&
+      (request.callerArgs === args || request.effectiveArgs === args)
+    )) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function captureLoopApprovalCandidate(
+  instance: object,
+  manager: object,
+  session: ToolSession,
+  toolName: "write" | "edit",
+  args: unknown,
+  context: NativeApprovalContext | undefined,
+): boolean {
+  if (!isRecord(args)) return false;
+  const generation = runtime.captureManagerGeneration(manager as ManagerRef);
+  if (!generation || generation.manager !== manager) return false;
+  const callId = approvalCallId(context, toolName);
+  if (callId === null) return false;
+  if (callId !== undefined) {
+    if (hasLoopCallerRequestForCall(manager, session, callId, toolName)) return true;
+    if (runtime.loopCallFor(session, callId)) return false;
+  } else if (hasLoopCallerRequestForArgs(manager, session, toolName, args)) {
+    return true;
+  }
+  const fingerprint = toolArgsFingerprint(args);
+  if (fingerprint === "unserializable") return false;
+  const eventArgs = approvalEventArgs(instance, toolName, args);
+  if (!eventArgs) return false;
+  let byGeneration = loopCallerRequestRegistry.approvalCandidates.get(manager);
+  if (!byGeneration) {
+    byGeneration = new Map();
+    loopCallerRequestRegistry.approvalCandidates.set(manager, byGeneration);
+  }
+  let candidates = byGeneration.get(generation.generation);
+  if (!candidates) {
+    candidates = [];
+    byGeneration.set(generation.generation, candidates);
+  }
+  if (candidates.length >= 16) {
+    byGeneration.delete(generation.generation);
+    if (byGeneration.size === 0) loopCallerRequestRegistry.approvalCandidates.delete(manager);
+    return false;
+  }
+  candidates.push({
+    generation: generation.generation,
+    session,
+    toolName,
+    ...(callId !== undefined ? { callId } : {}),
+    args,
+    eventArgs,
+    fingerprint,
+  });
+  return true;
+}
+
+function expectedApprovalEventArgs(
+  candidate: LoopApprovalCandidate,
+  aliases: Map<string, string>,
+): Record<string, unknown> | undefined {
+  const result = normalizedInputForToolCall(
+    { toolName: candidate.toolName, input: candidate.eventArgs },
+    new Map(aliases),
+  );
+  if (result.error) return undefined;
+  return result.input ?? candidate.eventArgs;
+}
+
+function claimLoopApprovalCandidate(
+  manager: object,
+  generation: number,
+  callId: string,
+  session: ToolSession,
+  toolName: "write" | "edit",
+  effectiveArgs: unknown,
+  aliases: Map<string, string>,
+): LoopApprovalClaim {
+  const byGeneration = loopCallerRequestRegistry.approvalCandidates.get(manager);
+  const candidates = byGeneration?.get(generation);
+  if (!byGeneration || !candidates) return { kind: "none" };
+  const eligible = candidates.filter(candidate =>
+    candidate.generation === generation &&
+    candidate.session === session &&
+    candidate.toolName === toolName
+  );
+  const keyed = eligible.filter(candidate => candidate.callId === callId);
+  const unkeyed = eligible.filter(candidate => candidate.callId === undefined);
+  const removeCandidates = (removed: LoopApprovalCandidate[]) => {
+    const removedSet = new Set(removed);
+    const remaining = candidates.filter(candidate => !removedSet.has(candidate));
+    if (remaining.length > 0) byGeneration.set(generation, remaining);
+    else byGeneration.delete(generation);
+    if (byGeneration.size === 0) loopCallerRequestRegistry.approvalCandidates.delete(manager);
+  };
+  const eventFingerprint = toolArgsFingerprint(effectiveArgs);
+  const matches = (candidate: LoopApprovalCandidate): boolean => {
+    if (toolArgsFingerprint(candidate.args) !== candidate.fingerprint) return false;
+    const expected = expectedApprovalEventArgs(candidate, aliases);
+    return expected !== undefined && toolArgsFingerprint(expected) === eventFingerprint;
+  };
+  if (keyed.length > 0) {
+    if (keyed.length !== 1 || !matches(keyed[0]!)) {
+      removeCandidates(keyed);
+      return { kind: "rejected" };
+    }
+    removeCandidates(keyed);
+    return { kind: "matched", candidate: keyed[0]! };
+  }
+  const matching = unkeyed.filter(matches);
+  if (matching.length === 0) return { kind: "none" };
+  if (matching.length > 1) {
+    removeCandidates(matching);
+    return { kind: "rejected" };
+  }
+  removeCandidates(matching);
+  return { kind: "matched", candidate: matching[0]! };
+}
+function rejectExplicitLoopApprovalCandidate(
+  manager: object,
+  generation: number,
+  callId: string,
+  session: ToolSession,
+  toolName: "write" | "edit",
+): boolean {
+  const byGeneration = loopCallerRequestRegistry.approvalCandidates.get(manager);
+  const candidates = byGeneration?.get(generation);
+  if (!byGeneration || !candidates) return false;
+  const matching = candidates.filter(candidate =>
+    candidate.generation === generation &&
+    candidate.session === session &&
+    candidate.toolName === toolName &&
+    candidate.callId === callId
+  );
+  if (matching.length === 0) return false;
+  const rejected = new Set(matching);
+  const remaining = candidates.filter(candidate => !rejected.has(candidate));
+  if (remaining.length > 0) byGeneration.set(generation, remaining);
+  else byGeneration.delete(generation);
+  if (byGeneration.size === 0) loopCallerRequestRegistry.approvalCandidates.delete(manager);
+  return true;
+}
 type HeldPatch = {
   symbol?: symbol;
   originalExecute?: Function;
   patchedExecute?: Function;
   openArgStream?: PropertyDescriptor;
   patchedOpen?: Function;
+  approvalDetails?: ApprovalDetailsDescriptor;
+  patchedApprovalDetails?: ApprovalDetailsFormatter;
+  editApproval?: NativeEditApprovalDescriptor;
+  patchedEditApproval?: NativeEditApproval;
+  writeApproval?: NativeWriteApprovalDescriptor;
+  patchedWriteApproval?: NativeWriteApproval;
 };
+
+function isApprovalDetailsFormatter(value: unknown): value is ApprovalDetailsFormatter {
+  return typeof value === "function";
+}
+
+function approvalDetailsDescriptor(instance: object): ApprovalDetailsDescriptor | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(instance, "formatApprovalDetails");
+  const formatter: unknown = descriptor?.value;
+  if (!descriptor?.configurable || !isApprovalDetailsFormatter(formatter)) return undefined;
+  return { ...descriptor, value: formatter };
+}
+
+function isNativeEditApproval(value: unknown): value is NativeEditApproval {
+  return typeof value === "function";
+}
+
+function nativeEditApprovalDescriptor(instance: object): NativeEditApprovalDescriptor | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(instance, "approval");
+  const approval: unknown = descriptor?.value;
+  if (!descriptor?.configurable || !isNativeEditApproval(approval)) return undefined;
+  return { ...descriptor, value: approval };
+}
+
+function isNativeWriteApproval(value: unknown): value is NativeWriteApproval {
+  return typeof value === "function";
+}
+
+function nativeWriteApprovalDescriptor(instance: object): NativeWriteApprovalDescriptor | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(instance, "approval");
+  const approval: unknown = descriptor?.value;
+  if (!descriptor?.configurable || !isNativeWriteApproval(approval)) return undefined;
+  return { ...descriptor, value: approval };
+}
+
 
 const heldPatches = new WeakMap<object, HeldPatch>();
 const heldByManager = new WeakMap<object, Set<object>>();
@@ -1638,10 +3358,7 @@ function unwrappedExecuteSymbol(instance: object): symbol | undefined {
 }
 
 function sessionManagerOfTool(instance: object): object | undefined {
-  if (!("session" in instance)) return undefined;
-  const session = instance.session;
-  if (!session || typeof session !== "object" || !("sessionManager" in session)) return undefined;
-  const manager = session.sessionManager;
+  const manager = toolSessionFromNativeTool(instance)?.sessionManager;
   return manager && typeof manager === "object" ? manager : undefined;
 }
 
@@ -1701,6 +3418,131 @@ function bindCapturedOpenArgStream(instance: object, manager: object): void {
   heldPatches.set(instance, record);
   trackHeld(manager, instance);
 }
+function bindLoopEditApproval(instance: EditTool, manager: object): void {
+  const own = nativeEditApprovalDescriptor(instance);
+  if (!own) throw new Error("Octo cannot bind native edit: approval policy is not configurable");
+  const record = heldPatches.get(instance) ?? {};
+  if (own.value === record.patchedEditApproval) {
+    heldPatches.set(instance, record);
+    trackHeld(manager, instance);
+    return;
+  }
+  if (record.patchedEditApproval && own.value !== record.patchedEditApproval) {
+    throw new Error("Octo cannot bind native edit: approval policy is no longer held by this plugin");
+  }
+  record.editApproval ??= own;
+  const original = record.editApproval.value;
+  const patched: NativeEditApproval = (args, context) => {
+    const decision = original(args, context);
+    if (typeof decision !== "string" && decision.policy === "deny") return decision;
+    if (!isLoopEditApprovalArgs(args)) return decision;
+    if (!forceAcpLoopPrompt(args, context)) {
+      return {
+        tier: typeof decision === "string" ? decision : decision.tier,
+        policy: "deny",
+        reason: "Could not force this Loop comment mutation through a per-call approval prompt",
+      };
+    }
+    if (!captureLoopApprovalCandidate(instance, manager, toolSessionOfEdit(instance), "edit", args, context)) {
+      return {
+        tier: typeof decision === "string" ? decision : decision.tier,
+        policy: "deny",
+        reason: "Could not bind this Loop edit's original arguments to a unique tool call",
+      };
+    }
+    return {
+      tier: typeof decision === "string" ? decision : decision.tier,
+      policy: "prompt",
+      reason: "Loop comment changes can trigger notifications or expert activity and require explicit approval",
+    };
+  };
+  Object.defineProperty(instance, "approval", { ...own, value: patched });
+  if (nativeEditApprovalDescriptor(instance)?.value !== patched) {
+    throw new Error("Octo cannot bind native edit: approval policy replacement did not stick");
+  }
+  record.patchedEditApproval = patched;
+  heldPatches.set(instance, record);
+  trackHeld(manager, instance);
+}
+
+function bindLoopWriteApproval(instance: WriteTool, manager: object): void {
+  const own = nativeWriteApprovalDescriptor(instance);
+  if (!own) throw new Error("Octo cannot bind native write: approval policy is not configurable");
+  const record = heldPatches.get(instance) ?? {};
+  if (own.value === record.patchedWriteApproval) {
+    heldPatches.set(instance, record);
+    trackHeld(manager, instance);
+    return;
+  }
+  if (record.patchedWriteApproval && own.value !== record.patchedWriteApproval) {
+    throw new Error("Octo cannot bind native write: approval policy is no longer held by this plugin");
+  }
+  record.writeApproval ??= own;
+  const original = record.writeApproval.value;
+  const patched: NativeWriteApproval = (args, context) => {
+    const decision = original(args, context);
+    if (typeof decision !== "string" && decision.policy === "deny") return decision;
+    if (!isLoopWriteApprovalArgs(args)) return decision;
+    if (!forceAcpLoopPrompt(args, context)) {
+      return {
+        tier: typeof decision === "string" ? decision : decision.tier,
+        policy: "deny",
+        reason: "Could not force this Loop comment mutation through a per-call approval prompt",
+      };
+    }
+    if (!captureLoopApprovalCandidate(instance, manager, toolSessionOfWrite(instance), "write", args, context)) {
+      return {
+        tier: typeof decision === "string" ? decision : decision.tier,
+        policy: "deny",
+        reason: "Could not bind this Loop write's original arguments to a unique tool call",
+      };
+    }
+    return {
+      tier: typeof decision === "string" ? decision : decision.tier,
+      policy: "prompt",
+      reason: "Loop comment changes can trigger notifications or expert activity and require explicit approval",
+    };
+  };
+  Object.defineProperty(instance, "approval", { ...own, value: patched });
+  if (nativeWriteApprovalDescriptor(instance)?.value !== patched) {
+    throw new Error("Octo cannot bind native write: approval policy replacement did not stick");
+  }
+  record.patchedWriteApproval = patched;
+  heldPatches.set(instance, record);
+  trackHeld(manager, instance);
+}
+
+function bindApprovalFormatter(instance: object, manager: object, toolName: "write" | "edit"): void {
+  const own = approvalDetailsDescriptor(instance);
+  if (!own) {
+    throw new Error(`Octo cannot bind native ${toolName}: approval details formatter is not configurable`);
+  }
+  const record = heldPatches.get(instance) ?? {};
+  if (own.value === record.patchedApprovalDetails) {
+    heldPatches.set(instance, record);
+    trackHeld(manager, instance);
+    return;
+  }
+  if (record.patchedApprovalDetails && own.value !== record.patchedApprovalDetails) {
+    throw new Error(`Octo cannot bind native ${toolName}: approval formatter is no longer held by this plugin`);
+  }
+  record.approvalDetails ??= own;
+  const original = record.approvalDetails.value;
+  const patched: ApprovalDetailsFormatter = args => {
+    const base = original.call(instance, args);
+    const approval = runtime.approvalCallFor(manager as ManagerRef, toolName, args);
+    if (approval === undefined) return base;
+    if (approval === null) {
+      return [...base, "BLOCKED: no unique Loop preview matches this approval request; execution will be rejected"];
+    }
+    return [...base, ...formatLoopApprovalDetails(approval, args)];
+  };
+  Object.defineProperty(instance, "formatApprovalDetails", { ...own, value: patched });
+  record.patchedApprovalDetails = patched;
+  heldPatches.set(instance, record);
+  trackHeld(manager, instance);
+}
+
 
 function restoreHeldInstance(instance: object): void {
   const record = heldPatches.get(instance);
@@ -1718,6 +3560,24 @@ function restoreHeldInstance(instance: object): void {
       else Reflect.deleteProperty(instance, "openArgStream");
     }
   }
+  if (record.patchedApprovalDetails) {
+    const own = Object.getOwnPropertyDescriptor(instance, "formatApprovalDetails");
+    if (own?.configurable && own.value === record.patchedApprovalDetails && record.approvalDetails) {
+      Object.defineProperty(instance, "formatApprovalDetails", record.approvalDetails);
+    }
+  }
+  if (record.patchedEditApproval) {
+    const own = nativeEditApprovalDescriptor(instance);
+    if (own?.value === record.patchedEditApproval && record.editApproval) {
+      Object.defineProperty(instance, "approval", record.editApproval);
+    }
+  }
+  if (record.patchedWriteApproval) {
+    const own = nativeWriteApprovalDescriptor(instance);
+    if (own?.value === record.patchedWriteApproval && record.writeApproval) {
+      Object.defineProperty(instance, "approval", record.writeApproval);
+    }
+  }
   heldPatches.delete(instance);
 }
 
@@ -1728,20 +3588,25 @@ function restoreManagerTools(manager: object): void {
   heldByManager.delete(manager);
 }
 
-function captureSessionTools(pi: Pick<ExtensionAPI, "getAllTools">, manager: object): void {
+function captureSessionTools(
+  pi: Pick<ExtensionAPI, "getAllTools">,
+  manager: object,
+): { read?: ReadTool; write?: WriteTool; edit?: EditTool } {
+  const captured: { read?: ReadTool; write?: WriteTool; edit?: EditTool } = {};
   const targets = [
     { name: "read", proto: ReadTool.prototype },
+    { name: "write", proto: WriteTool.prototype },
     { name: "edit", proto: EditTool.prototype },
   ] as const;
-  const saved: Array<{ name: "read" | "edit"; proto: object; descriptor: PropertyDescriptor & { get: () => string } }> = [];
+  const saved: Array<{ name: "read" | "write" | "edit"; proto: object; descriptor: PropertyDescriptor & { get: () => string } }> = [];
   const uncapturable: string[] = [];
   for (const target of targets) {
     const descriptor = Object.getOwnPropertyDescriptor(target.proto, "description");
-    if (!descriptor?.get || !descriptor.configurable) {
+    if (!descriptor || typeof descriptor.get !== "function" || !descriptor.configurable) {
       uncapturable.push(target.name);
       continue;
     }
-    saved.push({ name: target.name, proto: target.proto, descriptor });
+    saved.push({ name: target.name, proto: target.proto, descriptor: { ...descriptor, get: descriptor.get } });
   }
   const seen = new Set<object>();
   let listingError: unknown;
@@ -1769,7 +3634,7 @@ function captureSessionTools(pi: Pick<ExtensionAPI, "getAllTools">, manager: obj
   if (listingError) throw new Error(`Octo cannot inspect native tools: ${errorText(listingError)}`);
   const required = new Set(
     tools
-      .filter(tool => (tool.name === "read" || tool.name === "edit") && tool.sourceInfo.source === "builtin")
+      .filter(tool => (tool.name === "read" || tool.name === "write" || tool.name === "edit") && tool.sourceInfo.source === "builtin")
       .map(tool => tool.name),
   );
   for (const name of uncapturable) {
@@ -1778,17 +3643,29 @@ function captureSessionTools(pi: Pick<ExtensionAPI, "getAllTools">, manager: obj
     }
   }
   let boundRead = false;
+  let boundWrite = false;
   let boundEdit = false;
   for (const instance of seen) {
     const owner = sessionManagerOfTool(instance);
     if (owner && owner !== manager) continue;
     if (instance instanceof ReadTool) {
       bindCapturedExecute(instance, patchedReadExecute, manager, "read");
+      captured.read = instance;
       boundRead = true;
+    }
+    if (instance instanceof WriteTool) {
+      bindCapturedExecute(instance, patchedWriteExecute, manager, "write");
+      bindLoopWriteApproval(instance, manager);
+      bindApprovalFormatter(instance, manager, "write");
+      captured.write = instance;
+      boundWrite = true;
     }
     if (instance instanceof EditTool) {
       bindCapturedExecute(instance, patchedEditExecute, manager, "edit");
       bindCapturedOpenArgStream(instance, manager);
+      bindLoopEditApproval(instance, manager);
+      bindApprovalFormatter(instance, manager, "edit");
+      captured.edit = instance;
       boundEdit = true;
     }
   }
@@ -1798,7 +3675,19 @@ function captureSessionTools(pi: Pick<ExtensionAPI, "getAllTools">, manager: obj
   if (required.has("edit") && !boundEdit) {
     throw new Error("Octo found builtin edit but did not bind its captured execute");
   }
+  if (required.has("write") && !boundWrite) {
+    throw new Error("Octo found builtin write but did not bind its captured execute");
+  }
+  return captured;
 }
+function capturedWriteTool(manager: object): WriteTool | undefined {
+  for (const instance of heldByManager.get(manager) ?? []) {
+    if (instance instanceof WriteTool) return instance;
+  }
+  return undefined;
+}
+
+
 
 export function installNativeOctoTools(pi: ExtensionAPI): void {
   InternalUrlRouter.instance().register(octoProtocol);
@@ -1836,7 +3725,7 @@ export function installNativeOctoTools(pi: ExtensionAPI): void {
   });
   pi.on("tool_call", async (event, context) => {
     const generationAtCall = runtime.captureManagerGeneration(context.sessionManager);
-    captureSessionTools(pi, context.sessionManager);
+    const capturedTools = captureSessionTools(pi, context.sessionManager);
     await runtime.activateManager(context.sessionManager);
     if (event.toolName !== "read" && event.toolName !== "write" && event.toolName !== "edit") return;
     const aliases = new Map<string, string>();
@@ -1851,8 +3740,119 @@ export function installNativeOctoTools(pi: ExtensionAPI): void {
     if (remoteCall && generationAtCall && !runtime.isManagerGenerationCurrent(context.sessionManager, generationAtCall)) {
       return { block: true, reason: "Octo tool call belongs to a previous session generation" };
     }
-    runtime.recordCall(context.sessionManager, event.toolCallId, aliases, rewritten.writeTag, remoteCall);
+    const effectiveInput = rewritten.input ?? event.input;
+    let callerCandidate: LoopApprovalCandidate | undefined;
+    if (event.toolName === "write" || event.toolName === "edit") {
+      const toolName = event.toolName;
+      const loopRequested = toolName === "write"
+        ? isLoopWriteApprovalArgs(effectiveInput)
+        : isLoopEditApprovalArgs(effectiveInput);
+      let session: ToolSession | undefined;
+      if (toolName === "write" && capturedTools.write) session = toolSessionOfWrite(capturedTools.write);
+      else if (toolName === "edit" && capturedTools.edit) session = toolSessionOfEdit(capturedTools.edit);
+      const generation = runtime.captureManagerGeneration(context.sessionManager);
+      if (session && generation !== undefined && generation.manager === context.sessionManager) {
+        if (loopRequested) {
+          const claim = claimLoopApprovalCandidate(
+            context.sessionManager as object,
+            generation.generation,
+            event.toolCallId,
+            session,
+            toolName,
+            effectiveInput,
+            aliases,
+          );
+          if (claim.kind === "rejected") {
+            runtime.finishCall(context.sessionManager, event.toolCallId);
+            return { block: true, reason: "Loop caller parameters could not be uniquely bound to this tool call; no mutation was submitted" };
+          }
+          callerCandidate = claim.kind === "matched" ? claim.candidate : undefined;
+        } else if (
+          rejectExplicitLoopApprovalCandidate(
+            context.sessionManager as object,
+            generation.generation,
+            event.toolCallId,
+            session,
+            toolName,
+          )
+        ) {
+          runtime.finishCall(context.sessionManager, event.toolCallId);
+          return { block: true, reason: "Loop approval call ID no longer matches this tool call; no mutation was submitted" };
+        }
+      }
+      if (loopRequested && !callerCandidate) {
+        runtime.finishCall(context.sessionManager, event.toolCallId);
+        return { block: true, reason: "Loop mutation lacks a uniquely bound original caller argument snapshot; no mutation was submitted" };
+      }
+    }
+    const requestFingerprint = toolArgsFingerprint(effectiveInput);
+    let loopCall: LoopPreparedCall | undefined;
+    try {
+      if (event.toolName === "write") {
+        const tool = capturedWriteTool(context.sessionManager);
+        if (tool) {
+          loopCall = await prepareLoopWriteCall(
+            toolSessionOfWrite(tool),
+            effectiveInput,
+            requestFingerprint,
+            rewritten.writeTag,
+          );
+        } else if (parseLoopPath(unwrapWritePath(pathString(effectiveInput)).path).kind !== "other") {
+          return { block: true, reason: "Native write tool is unavailable for a Loop preview; no mutation was submitted" };
+        }
+      } else if (event.toolName === "edit") {
+        const input = inputString(effectiveInput);
+        const route = loopEditRoute(input, pathString(effectiveInput));
+        if (route) {
+          const tool = captureSessionTools(pi, context.sessionManager).edit;
+          if (!tool) return { block: true, reason: "Native edit tool is unavailable for a Loop preview; no mutation was submitted" };
+          loopCall = await prepareLoopEditCall(tool, effectiveInput, requestFingerprint);
+        }
+      }
+    } catch (error) {
+      return { block: true, reason: errorText(error) };
+    }
+    if (callerCandidate && !loopCall) {
+      runtime.finishCall(context.sessionManager, event.toolCallId);
+      return { block: true, reason: "Loop approval arguments no longer match this tool call; no mutation was submitted" };
+    }
+    runtime.recordCall(context.sessionManager, event.toolCallId, aliases, rewritten.writeTag, remoteCall, loopCall);
+    if (loopCall) {
+      if (!isRecord(effectiveInput) || !callerCandidate) {
+        runtime.finishCall(context.sessionManager, event.toolCallId);
+        return { block: true, reason: "Loop mutation parameters are unavailable; no mutation was submitted" };
+      }
+      const isolatedInput = { ...effectiveInput };
+      const generation = runtime.generationForCall(loopCall.session, event.toolCallId);
+      if (!generation || generation.manager !== context.sessionManager) {
+        runtime.finishCall(context.sessionManager, event.toolCallId);
+        return { block: true, reason: "Loop mutation generation is unavailable; no mutation was submitted" };
+      }
+      setLoopCallerRequest(context.sessionManager as object, event.toolCallId, {
+        generation: generation.generation,
+        session: loopCall.session,
+        toolName: event.toolName,
+        operation: loopCall.operation,
+        canonicalPath: loopCall.route.canonicalPath,
+        identity: loopCall.preview.identity,
+        callerArgs: callerCandidate.args,
+        callerFingerprint: callerCandidate.fingerprint,
+        effectiveArgs: isolatedInput,
+      });
+      loopApprovalInputs.add(isolatedInput);
+      return { input: isolatedInput };
+    }
     return rewritten.input ? { input: rewritten.input } : undefined;
+  });
+  pi.on("tool_approval_requested", (event, context) => {
+    if (event.toolName === "write" || event.toolName === "edit") {
+      runtime.setApprovalCall(context.sessionManager, event.toolName, event.toolCallId);
+    }
+  });
+  pi.on("tool_approval_resolved", (event, context) => {
+    if (event.toolName !== "write" && event.toolName !== "edit") return;
+    runtime.resolveApprovalCall(context.sessionManager, event.toolName, event.toolCallId, event.approved);
+    if (!event.approved) runtime.finishCall(context.sessionManager, event.toolCallId);
   });
   pi.on("tool_result", (event, context) => {
     if (event.toolName === "read" || event.toolName === "write" || event.toolName === "edit") {
