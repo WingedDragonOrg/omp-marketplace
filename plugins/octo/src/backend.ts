@@ -346,6 +346,23 @@ function snapshot(
 ): OctoDocument {
   return immutable({ id, type, text, version, backend });
 }
+export async function listDocuments(signal?: AbortSignal): Promise<{ total: number; items: unknown[] }> {
+  const items: unknown[] = [];
+  let page = 1;
+  let total: number;
+  do {
+    const result = requireRecord(await runOctoCli(["docs", "list", "--page", String(page), "--pageSize", "100"], undefined, signal), "document list");
+    if (typeof result.total !== "number" || !Number.isInteger(result.total) || result.total < 0 || !Array.isArray(result.items)) {
+      throw new Error("octo-cli returned invalid document list pagination");
+    }
+    total = result.total;
+    if (result.items.length === 0 && items.length < total) throw new Error("Octo document listing ended before all pages were read");
+    items.push(...result.items);
+    page++;
+  } while (items.length < total);
+  return { total, items };
+}
+
 
 export async function readDocument(id: string, signal?: AbortSignal): Promise<OctoDocument> {
   const metadata = requireRecord(await runOctoCli(["docs", "get", id], undefined, signal), "document metadata");

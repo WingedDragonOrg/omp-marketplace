@@ -51,7 +51,7 @@ import {
   type LoopCommentPreviewInput,
   type LoopCommentSnapshot,
 } from "./loop-backend.ts";
-import { isRecord, readDocument, writeDocument, type OctoDocument } from "./backend.ts";
+import { isRecord, listDocuments, readDocument, runOctoCliEnvelope, writeDocument, type OctoDocument } from "./backend.ts";
 
 const octoEnabled = lookup("octo.enabled") ?? register({
   id: "octo.enabled",
@@ -367,7 +367,7 @@ const PATCH_FILE_HEADER = /^(\*\*\*\s+(?:Update|Add|Delete) File:\s*)([^\r\n]+)$
 const PATCH_MOVE_HEADER = /^(\*\*\*\s+Move to:\s*)([^\r\n]+)$/i;
 const SESSION_MANAGER_CALL_LIMIT = 128;
 const EXTENSION_SESSION_PROMPT =
-  "Octo documents and Loop tasks/comments are available through the native read, write, and edit tools. Use octo://docs/<docId> for documents and octo://loop/workspaces/<workspaceId>/tasks/<taskId>/comments/... for Loop. Read before hashline editing. Loop comment mutations require explicit approval and preview.";
+  "Octo documents and Loop tasks/comments are available through the native read, write, and edit tools. Read octo://docs/ for documents, octo://loop/workspaces/ for Loop workspaces, and octo://drive/spaces/ for Drive spaces. Drive listings use octo://drive/spaces/<spaceId>/ and octo://drive/spaces/<spaceId>/folders/<folderId>/. Use octo://docs/<docId> for a document and octo://loop/workspaces/<workspaceId>/tasks/<taskId>/comments/... for Loop. Read before hashline editing. Loop comment mutations require explicit approval and preview.";
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -441,6 +441,26 @@ function decodeDocumentId(id: string): string | undefined {
     return undefined;
   }
 }
+function isDocsRoot(path: string): boolean {
+  return /^octo:\/\/docs\/?$/i.test(path);
+}
+
+function driveListArgs(rawPath: string): string[] | undefined {
+  if (!/^octo:\/\/drive(?=\/|$)/i.test(rawPath)) return undefined;
+  const segments = rawPath.slice("octo://drive".length).split("/").slice(1);
+  if (segments.length === 0 || segments.length === 1 && segments[0] === "") return ["drive", "space", "list"];
+  if (segments[0] === "spaces" && (segments.length === 1 || segments.length === 2 && segments[1] === "")) return ["drive", "space", "list"];
+  if (segments[0] !== "spaces" || !segments[1]) throw new Error(`Unsupported Octo Drive list path '${rawPath}'`);
+  const spaceId = decodeURIComponent(segments[1]);
+  if (segments.length === 2 || segments.length === 3 && segments[2] === "") {
+    return ["drive", "browse", "--space-id", spaceId, "--parent-id", "0"];
+  }
+  if ((segments.length === 4 || segments.length === 5 && segments[4] === "") && segments[2] === "folders" && /^\d+$/.test(segments[3])) {
+    return ["drive", "browse", "--space-id", spaceId, "--parent-id", segments[3]];
+  }
+  throw new Error(`Unsupported Octo Drive list path '${rawPath}'`);
+}
+
 
 function parseDocumentPath(rawPath: string): ParsedDocumentPath {
   const httpPrefix = HTTP_OCTO_PREFIX.exec(rawPath);
@@ -504,10 +524,14 @@ function parseLoopPath(rawPath: string): ParsedLoopPath {
   if (rest.includes("?") || rest.includes("#")) {
     return { kind: "invalid", message: `Loop paths do not support query or fragment components: '${rawPath}'` };
   }
-  if (!rest.startsWith("/") || rest.length === 1) {
+  if (rest === "" || rest === "/") {
+    return { kind: "loop", route: { kind: "workspaces", canonicalPath: "octo://loop/workspaces" } };
+  }
+  if (!rest.startsWith("/")) {
     return { kind: "invalid", message: `Invalid Loop URI '${rawPath}'` };
   }
-  const rawSegments = rest.slice(1).split("/");
+  const listRest = /\/(?:workspaces|tasks|comments)\/$/.test(rest) ? rest.slice(0, -1) : rest;
+  const rawSegments = listRest.slice(1).split("/");
   if (rawSegments.some(segment => segment.length === 0)) {
     return { kind: "invalid", message: `Invalid Loop URI '${rawPath}': empty path segment` };
   }
@@ -1576,6 +1600,12 @@ const octoProtocol: ProtocolHandler = {
       payload: "text",
       scope: "workspace",
       tier: (url, _content, session) => {
+        if (isDocsRoot(url.rawHref ?? url.href)) {
+          return { tier: "write", policy: "deny", reason: "The Octo document list is read-only" };
+        }
+        if (/^octo:\/\/drive(?=\/|$)/i.test(url.rawHref ?? url.href)) {
+          return { tier: "write", policy: "deny", reason: "Octo Drive listings are read-only" };
+        }
         const parsed = parseLoopPath(url.rawHref ?? url.href);
         if (parsed.kind === "invalid") {
           return { tier: "write", policy: "deny", reason: parsed.message };
@@ -1606,6 +1636,19 @@ const octoProtocol: ProtocolHandler = {
       const loop = parseLoopPath(url.rawHref ?? url.href);
       if (loop.kind === "invalid") throw new Error(loop.message);
       if (loop.kind === "loop") return await resolveLoopResource(loop.route, session, lease);
+      if (isDocsRoot(url.rawHref ?? url.href)) {
+        const listing = await listDocuments(lease.signal);
+        runtime.assertCurrent(lease);
+        const content = JSON.stringify(listing, null, 2);
+        return { url: "octo://docs/", content, contentType: "application/json", size: Buffer.byteLength(content), immutable: false };
+      }
+      const driveArgs = driveListArgs(url.rawHref ?? url.href);
+      if (driveArgs) {
+        const listing = await runOctoCliEnvelope(driveArgs, undefined, lease.signal);
+        runtime.assertCurrent(lease);
+        const content = JSON.stringify(listing.data, null, 2);
+        return { url: url.rawHref ?? url.href, content, contentType: "application/json", size: Buffer.byteLength(content), immutable: false };
+      }
       const target = targetFromInternalUrl(url);
       if (!target) throw new Error(`Invalid Octo document URL '${url.rawHref ?? url.href}'`);
       const document = await readDocument(target.id, lease.signal);
@@ -2302,6 +2345,21 @@ const patchedReadExecute: typeof ReadTool.prototype.execute = async function (
 ) {
   const session = toolSessionOfRead(this);
   const rawPath = typeof params.path === "string" ? params.path : "";
+  if (isDocsRoot(rawPath)) {
+    if (!runtime.isActive(session)) {
+      return toolError("Octo tools are not active for this session") as Awaited<ReturnType<typeof nativeReadExecute>>;
+    }
+    const lease = runtime.beginOperation(session, signal, runtime.generationForCall(session, toolCallId));
+    try {
+      const result = await nativeReadExecute.call(this, toolCallId, params, lease.signal, onUpdate, context);
+      runtime.assertCurrent(lease);
+      return result;
+    } catch (error) {
+      return toolError(`Unable to list Octo documents: ${errorText(error)}`) as Awaited<ReturnType<typeof nativeReadExecute>>;
+    } finally {
+      lease.release();
+    }
+  }
   const loop = parseLoopPath(rawPath);
   if (loop.kind === "invalid") return toolError(loop.message) as Awaited<ReturnType<typeof nativeReadExecute>>;
   if (loop.kind === "loop") {

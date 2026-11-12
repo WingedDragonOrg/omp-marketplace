@@ -449,9 +449,12 @@ try {
   const result = tool
     ? await tool.execute("loop-workspaces-read", { path: "octo://loop/workspaces" })
     : { isError: true, content: [{ text: "builtin read tool missing" }] };
+  const root = await tool.execute("loop-root-read", { path: "octo://loop/" });
   console.log("OCTO_LOOP_READ_HOST_RESULT " + JSON.stringify({
     isError: result.isError === true,
     text: (result.content || []).filter(block => typeof block.text === "string").map(block => block.text).join("\\\\n"),
+    rootIsError: root.isError === true,
+    rootText: (root.content || []).filter(block => typeof block.text === "string").map(block => block.text).join("\\\\n"),
   }));
 } finally {
   await session.dispose();
@@ -490,6 +493,8 @@ try {
     const result = JSON.parse(resultLine!.slice("OCTO_LOOP_READ_HOST_RESULT ".length));
     expect(result.isError).toBe(false);
     expect(result.text).toContain("Loop fixture workspace");
+    expect(result.rootIsError).toBe(false);
+    expect(result.rootText).toContain("Loop fixture workspace");
     expect(gateway.requests.some(request => request.path === "/fleet/api/v1/workspaces" && request.method === "GET")).toBe(true);
   } finally {
     gateway.server.stop();
@@ -684,6 +689,9 @@ try {
   result.reads.tasks = await invoke("read", { path: tasksPath }, "task-list");
   result.reads.task = await invoke("read", { path: taskPath }, "task-detail");
   result.reads.comments = await invoke("read", { path: commentsPath }, "comment-list");
+  result.reads.workspacesSlash = await invoke("read", { path: "octo://loop/workspaces/" }, "workspace-list-slash");
+  result.reads.tasksSlash = await invoke("read", { path: tasksPath + "/" }, "task-list-slash");
+  result.reads.commentsSlash = await invoke("read", { path: commentsPath + "/" }, "comment-list-slash");
   result.reads.comment = await invoke("read", { path: targetCommentPath }, "comment-body");
   result.reads.uppercaseComment = await invoke("read", {
     path: "octo://loop/workspaces/${WORKSPACE_ID.toUpperCase()}/tasks/${TASK_ID.toUpperCase()}/comments/${TARGET_COMMENT_ID.toUpperCase()}",
@@ -1148,6 +1156,12 @@ try {
     expect(result.reads.task.text).toContain("Task detail");
     expect(result.reads.comments.isError).toBe(false);
     expect(result.reads.comments.text).toContain(TARGET_COMMENT_ID);
+    expect(result.reads.workspacesSlash.isError).toBe(false);
+    expect(result.reads.workspacesSlash.text).toContain("Loop fixture workspace");
+    expect(result.reads.tasksSlash.isError).toBe(false);
+    expect(result.reads.tasksSlash.text).toContain("Loop fixture task");
+    expect(result.reads.commentsSlash.isError).toBe(false);
+    expect(result.reads.commentsSlash.text).toContain(TARGET_COMMENT_ID);
     expect(result.reads.comments.text).toContain(PARENT_COMMENT_ID);
     expect(result.reads.comments.text).toContain(ATTACHMENT_ID);
     expect(gateway.commentPages.some(page => page.taskId === TASK_ID && page.page === 2)).toBe(true);

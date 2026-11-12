@@ -48,6 +48,28 @@ function startGateway() {
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
+      if (request.method === "GET" && url.pathname === "/v1/bot/drive/spaces") {
+        return Response.json({ spaces: [{ id: "shared:fixture", name: "Fixture space" }], page: { total: 1 } });
+      }
+      if (request.method === "GET" && url.pathname === "/v1/bot/drive/browse") {
+        const parent = url.searchParams.get("parent_id");
+        if (url.searchParams.get("space_id") === "space/with?#" && parent === "0") return Response.json({ entries: [{ id: "3", name: "Encoded space item", type: "doc" }] });
+        if (url.searchParams.get("space_id") !== "shared:fixture") return new Response("wrong space", { status: 404 });
+        if (parent === "0") return Response.json({ entries: [{ id: "9007199254740993", name: "Fixture folder", type: "folder" }] });
+        if (parent === "9007199254740993") return Response.json({ entries: [{ id: "2", name: "Nested document", type: "doc" }] });
+        return new Response("wrong folder", { status: 404 });
+      }
+      if (request.method === "GET" && url.pathname === "/v1/bot/docs") {
+        const page = Number(url.searchParams.get("page") ?? 1);
+        const pageSize = Number(url.searchParams.get("pageSize") ?? 20);
+        const items = Array.from({ length: 101 }, (_, index) => ({
+          docId: `d_list_${index + 1}`,
+          title: `Document ${index + 1}`,
+          docType: "doc",
+          role: "reader",
+        }));
+        return Response.json({ total: items.length, items: items.slice((page - 1) * pageSize, page * pageSize) });
+      }
       if (url.pathname.startsWith("/v1/bot/docs/")) docsRequests.push(`${request.method} ${url.pathname}`);
       if (url.pathname === "/__cancel_started") {
         await cancellationStarted.promise;
@@ -273,7 +295,7 @@ try {
     hasPutGrammar: !!(customFormat && typeof customFormat.definition === "string" && customFormat.definition.includes("PUT")),
   };
 
-  const result = { provenance, editFormat, local: {}, octo: {}, https: {}, legacy: {}, loop: {}, xd: {} };
+  const result = { provenance, editFormat, local: {}, octo: {}, drive: {}, https: {}, legacy: {}, loop: {}, xd: {} };
   result.xd.mounted = session.getMountedXdevToolNames();
   result.xd.listing = await invoke("read", { path: "xd://" }, "xd-list");
   result.xd.device = result.xd.mounted[0] || null;
@@ -285,6 +307,16 @@ try {
   result.local.read = await invoke("read", { path: cwd + "/ordinary.md" }, "local-read");
   result.local.edit = await invoke("edit", { input: patch(header(result.local.read.text), 2, "local changed") }, "local-edit");
 
+  result.octo.list = await invoke("read", { path: "octo://docs/" }, "docs-list");
+  result.octo.listWithoutSlash = await invoke("read", { path: "octo://docs" }, "docs-list-no-slash");
+  result.octo.listWrite = await invoke("write", { path: "octo://docs/", content: "not a document" }, "docs-list-write");
+  result.drive.spaces = await invoke("read", { path: "octo://drive/" }, "drive-spaces");
+  result.drive.spaceList = await invoke("read", { path: "octo://drive/spaces" }, "drive-spaces-collection");
+  result.drive.spaceListSlash = await invoke("read", { path: "octo://drive/spaces/" }, "drive-spaces-collection-slash");
+  result.drive.root = await invoke("read", { path: "octo://drive/spaces/shared%3Afixture" }, "drive-root");
+  result.drive.folder = await invoke("read", { path: "octo://drive/spaces/shared%3Afixture/folders/9007199254740993/" }, "drive-folder");
+  result.drive.encodedSpace = await invoke("read", { path: "octo://drive/spaces/space%2Fwith%3F%23" }, "drive-encoded-space");
+  result.drive.write = await invoke("write", { path: "octo://drive/", content: "not writable" }, "drive-list-write");
   result.octo.path = "octo://docs/d_octouri";
   result.octo.read = await invoke("read", { path: result.octo.path }, "octo-read");
   if (result.octo.read.isError) throw new Error("Docs URI read failed (" + result.octo.path + "): " + result.octo.read.text);
@@ -424,6 +456,25 @@ try {
     const resultLine = stdout.split(/\r?\n/).find(line => line.startsWith("OCTO_NATIVE_HOST_RESULT "));
     expect(resultLine, stdout).toBeDefined();
     const result = JSON.parse(resultLine!.slice("OCTO_NATIVE_HOST_RESULT ".length));
+    expect(result.octo.list.isError).toBe(false);
+    expect(result.octo.list.text).toContain("Document 1");
+    expect(result.octo.list.text).toContain("Document 101");
+    expect(result.octo.listWithoutSlash.isError).toBe(false);
+    expect(result.octo.listWithoutSlash.text).toContain("Document 101");
+    expect(result.octo.listWrite.isError).toBe(true);
+    expect(result.drive.spaces.isError).toBe(false);
+    expect(result.drive.spaces.text).toContain("Fixture space");
+    expect(result.drive.spaceList.isError).toBe(false);
+    expect(result.drive.spaceList.text).toContain("Fixture space");
+    expect(result.drive.spaceListSlash.isError).toBe(false);
+    expect(result.drive.spaceListSlash.text).toContain("Fixture space");
+    expect(result.drive.root.isError).toBe(false);
+    expect(result.drive.root.text).toContain("Fixture folder");
+    expect(result.drive.folder.isError).toBe(false);
+    expect(result.drive.folder.text).toContain("Nested document");
+    expect(result.drive.encodedSpace.isError).toBe(false);
+    expect(result.drive.encodedSpace.text).toContain("Encoded space item");
+    expect(result.drive.write.isError).toBe(true);
 
     expect(result.provenance).toEqual({
       read: { source: "builtin", builtIn: true },
