@@ -319,6 +319,21 @@ afterEach(async () => {
 });
 
 describe("managed skill group storage", () => {
+  test("ignores generated indexes at every group level while keeping member skills trackable", async () => {
+    const root = await makeManagedRoot();
+    Bun.spawnSync(["git", "init", "-q", root]);
+    await writeMember(root, "engineering/database", "postgres", "postgres", "Postgres skill.");
+    await writeFile(join(root, "engineering", ".gitignore"), "local-only");
+    const createStore = await createStoreFactory();
+    const store = createStore(root);
+    store.scan();
+    expect(await readFile(join(root, "engineering", ".gitignore"), "utf8")).toBe("local-only\n/SKILL.md\n");
+    const check = (file: string) => Bun.spawnSync(["git", "-C", root, "check-ignore", "-q", file]).exitCode;
+    expect(check("engineering/SKILL.md")).toBe(0);
+    expect(check("engineering/database/SKILL.md")).toBe(0);
+    expect(check("engineering/database/postgres/SKILL.md")).toBe(1);
+  });
+
   test("indexes a member description containing an unquoted colon accepted by OMP", async () => {
     const root = await makeManagedRoot();
     const file = join(root, "quality", "diagnosis", "SKILL.md");

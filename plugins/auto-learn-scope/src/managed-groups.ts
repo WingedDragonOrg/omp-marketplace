@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import {
+  appendFileSync,
   chmodSync,
   closeSync,
   fsyncSync,
@@ -1340,6 +1341,12 @@ function refreshGroupsLocked(
       const snapshot = inspectGroup(root, group, action, false);
       if (!snapshot) {
         throw makeError(group, action, `group "${group}" could not be scanned for index rebuilding.`, path.join(root, group, SKILL_FILE_NAME), skillPath, path.join(root, group, SKILL_FILE_NAME));
+      }
+      const ignoreFile = path.join(snapshot.directory, ".gitignore");
+      const ignoreStat = lstatOrNull(ignoreFile);
+      const ignoreContents = ignoreStat ? readFileSync(ignoreFile, "utf8") : "";
+      if (!ignoreContents.split(/\r?\n/).includes("/SKILL.md")) {
+        appendFileSync(ignoreFile, `${ignoreContents && !ignoreContents.endsWith("\n") ? "\n" : ""}/SKILL.md\n`);
       }
       writeGroupIndex(root, snapshot, action, skillStatus, skillPath, summaryStates.get(group), summaryDescriptions.get(group));
       completed.add(group);
