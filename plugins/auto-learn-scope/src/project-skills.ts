@@ -7,6 +7,7 @@ import * as path from "node:path";
 import { YAML } from "bun";
 
 export const MAX_PROJECT_SKILL_BYTES = 64_000;
+export const MAX_MANAGED_GROUP_DESCRIPTION_CODE_POINTS = 1024;
 
 const SKILL_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const PROJECT_SKILLS_DIRECTORY = path.join(".omp", "skills");

@@ -1094,7 +1094,7 @@ describe("managed skill group storage", () => {
     expect(await pathExists(memberSkillFile(root, "parallel/alpha", "alpha-worker"))).toBe(true);
     expect(await pathExists(memberSkillFile(root, "parallel/beta", "beta-worker"))).toBe(true);
   });
-  test("group descriptions are capped at 200 Unicode characters and index ordering is stable", async () => {
+  test("group descriptions retain member details and index ordering is stable", async () => {
     const root = await makeManagedRoot();
     await writeMember(root, "summaries", "z-folder", "z-skill", "Z description.");
     await writeMember(root, "summaries", "a-folder", "a-skill", "A description.");
@@ -1105,7 +1105,7 @@ describe("managed skill group storage", () => {
     const frontmatter = index.match(/^---\n([\s\S]*?)\n---/);
     expect(frontmatter).not.toBeNull();
     const parsed = Bun.YAML.parse(frontmatter![1]) as { description: string };
-    expect([...parsed.description].length).toBeLessThanOrEqual(200);
+    expect(parsed.description).toContain("A description.");
     expect(index.indexOf("a-skill")).toBeLessThan(index.indexOf("z-skill"));
 
     const before = await stat(file);
@@ -1115,14 +1115,14 @@ describe("managed skill group storage", () => {
   });
   test("long group descriptions truncate on a Unicode character boundary", async () => {
     const root = await makeManagedRoot();
-    await writeMember(root, "unicode-summary", "member-folder", "member-skill", "🙂".repeat(250));
+    await writeMember(root, "unicode-summary", "member-folder", "member-skill", "🙂".repeat(1200));
     const createStore = await createStoreFactory();
     createStore(root);
     const index = await readFile(groupSkillFile(root, "unicode-summary"), "utf8");
     const frontmatter = index.match(/^---\n([\s\S]*?)\n---/);
     expect(frontmatter).not.toBeNull();
     const parsed = Bun.YAML.parse(frontmatter![1]) as { description: string };
-    expect([...parsed.description]).toHaveLength(200);
+    expect([...parsed.description]).toHaveLength(1024);
     expect(parsed.description).not.toContain("\uFFFD");
   });
   test("isGroup only reads marked indexes and refresh reports corrupted indexes", async () => {

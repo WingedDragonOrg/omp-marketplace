@@ -23,6 +23,7 @@ import * as path from "node:path";
 import { YAML } from "bun";
 import { parseFrontmatter as parseOmpFrontmatter, withFileLockSync } from "@oh-my-pi/pi-utils";
 import {
+  MAX_MANAGED_GROUP_DESCRIPTION_CODE_POINTS,
   MAX_PROJECT_SKILL_BYTES,
   sanitizeManagedDescription,
   sanitizeSkillName,
@@ -897,7 +898,7 @@ function groupIndexFallbackDescription(snapshot: GroupSnapshot, entries: GroupEn
   const source = entries.length === 0
     ? `${snapshot.displayName} managed skills.`
     : `${snapshot.displayName}: ${entries.map(entry => entry.description).join(" ")}`;
-  return Array.from(sanitizeManagedDescription(source)).slice(0, 200).join("");
+  return Array.from(sanitizeManagedDescription(source)).slice(0, MAX_MANAGED_GROUP_DESCRIPTION_CODE_POINTS).join("");
 }
 
 function newGroupRevision(): string {
@@ -2539,8 +2540,8 @@ export function createManagedGroupStore(rootPath: string): ManagedGroupStore {
     description: string,
   ): { status: "committed" | "stale" } {
     const cleaned = sanitizeManagedDescription(description);
-    if (!cleaned || Array.from(cleaned).length > 200) {
-      throw makeError(snapshot?.group ?? "<summary>", "summary", "the generated group summary must be non-empty and at most 200 characters.", groupIndex(snapshot?.group ?? "<summary>"), groupIndex(snapshot?.group ?? "<summary>"), groupIndex(snapshot?.group ?? "<summary>"));
+    if (!cleaned || Array.from(cleaned).length > MAX_MANAGED_GROUP_DESCRIPTION_CODE_POINTS) {
+      throw makeError(snapshot?.group ?? "<summary>", "summary", `the generated group summary must be non-empty and at most ${MAX_MANAGED_GROUP_DESCRIPTION_CODE_POINTS} characters.`, groupIndex(snapshot?.group ?? "<summary>"), groupIndex(snapshot?.group ?? "<summary>"), groupIndex(snapshot?.group ?? "<summary>"));
     }
     return withSummaryCAS(snapshot, "summary commit", (current, state, groups) => {
       const next: GroupSummaryState = {

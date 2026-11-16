@@ -35,7 +35,7 @@ type NativeInvoker = (
 ) => Promise<unknown>;
 type CapturedModelRequest = { path: string; body: string; authorization?: string };
 type SummaryServerReply = (
-  | { text: string }
+  | { text: string; raw?: boolean; finishReason?: "stop" | "length" }
   | { judgeProbability: number }
   | { error: string }
 ) & { release?: Promise<void> };
@@ -404,9 +404,9 @@ async function startSummaryServer(replies: readonly SummaryServerReply[]): Promi
       });
       response.end(
         [
-          `data: ${JSON.stringify(chunk(reply.text, null))}`,
+          `data: ${JSON.stringify(chunk(reply.raw || reply.text.includes("<description>") ? reply.text : `<description>${reply.text}</description>`, null))}`,
           "",
-          `data: ${JSON.stringify(chunk("", "stop"))}`,
+          `data: ${JSON.stringify(chunk("", reply.finishReason ?? "stop"))}`,
           "",
           "data: [DONE]",
           "",
@@ -1000,6 +1000,75 @@ describe("managed skill group extension behavior", () => {
     expect(await readFile(childSkillFile(managedRoot, "postgresql", "zeta-audit"), "utf8")).toContain(
       "Zeta body stays untouched.",
     );
+  });
+
+  test("refresh stores only the framed description and truncates long model output", async () => {
+    const managedRoot = await makeRoot("auto-learn-scope-group-");
+    await mkdir(join(managedRoot, "runtime-group", "member-skill"), { recursive: true });
+    await writeFile(
+      childSkillFile(managedRoot, "runtime-group", "member-skill"),
+      skillDocument("member-skill", "Incident escalation.", "Body."),
+      "utf8",
+    );
+    const description = "排查事件".repeat(300);
+    const pi = new FakePi();
+    const server = await startSummaryServer([{ text: `Here is the description:\n<description>${description}</description>\nExtra explanation.` }]);
+    const runtime = summaryRuntime(makeSummaryModel(server.baseUrl));
+    const ctx = makeContext(process.cwd(), undefined, undefined, runtime);
+    await install(pi, managedRoot);
+    try {
+      await pi.commands.get("refresh-managed-skills")!("--force", ctx);
+      const request = JSON.parse(server.requests[0]!.body) as { max_tokens?: number; max_completion_tokens?: number };
+      expect(request.max_tokens ?? request.max_completion_tokens ?? Infinity).toBeGreaterThan(512);
+      const indexText = await readFile(groupIndexFile(managedRoot, "runtime-group"), "utf8");
+      const metadata = Bun.YAML.parse(indexText.match(/^---\n([\s\S]*?)\n---/)![1]) as { description: string };
+      expect(metadata.description).toBe("排查事件".repeat(256));
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("refresh retains usable framed output when the provider stops at its limit", async () => {
+    const managedRoot = await makeRoot("auto-learn-scope-group-");
+    await mkdir(join(managedRoot, "runtime-group", "member-skill"), { recursive: true });
+    await writeFile(
+      childSkillFile(managedRoot, "runtime-group", "member-skill"),
+      skillDocument("member-skill", "Incident escalation.", "Body."),
+      "utf8",
+    );
+    const pi = new FakePi();
+    const server = await startSummaryServer([{ text: "<description>Incident escalation", raw: true, finishReason: "length" }]);
+    const runtime = summaryRuntime(makeSummaryModel(server.baseUrl));
+    await install(pi, managedRoot);
+    try {
+      await pi.commands.get("refresh-managed-skills")!("--force", makeContext(process.cwd(), undefined, undefined, runtime));
+      const index = frontmatter(await readFile(groupIndexFile(managedRoot, "runtime-group"), "utf8"));
+      expect(index.description).toBe("Incident escalation");
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("refresh rejects unframed output rather than saving model commentary", async () => {
+    const managedRoot = await makeRoot("auto-learn-scope-group-");
+    await mkdir(join(managedRoot, "runtime-group", "member-skill"), { recursive: true });
+    await writeFile(
+      childSkillFile(managedRoot, "runtime-group", "member-skill"),
+      skillDocument("member-skill", "Incident escalation.", "Body."),
+      "utf8",
+    );
+    const pi = new FakePi();
+    const server = await startSummaryServer([{ text: "Here is my explanation.", raw: true }]);
+    const runtime = summaryRuntime(makeSummaryModel(server.baseUrl));
+    await install(pi, managedRoot);
+    try {
+      await pi.commands.get("refresh-managed-skills")!("--force", makeContext(process.cwd(), undefined, undefined, runtime));
+      const index = frontmatter(await readFile(groupIndexFile(managedRoot, "runtime-group"), "utf8"));
+      expect(index.description).toBe("runtime-group: Incident escalation.");
+      expect(runtime.notifications.join("\n")).toContain("did not return a framed description");
+    } finally {
+      await server.close();
+    }
   });
 
   test("interactive refresh runs the command without forwarding a plugin reload", async () => {
