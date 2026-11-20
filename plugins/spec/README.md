@@ -1,8 +1,7 @@
 # spec
 
-Skill-only plugin for spec work. Today it ships one skill, `spec-design`, which turns a
-feature idea, behaviour change or existing plan into an implementable spec through a
-focused design interview, then writes it to `docs/specs/YYYY-MM-DD-<topic>-design.md`.
+Skill-only plugin for turning a feature idea, behaviour change or existing plan
+into an implementable spec. Confirmed specs live in `docs/specs/`.
 
 ```sh
 omp plugin marketplace add WingedDragonOrg/omp-marketplace
@@ -13,26 +12,24 @@ Skills refresh with `/reload-plugins`; no new session required.
 
 ## `spec-design`
 
-- **Hard gate** — no implementation code, scaffolding or plan execution until the user
-  confirms the design. Codebase exploration, option comparison and writing the spec are
-  not implementation.
-- **Facts vs decisions** — anything answerable from the repo is investigated, never asked.
-  Only product-level commitments (user promises, data semantics, permissions, irreversible
-  migrations, cost) interrupt the user; derived architecture is decided and disclosed.
-- **Stances before leaves** — one upstream question that constrains a whole group of
-  downstream choices, each with 2–3 options and a recommendation, instead of a
-  field-by-field questionnaire.
+- **Routing** — implement clear, authorized work within an existing spec without
+  restarting design. Confirm changes to a settled commitment, scope, contract
+  or acceptance standard; wait for approval before implementing new design.
+- **Facts vs decisions** — investigate repo facts, decide derived details, and
+  ask one high-impact product question at a time with a recommendation.
+- **Spec location** — update the current spec in place; when revising a
+  historical-only spec, retain the read-only original and write the active
+  version to `docs/specs/`.
 - **Derivation packages** — confirmed stance, derived design, adopted defaults, exclusions
   and the few assumptions worth correcting, shown as one block for a single confirmation.
-- **Risk-tiered review** — every spec gets a deterministic self-check; specs touching
-  concurrency, persistence/migration, auth/tenancy/billing, external contracts or
-  irreversible operations additionally get exactly one independent read-only review round.
+- **Risk-tiered review** — always self-check; add one independent read-only
+  review if requested or if load-bearing assumptions need adversarial review.
 
 ## Layout
 
 ```
 skills/spec-design/SKILL.md          the skill
-skills/spec-design/evals/evals.json  skill-creator eval suite (5 scenarios)
+skills/spec-design/evals/evals.json  skill-creator eval suite
 ```
 
 Plugin name and skill name are independent: the plugin is the delivery unit (`spec`), the
